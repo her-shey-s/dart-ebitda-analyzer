@@ -49,8 +49,8 @@ def _generate(client, prompt: str) -> Optional[str]:
             contents=prompt,
         )
         return response.text.strip()
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
 
 
 def _parse_json(text: str) -> Optional[dict]:
@@ -136,9 +136,10 @@ def verify_financial_data(
         f'"corrections":{{"항목명":수정값}}}}'
     )
 
-    raw = _generate(client, prompt)
-    if raw is None:
-        return {"verdict": "skipped", "issues": ["AI 호출 실패"], "corrections": {}}
+    try:
+        raw = _generate(client, prompt)
+    except RuntimeError as e:
+        return {"verdict": "skipped", "issues": [str(e)], "corrections": {}}
 
     parsed = _parse_json(raw)
     if parsed is None:
@@ -197,8 +198,9 @@ def extract_from_raw_text(
         f"텍스트:\n{truncated}"
     )
 
-    raw = _generate(client, prompt)
-    if raw is None:
+    try:
+        raw = _generate(client, prompt)
+    except RuntimeError:
         return {}
 
     parsed = _parse_json(raw)
