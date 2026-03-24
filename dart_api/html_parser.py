@@ -35,7 +35,7 @@ _DOCUMENT_API_URL = "https://opendart.fss.or.kr/api/document.xml"
 # 재무상태표 판별 키워드
 _BS_KEYWORDS = {"자산총계", "부채총계", "자본총계", "유동자산", "비유동자산"}
 # 손익계산서 판별 키워드
-_IS_KEYWORDS = {"매출액", "영업이익", "당기순이익", "매출총이익", "영업수익"}
+_IS_KEYWORDS = {"매출액", "영업이익", "당기순이익", "매출총이익", "영업수익", "연결당기순이익"}
 
 
 # ── 전처리 함수 ────────────────────────────────────────────────────────────
@@ -64,8 +64,9 @@ def normalize_label(text: str) -> str:
     text = re.sub(r"<주석[\d,\s]+>", "", text)
     # 2. 모든 공백 변종 제거
     text = re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
-    # 3. 선두 로마자 번호 + 마침표
-    text = re.sub(r"^[IVXivx]+\.", "", text)
+    # 3. 선두 로마자 번호 + 마침표 (ASCII: I., II. 등 / 전각 유니코드: Ⅰ Ⅱ … Ⅻ)
+    text = re.sub(r"^[\u2160-\u216B]+\.?", "", text)   # 전각 Unicode Roman (Ⅰ–Ⅻ)
+    text = re.sub(r"^[IVXivx]+\.", "", text)            # ASCII Roman
     # 4. 선두 아라비아 숫자 + 마침표
     text = re.sub(r"^\d+\.", "", text)
     # 5. 선두 한글 목차 번호 + 마침표
@@ -224,11 +225,16 @@ def find_item_in_table(rows: list[list[str]], keywords: list[str]) -> Optional[f
 
     keyword_set = set(keywords)
 
-    # 금액 컬럼 인덱스: 행들을 순회하며 숫자가 나오는 최초 컬럼 인덱스 결정
-    # (헤더 행 제외, 보통 col 1 또는 2)
+    # 주석 컬럼 인덱스 탐지: 헤더 행에 "주석" 포함 → 금액 컬럼 탐색 시 제외
+    header = rows[0] if rows else []
+    skip_cols = {ci for ci, cell in enumerate(header) if "주석" in cell}
+
+    # 금액 컬럼 인덱스: 헤더 건너뛰고 주석 컬럼도 건너뛴 뒤 최초 숫자 컬럼
     amount_col = None
-    for row in rows[1:]:  # 헤더 행 건너뜀
+    for row in rows[1:]:
         for ci in range(1, len(row)):
+            if ci in skip_cols:
+                continue
             if _is_numeric_cell(row[ci]):
                 amount_col = ci
                 break
@@ -253,8 +259,8 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     """
     파싱된 DART XML에서 모든 FINANCIAL_ITEMS를 추출한다.
 
-    재무상태표(BS) 항목은 BS 테이블에서, 손익계산서(IS) 항목은 IS 테이블에서 우선 탐색하고,
-    못 찾으면 전체 테이블에서 재시도한다.
+    재무상태표(BS) 항목은 BS 테이블에서만, 손익계산서(IS) 항목은 IS 테이블에서만 탐색한다.
+    전체 테이블 fallback 없음: 오분류 방지를 위해 유형이 맞는 테이블만 사용한다.
 
     Args:
         soup: _parse_dart_xml() 반환값
@@ -281,9 +287,8 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
             is_tables.append(rows)
 
     for item in FINANCIAL_ITEMS:
-        # fs_type에 맞는 테이블 우선 탐색
-        priority = bs_tables if item["fs_type"] == "BS" else is_tables
-        search_order = priority + all_tables  # 못 찾으면 전체 재시도
+        # fs_type에 맞는 테이블에서만 탐색 (fallback 없음)
+        search_order = bs_tables if item["fs_type"] == "BS" else is_tables
 
         for rows in search_order:
             val = find_item_in_table(rows, item["keywords"])
