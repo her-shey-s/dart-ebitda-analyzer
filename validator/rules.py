@@ -158,6 +158,11 @@ _CFS_OFS_MIN_ITEMS = 2       # 패턴 판별에 필요한 최소 불일치 항�
 _CFS_OFS_RATIO_MIN = 0.20   # 불일치 비율이 이 값 이상이면 CFS/OFS 가능
 _CFS_OFS_RATIO_MAX = 0.95   # 이 값을 넘으면 너무 달라서 다른 원인 가능
 
+# DART 두 API 간 집계 기준 차이(비지배지분 포함 여부 등)로 발생하는 근소 차이:
+# 비율이 0.95~1.05 사이면 API 특성으로 인한 소수 차이로 간주 → warning
+_NEAR_MATCH_MIN = 0.95
+_NEAR_MATCH_MAX = 1.05
+
 
 def _is_cfs_ofs_confusion(ratios: list[float]) -> bool:
     """
@@ -188,6 +193,7 @@ def check_cross_validation(
 
     불일치 원인 분류:
       - CFS/OFS 혼동: DART가 CFS 요청에 OFS를 반환하는 알려진 버그 → severity=warning
+      - API 근소 차이: 비율 0.95~1.05, DART 두 API 간 집계 기준 차이 → severity=warning
       - 실제 불일치: 원인 불명의 수치 차이 → severity=critical
 
     Args:
@@ -218,10 +224,24 @@ def check_cross_validation(
     if not mismatches:
         return []
 
-    # 혼동 패턴 여부 결정
-    is_confusion = _is_cfs_ofs_confusion(ratios)
-    severity = "warning" if is_confusion else "critical"
-    cause = "DART API CFS/OFS 혼동 가능성" if is_confusion else "수치 불일치"
+    # 원인 분류
+    is_confusion  = _is_cfs_ofs_confusion(ratios)
+    near_match_count = sum(_NEAR_MATCH_MIN < r < _NEAR_MATCH_MAX for r in ratios)
+    is_near_match = (
+        len(ratios) >= _CFS_OFS_MIN_ITEMS
+        and near_match_count >= len(ratios) * 0.5
+        and not is_confusion  # CFS/OFS 혼동과 중복 분류 방지
+    )
+
+    if is_confusion:
+        severity = "warning"
+        cause    = "DART API CFS/OFS 혼동 가능성"
+    elif is_near_match:
+        severity = "warning"
+        cause    = "DART API 집계 기준 차이"
+    else:
+        severity = "critical"
+        cause    = "수치 불일치"
 
     checks = []
     for name, v1, v2, diff in mismatches:
