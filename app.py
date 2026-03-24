@@ -64,20 +64,21 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     기업명·연도 1쌍에 대한 전체 파이프라인을 실행하여 결과 딕셔너리를 반환한다.
 
     반환 키:
-        corp_name, year, corp_code, path, report_nm, fs_div,
+        corp_name, year, corp_code, path, report_nm, report_type, fs_div,
         items, validation, status, error_msg
     """
     base: dict = {
-        "corp_name": corp_name,
-        "year":      year,
-        "corp_code": "-",
-        "path":      "-",
-        "report_nm": "-",
-        "fs_div":    "-",
-        "items":     {item["name"]: None for item in FINANCIAL_ITEMS},
-        "validation": None,
-        "status":    "ok",
-        "error_msg": "",
+        "corp_name":   corp_name,
+        "year":        year,
+        "corp_code":   "-",
+        "path":        "-",
+        "report_nm":   "-",
+        "report_type": "-",
+        "fs_div":      "-",
+        "items":       {item["name"]: None for item in FINANCIAL_ITEMS},
+        "validation":  None,
+        "status":      "ok",
+        "error_msg":   "",
     }
 
     # 1. corp_code 조회
@@ -108,8 +109,9 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     if report is None:
         return {**base, "status": "no_report", "error_msg": "보고서 없음"}
 
-    base["path"]      = report["path"]
-    base["report_nm"] = report["report_nm"]
+    base["path"]        = report["path"]
+    base["report_nm"]   = report["report_nm"]
+    base["report_type"] = report.get("report_type", "-")
 
     # 4. 재무 데이터 추출
     try:
@@ -142,6 +144,19 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
 # ── 결과 → DataFrame ──────────────────────────────────────────────────────────
 
+def _fs_label(r: dict) -> str:
+    """결과 딕셔너리에서 재무제표기준(연결/별도)을 반환한다."""
+    if r["path"] == "A":
+        return "연결" if r.get("fs_div") == "CFS" else "별도"
+    # 경로B: report_type으로 판단
+    rt = r.get("report_type", "-")
+    if rt == "audit_consol":
+        return "연결"
+    if rt == "audit_separate":
+        return "별도"
+    return "-"
+
+
 def _to_summary_df(results: list[dict]) -> pd.DataFrame:
     """결과 리스트를 요약 표시용 DataFrame으로 변환한다."""
     rows = []
@@ -157,10 +172,11 @@ def _to_summary_df(results: list[dict]) -> pd.DataFrame:
             valid_str = r["error_msg"]
 
         row = {
-            "기업명":   r["corp_name"],
-            "연도":     r["year"],
-            "경로":     r["path"],
-            "보고서":   r["report_nm"],
+            "기업명":       r["corp_name"],
+            "연도":         r["year"],
+            "재무제표기준": _fs_label(r),
+            "경로":         r["path"],
+            "보고서":       r["report_nm"],
         }
         for name in _DISPLAY_ITEMS:
             row[f"{name}(억)"] = _fmt_억(items.get(name))
@@ -264,7 +280,7 @@ with st.sidebar:
 
     years_selected = st.multiselect(
         "분석 연도",
-        options=list(range(2024, 2019, -1)),
+        options=list(range(2025, 2019, -1)),
         default=[2023],
     )
 
