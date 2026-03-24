@@ -14,6 +14,7 @@ dart_api/report_finder.py
 정정보고서가 있으면 접수일 기준 최신 본(정정본)을 우선 선택한다.
 """
 
+import re
 from typing import Optional
 
 import requests
@@ -87,6 +88,12 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
         if item is None:
             continue
 
+        # 보고서명에서 사업연도 추출하여 요청 연도와 일치 여부 검증
+        # 예: "감사보고서 (2024.12)" → 2024 ≠ 2025(요청) → 스킵
+        report_year = _extract_year_from_report_nm(item["report_nm"])
+        if report_year is not None and report_year != year:
+            continue
+
         return {
             "path":        spec["path"],
             "rcept_no":    item["rcept_no"],
@@ -153,6 +160,22 @@ def _fetch_latest_disclosure(
         "report_nm": latest["report_nm"],
         "rcept_dt":  latest["rcept_dt"],
     }
+
+
+def _extract_year_from_report_nm(report_nm: str) -> Optional[int]:
+    """
+    보고서명에서 사업연도를 추출한다.
+
+    DART 보고서명 패턴: "감사보고서 (2024.12)", "사업보고서 (2023.12)" 등
+
+    Args:
+        report_nm: DART 보고서명 문자열
+
+    Returns:
+        사업연도(int) 또는 None (패턴 없으면 검증 생략)
+    """
+    m = re.search(r"\((\d{4})\.\d{2}\)", report_nm)
+    return int(m.group(1)) if m else None
 
 
 def get_document_index(rcept_no: str) -> list[dict]:

@@ -205,17 +205,24 @@ def _classify_table(rows: list[list[str]]) -> str:
 
 # ── 항목 추출 ──────────────────────────────────────────────────────────────
 
-def find_item_in_table(rows: list[list[str]], keywords: list[str]) -> Optional[float]:
+def find_item_in_table(
+    rows: list[list[str]],
+    keywords: list[str],
+    negate_keywords: list[str] | None = None,
+) -> Optional[float]:
     """
     행 리스트에서 keywords와 일치하는 항목명을 찾아 당기 금액을 반환한다.
 
     - 첫 번째 컬럼이 항목명, 이후 컬럼 중 첫 번째 숫자 컬럼이 당기 금액
     - normalize_label() 적용 후 keywords와 정확히 일치(==)하는지 비교
       → 부분 일치 사용 안 함: "영업외이익" ≠ "영업이익"
+    - negate_keywords: 해당 키워드로 매칭되면 양수 값을 음수로 반전
+      (예: "영업손실" → 12억 → -12억)
 
     Args:
-        rows:     _xml_table_to_rows() 반환값
-        keywords: config.FINANCIAL_ITEMS의 keywords (정규화된 형태)
+        rows:            _xml_table_to_rows() 반환값
+        keywords:        config.FINANCIAL_ITEMS의 keywords (정규화된 형태)
+        negate_keywords: 부호 반전이 필요한 키워드 목록 (선택)
 
     Returns:
         금액(float) 또는 None
@@ -224,33 +231,29 @@ def find_item_in_table(rows: list[list[str]], keywords: list[str]) -> Optional[f
         return None
 
     keyword_set = set(keywords)
+    negate_set  = set(negate_keywords) if negate_keywords else set()
 
     # 주석 컬럼 인덱스 탐지: 헤더 행에 "주석" 포함 → 금액 컬럼 탐색 시 제외
     header = rows[0] if rows else []
     skip_cols = {ci for ci, cell in enumerate(header) if "주석" in cell}
 
-    # 금액 컬럼 인덱스: 헤더 건너뛰고 주석 컬럼도 건너뛴 뒤 최초 숫자 컬럼
-    amount_col = None
-    for row in rows[1:]:
-        for ci in range(1, len(row)):
-            if ci in skip_cols:
-                continue
-            if _is_numeric_cell(row[ci]):
-                amount_col = ci
-                break
-        if amount_col is not None:
-            break
-
-    if amount_col is None:
-        return None
-
+    # 매칭된 행마다 동적으로 첫 번째 숫자 컬럼을 탐색한다.
+    # → 고정 amount_col을 사용하지 않음:
+    #   소계 행(자산총계 등)은 col 3에, 상세 행(결손금 등)은 col 2에 값이 있는
+    #   이중 컬럼 구조 테이블에서도 각 행이 올바른 값을 찾을 수 있다.
     for row in rows:
         if not row:
             continue
         norm = normalize_label(row[0])
         if norm in keyword_set:
-            if len(row) > amount_col:
-                return _to_float(row[amount_col])
+            for ci in range(1, len(row)):
+                if ci in skip_cols:
+                    continue
+                val = _to_float(row[ci])
+                if val is not None:
+                    if norm in negate_set and val > 0:
+                        val = -val
+                    return val
 
     return None
 
@@ -291,7 +294,7 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
         search_order = bs_tables if item["fs_type"] == "BS" else is_tables
 
         for rows in search_order:
-            val = find_item_in_table(rows, item["keywords"])
+            val = find_item_in_table(rows, item["keywords"], item.get("negate_keywords"))
             if val is not None:
                 result[item["name"]] = val
                 break
