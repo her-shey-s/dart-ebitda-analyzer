@@ -302,6 +302,39 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     return result
 
 
+def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
+    """
+    BS/IS 테이블의 텍스트를 AI 재추출용으로 압축하여 반환한다.
+
+    분류된 테이블만 포함하여 불필요한 텍스트를 줄인다.
+    각 행은 '항목명: 값' 형태로 변환한다.
+
+    Args:
+        soup: _parse_dart_xml() 반환값
+
+    Returns:
+        테이블 텍스트 문자열 (최대 4000자)
+    """
+    lines: list[str] = []
+    for table_tag in soup.find_all("table"):
+        rows = _xml_table_to_rows(table_tag)
+        if not rows:
+            continue
+        fs_type = _classify_table(rows)
+        if fs_type not in ("BS", "IS"):
+            continue
+        lines.append(f"[{fs_type}]")
+        for row in rows:
+            if row and len(row) >= 2:
+                label = normalize_label(row[0])
+                vals  = " | ".join(c for c in row[1:] if c.strip())
+                if label and vals:
+                    lines.append(f"{label}: {vals}")
+        if len("\n".join(lines)) > 4000:
+            break
+    return "\n".join(lines)[:4000]
+
+
 # ── 경로B 메인 함수 ────────────────────────────────────────────────────────
 
 def get_financial_data_path_b(rcept_no: str) -> dict:
@@ -349,6 +382,21 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
 
     # 3. 항목 추출
     items = _extract_all_items(soup)
+
+    # 4. AI 재추출: 못 찾은 항목이 4개 이상이고 GEMINI_API_KEY가 있을 때
+    missing = [k for k, v in items.items() if v is None]
+    if len(missing) >= 4:
+        try:
+            from config import GEMINI_API_KEY
+            if GEMINI_API_KEY:
+                from gemini_parser import extract_from_raw_text
+                table_text = _extract_table_text_for_ai(soup)
+                ai_items = extract_from_raw_text(table_text, missing)
+                for k, v in ai_items.items():
+                    if v is not None and items.get(k) is None:
+                        items[k] = v
+        except Exception:
+            pass  # AI 재추출 실패는 무시
 
     return {
         "items":       items,

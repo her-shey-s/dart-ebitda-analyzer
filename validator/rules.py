@@ -248,8 +248,8 @@ def validate_with_ai(
     """
     3단계: AI(Gemini Flash)로 검증한다.
 
-    1·2단계에서 critical 플래그가 달린 건만 이 단계를 호출한다.
-    현재는 시그니처만 정의되어 있으며, gemini_parser.py 연결 시 구현한다.
+    critical 실패가 있는 건에 대해 gemini_parser.verify_financial_data()를 호출하여
+    데이터 정합성을 AI로 재검토한다. API 키 미설정 또는 호출 실패 시 기존 결과 유지.
 
     Args:
         validation_result: validate() 반환값 (1·2단계 결과)
@@ -259,13 +259,19 @@ def validate_with_ai(
 
     Returns:
         validate()와 동일한 형식에 "ai_result" 키 추가된 딕셔너리
-
-    Raises:
-        NotImplementedError: 미구현 상태
+        ai_result: {
+            "verdict":     "correct"|"error"|"uncertain"|"skipped",
+            "issues":      [...],
+            "corrections": {...},
+        }
     """
-    raise NotImplementedError(
-        "3단계 AI 검증은 gemini_parser.py 연결 후 구현 예정입니다."
-    )
+    try:
+        from gemini_parser import verify_financial_data
+        ai_result = verify_financial_data(items, validation_result, corp_name, year)
+    except Exception as e:
+        ai_result = {"verdict": "skipped", "issues": [f"AI 모듈 오류: {e}"], "corrections": {}}
+
+    return {**validation_result, "ai_result": ai_result}
 
 
 # ── 메인 검증 함수 ────────────────────────────────────────────────────────

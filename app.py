@@ -13,13 +13,13 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from config import FINANCIAL_ITEMS
+from config import FINANCIAL_ITEMS, GEMINI_API_KEY
 from dart_api.corp_search import get_corp_code, search_corp
 from dart_api.financial_api import get_financial_data_path_a
 from dart_api.html_parser import get_financial_data_path_b
 from dart_api.report_finder import find_report
 from utils.cache import clear_all_cache, get_cache, make_cache_key, purge_expired, set_cache
-from validator.rules import needs_ai_validation, validate
+from validator.rules import needs_ai_validation, validate, validate_with_ai
 
 # ── 페이지 설정 ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -133,9 +133,17 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         validation = validate(data["items"], data.get("cross_check", {}), path=report["path"])
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
+
+    # 6. AI 검증 (GEMINI_API_KEY 있고 needs_ai_validation인 경우만)
+    if GEMINI_API_KEY and needs_ai_validation(validation):
+        try:
+            validation = validate_with_ai(validation, data["items"], corp_name, year)
+        except Exception:
+            pass  # AI 검증 실패는 기존 결과 유지
+
     base["validation"] = validation
 
-    # 6. 캐시 저장
+    # 7. 캐시 저장
     if use_cache:
         set_cache(cache_key, base, ttl_hours=48)
 
@@ -297,6 +305,21 @@ def _render_validation_detail(result: dict) -> None:
             st.warning(flag)
     else:
         st.success("이상 없음")
+
+    # AI 검증 결과
+    ai = val.get("ai_result")
+    if ai and ai.get("verdict") != "skipped":
+        st.markdown("**AI 검증 결과 (Gemini Flash):**")
+        verdict = ai.get("verdict", "uncertain")
+        verdict_display = {"correct": "✅ 정상", "error": "❌ 오류", "uncertain": "⚠️ 불확실"}.get(verdict, verdict)
+        st.info(f"판정: {verdict_display}")
+        if ai.get("issues"):
+            for issue in ai["issues"]:
+                st.warning(issue)
+        if ai.get("corrections"):
+            st.markdown("**AI 수정 제안:**")
+            corr_rows = [{"항목": k, "수정값(원)": f"{v:,.0f}"} for k, v in ai["corrections"].items()]
+            st.dataframe(pd.DataFrame(corr_rows), hide_index=True, use_container_width=True)
 
     # 재무 상세
     items = result.get("items", {})
