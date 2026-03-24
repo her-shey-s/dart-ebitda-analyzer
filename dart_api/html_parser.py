@@ -65,18 +65,55 @@ def extract_tables_from_html(html: str) -> list[pd.DataFrame]:
     return tables
 
 
-def _normalize_text(text: str) -> str:
-    """공백·특수문자를 제거하여 키워드 매칭을 단순화한다."""
-    return re.sub(r"[\s\u3000\xa0\u200b]+", "", text)
+def normalize_label(text: str) -> str:
+    """
+    재무제표 테이블 항목명을 정규화하여 키워드 매칭에 사용할 형태로 변환한다.
+
+    처리 순서:
+      1. 모든 공백 제거 (스페이스, 탭, nbsp, 전각공백, 제로폭공백 등)
+      2. 선두 로마자 번호 + 마침표 제거 (I., II., III., IV., V. 등, 대소문자)
+      3. 선두 아라비아 숫자 번호 + 마침표 제거 (1., 2., 등)
+      4. 선두 한글 목차 번호 + 마침표 제거 (가., 나., 다. 등)
+      5. 선두 괄호형 번호 제거 ((1), (2) 등)
+      6. 앞뒤 마침표 정리
+
+    Examples:
+        "III. 영 업 이 익"  → "영업이익"
+        "1. 매 출 액"       → "매출액"
+        "가.  당기순이익"   → "당기순이익"
+        "(2)영업이익(손실)" → "영업이익(손실)"
+
+    Args:
+        text: 테이블 셀의 원본 항목명 문자열
+
+    Returns:
+        정규화된 문자열
+    """
+    # 1. 모든 공백 변종 제거
+    text = re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
+    # 2. 선두 로마자 번호 + 마침표 (대소문자 모두)
+    text = re.sub(r"^[IVXivx]+\.", "", text)
+    # 3. 선두 아라비아 숫자 + 마침표
+    text = re.sub(r"^\d+\.", "", text)
+    # 4. 선두 한글 목차 번호 + 마침표
+    text = re.sub(r"^[가-힣]\.", "", text)
+    # 5. 선두 괄호형 번호
+    text = re.sub(r"^\(\d+\)", "", text)
+    # 6. 앞뒤 마침표
+    text = text.strip(".")
+    return text
 
 
 def find_item_in_table(df: pd.DataFrame, keywords: list[str]) -> Optional[float]:
     """
     DataFrame의 첫 번째 컬럼에서 키워드를 찾고, 당기 금액(보통 두 번째 숫자 컬럼)을 반환한다.
 
+    항목명은 normalize_label()로 전처리한 뒤 keywords와 정확히 일치(==)하는지 비교한다.
+    부분 문자열 매칭을 사용하지 않으므로 "영업외이익"이 "영업이익"에 오매칭되지 않는다.
+
     Args:
         df:       재무제표 테이블 DataFrame
-        keywords: 매칭할 키워드 리스트 (config.FINANCIAL_ITEMS의 keywords)
+        keywords: 매칭할 키워드 리스트 (config.FINANCIAL_ITEMS의 keywords, 정규화된 형태)
 
     Returns:
         금액(float) 또는 None
@@ -91,11 +128,12 @@ def find_item_in_table(df: pd.DataFrame, keywords: list[str]) -> Optional[float]
         return None
     amount_col = numeric_cols[0]
 
-    norm_keywords = [_normalize_text(kw) for kw in keywords]
+    # keywords는 이미 정규화된 형태로 config에 정의되어 있으므로 set 변환만
+    keyword_set = set(keywords)
 
     for idx, label in enumerate(label_col):
-        norm_label = _normalize_text(label)
-        if any(kw in norm_label for kw in norm_keywords):
+        norm_label = normalize_label(label)
+        if norm_label in keyword_set:   # 정확한 문자열 일치
             raw = df.iloc[idx][amount_col]
             return _to_float(raw)
 

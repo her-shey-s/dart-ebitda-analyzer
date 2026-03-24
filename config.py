@@ -49,32 +49,34 @@ REPORT_CODES = {
 
 FINANCIAL_ITEMS = [
     # ── 재무상태표 항목 ──────────────────────────────────────────────────
+    # keywords는 normalize_label() 적용 후 정확히 일치해야 하는 정규화된 문자열
     {
         "name":      "총자산",
         "dart_code": "ifrs-full_Assets",
         "fs_type":   "BS",
-        "keywords":  ["자산총계", "총자산", "자산 총계"],
+        "keywords":  ["자산총계", "총자산"],
         "sign":      1,
     },
     {
         "name":      "총부채",
         "dart_code": "ifrs-full_Liabilities",
         "fs_type":   "BS",
-        "keywords":  ["부채총계", "총부채", "부채 총계"],
+        "keywords":  ["부채총계", "총부채"],
         "sign":      1,
     },
     {
         "name":      "자본총계",
         "dart_code": "ifrs-full_Equity",
         "fs_type":   "BS",
-        "keywords":  ["자본총계", "총자본", "자본 총계"],
+        "keywords":  ["자본총계", "총자본"],
         "sign":      1,
     },
     {
         "name":      "이익잉여금",
         "dart_code": "ifrs-full_RetainedEarnings",
         "fs_type":   "BS",
-        "keywords":  ["이익잉여금", "결손금", "이익잉여금(결손금)", "미처분이익잉여금"],
+        # "결손금"은 독립 행으로 나타날 때만 해당 항목이므로 포함
+        "keywords":  ["이익잉여금", "이익잉여금(결손금)", "결손금", "미처분이익잉여금"],
         "sign":      1,
     },
     # ── 손익계산서 항목 ──────────────────────────────────────────────────
@@ -82,35 +84,38 @@ FINANCIAL_ITEMS = [
         "name":      "매출액",
         "dart_code": "ifrs-full_Revenue",
         "fs_type":   "IS",
-        "keywords":  ["매출액", "영업수익", "수익(매출액)", "매출", "수익"],
+        # "매출", "수익" 단독은 너무 광범위하여 제외
+        "keywords":  ["매출액", "영업수익", "수익(매출액)", "매출수익"],
         "sign":      1,
     },
     {
         "name":      "매출원가",
         "dart_code": "ifrs-full_CostOfSales",
         "fs_type":   "IS",
-        "keywords":  ["매출원가", "영업비용", "매출액의 원가"],
+        # "영업비용"은 판관비 포함 가능성 → 제외; "매출액의원가"는 정규화 후 형태
+        "keywords":  ["매출원가", "매출액의원가", "제품매출원가", "상품매출원가"],
         "sign":      1,
     },
     {
         "name":      "매출총이익",
         "dart_code": "ifrs-full_GrossProfit",
         "fs_type":   "IS",
-        "keywords":  ["매출총이익", "매출총손실", "매출총이익(손실)"],
+        "keywords":  ["매출총이익", "매출총이익(손실)", "매출총손실"],
         "sign":      1,
     },
     {
         "name":      "영업이익",
         "dart_code": "dart_OperatingIncomeLoss",
         "fs_type":   "IS",
-        "keywords":  ["영업이익", "영업손실", "영업이익(손실)", "영업손익"],
+        # "영업외이익" 오매칭 방지: 정확히 일치하는 표현만 포함
+        "keywords":  ["영업이익", "영업이익(손실)", "영업손실", "영업손익"],
         "sign":      1,
     },
     {
         "name":      "당기순이익",
         "dart_code": "ifrs-full_ProfitLoss",
         "fs_type":   "IS",
-        "keywords":  ["당기순이익", "당기순손실", "당기순이익(손실)", "분기순이익"],
+        "keywords":  ["당기순이익", "당기순이익(손실)", "당기순손실", "분기순이익", "반기순이익"],
         "sign":      1,
     },
 ]
