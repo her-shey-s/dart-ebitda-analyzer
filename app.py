@@ -188,22 +188,71 @@ def _to_summary_df(results: list[dict]) -> pd.DataFrame:
 
 # ── 결과 → Excel bytes ────────────────────────────────────────────────────────
 
+def _to_excel_summary_df(results: list[dict]) -> pd.DataFrame:
+    """엑셀용 요약 DataFrame: 금액 컬럼을 억 단위 숫자(float)로 반환한다."""
+    rows = []
+    for r in results:
+        items = r.get("items", {})
+        val   = r.get("validation")
+
+        if r["status"] == "ok":
+            valid_str = "통과" if (val and val["is_valid"]) else "검증실패"
+            if val and needs_ai_validation(val):
+                valid_str += "(AI검토필요)"
+        else:
+            valid_str = r["error_msg"]
+
+        row = {
+            "기업명":       r["corp_name"],
+            "연도":         r["year"],
+            "재무제표기준": _fs_label(r),
+            "경로":         r["path"],
+            "보고서":       r["report_nm"],
+        }
+        for name in _DISPLAY_ITEMS:
+            row[f"{name}(억원)"] = _fmt_억_raw(items.get(name))
+        row["검증"] = valid_str
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _apply_number_format(ws, df: pd.DataFrame, fmt: str = "#,##0") -> None:
+    """워크시트에서 숫자형 컬럼에 엑셀 숫자 서식을 적용한다."""
+    from openpyxl.styles import numbers as xl_numbers
+    numeric_cols = [i + 1 for i, col in enumerate(df.columns) if pd.api.types.is_float_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col])]
+    for col_idx in numeric_cols:
+        for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+            for cell in row:
+                if cell.value is not None:
+                    cell.number_format = fmt
+
+
 def _to_excel_bytes(results: list[dict]) -> bytes:
     """결과 리스트를 Excel bytes로 변환한다. 두 시트(요약·원본) 포함."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # 시트1: 요약 (억 단위)
-        _to_summary_df(results).to_excel(writer, sheet_name="요약", index=False)
+        # 시트1: 요약 (억원 단위 숫자)
+        df_summary = _to_excel_summary_df(results)
+        df_summary.to_excel(writer, sheet_name="요약(억원)", index=False)
+        _apply_number_format(writer.sheets["요약(억원)"], df_summary)
 
-        # 시트2: 원본 금액 (원 단위)
+        # 시트2: 원본 금액 (원 단위 숫자)
         raw_rows = []
         for r in results:
             items = r.get("items", {})
-            row = {"기업명": r["corp_name"], "연도": r["year"], "경로": r["path"]}
+            row = {
+                "기업명":       r["corp_name"],
+                "연도":         r["year"],
+                "재무제표기준": _fs_label(r),
+                "경로":         r["path"],
+            }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
             raw_rows.append(row)
-        pd.DataFrame(raw_rows).to_excel(writer, sheet_name="원본(원단위)", index=False)
+        df_raw = pd.DataFrame(raw_rows)
+        df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
+        _apply_number_format(writer.sheets["원본(원단위)"], df_raw)
 
     return buf.getvalue()
 
