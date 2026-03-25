@@ -60,8 +60,11 @@ def normalize_label(text: str) -> str:
         "V. 영업이익(손실)"          → "영업이익(손실)"
         "(2)영업이익(손실)"          → "영업이익(손실)"
     """
-    # 1. DART 주석 참조 제거 (예: <주석3,16>)
+    # 1. DART 주석 참조 제거
+    #    형식 A: <주석3,16>  (꺽쇠 태그형)
+    #    형식 B: (주석15)    (괄호형 — 식품·제조업 감사보고서에서 자주 사용)
     text = re.sub(r"<주석[\d,\s]+>", "", text)
+    text = re.sub(r"\(주석[\d,\s]+\)", "", text)
     # 2. 모든 공백 변종 제거
     text = re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
     # 3. 선두 로마자 번호 + 마침표 (ASCII: I., II. 등 / 전각 유니코드: Ⅰ Ⅱ … Ⅻ)
@@ -337,7 +340,7 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
 
 # ── 경로B 메인 함수 ────────────────────────────────────────────────────────
 
-def get_financial_data_path_b(rcept_no: str) -> dict:
+def get_financial_data_path_b(rcept_no: str, skip_gemini: bool = False) -> dict:
     """
     경로B 메인 함수: 감사보고서 rcept_no로 재무 데이터를 추출한다.
 
@@ -350,7 +353,8 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     반환 형식은 financial_api.get_financial_data_path_a()와 동일하다.
 
     Args:
-        rcept_no: 공시 접수번호 (report_finder.find_report()의 반환값)
+        rcept_no:     공시 접수번호 (report_finder.find_report()의 반환값)
+        skip_gemini:  True이면 AI 재추출을 건너뛰고 메타데이터만 반환 (배치 처리용)
 
     Returns:
         {
@@ -358,6 +362,7 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
             "cross_check": {},   # 경로B는 교차검증 없음
             "fs_div":      "OFS",  # 감사보고서는 별도 기준
             "error":       None | 오류 메시지 문자열,
+            "_pending_extraction": {table_text, missing_items} (skip_gemini=True일 때만),
         }
     """
     # 1. 다운로드
@@ -386,17 +391,31 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     # 4. AI 재추출: 못 찾은 항목이 4개 이상이고 GEMINI_API_KEY가 있을 때
     missing = [k for k, v in items.items() if v is None]
     if len(missing) >= 4:
-        try:
-            from config import GEMINI_API_KEY
-            if GEMINI_API_KEY:
-                from gemini_parser import extract_from_raw_text
-                table_text = _extract_table_text_for_ai(soup)
-                ai_items = extract_from_raw_text(table_text, missing)
-                for k, v in ai_items.items():
-                    if v is not None and items.get(k) is None:
-                        items[k] = v
-        except Exception:
-            pass  # AI 재추출 실패는 무시
+        if skip_gemini:
+            # 배치 처리용: Gemini 호출 대신 메타데이터만 반환
+            table_text = _extract_table_text_for_ai(soup)
+            return {
+                "items":       items,
+                "cross_check": {},
+                "fs_div":      "OFS",
+                "error":       None,
+                "_pending_extraction": {
+                    "table_text":    table_text,
+                    "missing_items": missing,
+                },
+            }
+        else:
+            try:
+                from config import GEMINI_API_KEY
+                if GEMINI_API_KEY:
+                    from gemini_parser import extract_from_raw_text
+                    table_text = _extract_table_text_for_ai(soup)
+                    ai_items = extract_from_raw_text(table_text, missing)
+                    for k, v in ai_items.items():
+                        if v is not None and items.get(k) is None:
+                            items[k] = v
+            except Exception:
+                pass  # AI 재추출 실패는 무시
 
     return {
         "items":       items,

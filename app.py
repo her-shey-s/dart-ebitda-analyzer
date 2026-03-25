@@ -59,9 +59,13 @@ def _fmt_억_raw(val: Optional[float]) -> Optional[float]:
 
 # ── 단일 기업·연도 분석 ───────────────────────────────────────────────────────
 
-def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
+def _analyze_one(corp_name: str, year: int, use_cache: bool, skip_gemini: bool = False) -> dict:
     """
     기업명·연도 1쌍에 대한 전체 파이프라인을 실행하여 결과 딕셔너리를 반환한다.
+
+    Args:
+        skip_gemini: True이면 Gemini API 호출을 건너뛴다 (배치 처리용).
+                     Path B 추출 시 메타데이터만 보존하고, AI 검증도 스킵한다.
 
     반환 키:
         corp_name, year, corp_code, path, report_nm, report_type, fs_div,
@@ -118,7 +122,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         if report["path"] == "A":
             data = get_financial_data_path_a(corp_code, year, report["reprt_code"])
         else:
-            data = get_financial_data_path_b(report["rcept_no"])
+            data = get_financial_data_path_b(report["rcept_no"], skip_gemini=skip_gemini)
     except Exception as e:
         return {**base, "status": "error", "error_msg": f"재무데이터 추출 오류: {e}"}
 
@@ -128,14 +132,18 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["items"]  = data["items"]
     base["fs_div"] = data.get("fs_div", "-")
 
+    # 배치용 메타데이터 보존
+    if data.get("_pending_extraction"):
+        base["_pending_extraction"] = data["_pending_extraction"]
+
     # 5. 검증
     try:
         validation = validate(data["items"], data.get("cross_check", {}), path=report["path"])
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
 
-    # 6. AI 검증 (GEMINI_API_KEY 있고 needs_ai_validation인 경우만)
-    if GEMINI_API_KEY and needs_ai_validation(validation):
+    # 6. AI 검증 (skip_gemini이면 건너뛴다 — 배치로 후처리)
+    if not skip_gemini and GEMINI_API_KEY and needs_ai_validation(validation):
         try:
             validation = validate_with_ai(validation, data["items"], corp_name, year)
         except Exception:
@@ -143,8 +151,8 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
     base["validation"] = validation
 
-    # 7. 캐시 저장
-    if use_cache:
+    # 7. 캐시 저장 (skip_gemini이면 아직 미완성이므로 캐시 안 함)
+    if use_cache and not skip_gemini:
         set_cache(cache_key, base, ttl_hours=48)
 
     return base
@@ -386,12 +394,99 @@ if analyze_btn:
         progress_bar = st.progress(0, text="분석 준비 중...")
         status_text  = st.empty()
 
+        # ── Phase 1: Gemini 없이 전체 분석 (DART API만) ───────────────
         results: list[dict] = []
         for i, (corp_name, year) in enumerate(tasks):
             status_text.markdown(f"**처리 중** ({i + 1}/{total}): `{corp_name}` {year}년")
-            result = _analyze_one(corp_name, year, use_cache)
+            result = _analyze_one(corp_name, year, use_cache, skip_gemini=True)
             results.append(result)
             progress_bar.progress((i + 1) / total, text=f"{i + 1}/{total} 완료")
+
+        # ── Phase 2: 추출 실패 건 배치 처리 (1회 Gemini 호출) ─────────
+        if GEMINI_API_KEY:
+            extraction_requests = []
+            extraction_indices = []
+
+            for idx, r in enumerate(results):
+                pending = r.get("_pending_extraction")
+                if pending and r["status"] == "ok" and not r.get("from_cache"):
+                    task_id = f"{r['corp_name']}_{r['year']}"
+                    extraction_requests.append({
+                        "task_id":       task_id,
+                        "table_text":    pending["table_text"],
+                        "missing_items": pending["missing_items"],
+                    })
+                    extraction_indices.append(idx)
+
+            if extraction_requests:
+                status_text.markdown(f"**AI 추출 중** ({len(extraction_requests)}건 일괄 처리)...")
+                from gemini_parser import batch_extract_from_raw_text
+                batch_results = batch_extract_from_raw_text(extraction_requests)
+
+                for idx in extraction_indices:
+                    r = results[idx]
+                    task_id = f"{r['corp_name']}_{r['year']}"
+                    ai_items = batch_results.get(task_id, {})
+                    for k, v in ai_items.items():
+                        if v is not None and r["items"].get(k) is None:
+                            r["items"][k] = v
+                    r.pop("_pending_extraction", None)
+
+                    # 추출 업데이트 후 검증 재실행
+                    try:
+                        r["validation"] = validate(r["items"], {}, path=r["path"])
+                    except Exception as e:
+                        r["validation"] = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
+
+        # ── Phase 3: 검증 실패 건 배치 처리 (1회 Gemini 호출) ─────────
+        if GEMINI_API_KEY:
+            verification_requests = []
+            verification_indices = []
+
+            for idx, r in enumerate(results):
+                if (r["status"] == "ok"
+                        and r["validation"]
+                        and needs_ai_validation(r["validation"])
+                        and not r.get("from_cache")):
+                    task_id = f"{r['corp_name']}_{r['year']}"
+                    failed_checks = [c for c in r["validation"]["checks"] if not c["passed"]]
+                    relevant = {k: v for k, v in r["items"].items() if v is not None}
+                    items_str = ", ".join(f"{k}={v:,.0f}원" for k, v in relevant.items())
+                    checks_str = "; ".join(
+                        f"{c['rule']}(차이={c['diff']:,.0f}원)" if isinstance(c.get("diff"), (int, float))
+                        else c["rule"]
+                        for c in failed_checks
+                    )
+                    verification_requests.append({
+                        "task_id":    task_id,
+                        "items_str":  items_str,
+                        "checks_str": checks_str,
+                        "corp_name":  r["corp_name"],
+                        "year":       r["year"],
+                    })
+                    verification_indices.append(idx)
+
+            if verification_requests:
+                status_text.markdown(f"**AI 검증 중** ({len(verification_requests)}건 일괄 처리)...")
+                from gemini_parser import batch_verify_financial_data
+                batch_results = batch_verify_financial_data(verification_requests)
+
+                for idx in verification_indices:
+                    r = results[idx]
+                    task_id = f"{r['corp_name']}_{r['year']}"
+                    ai_result = batch_results.get(task_id)
+                    if ai_result:
+                        r["validation"] = {**r["validation"], "ai_result": ai_result}
+
+        # ── 최종 캐시 저장 ────────────────────────────────────────────
+        if use_cache:
+            for r in results:
+                if r["status"] == "ok" and not r.get("from_cache"):
+                    corp_code = r.get("corp_code")
+                    if corp_code and corp_code != "-":
+                        # _pending_extraction 메타데이터 제거 후 캐시
+                        cache_data = {k: v for k, v in r.items() if not k.startswith("_")}
+                        set_cache(make_cache_key(corp_code, str(r["year"])), cache_data, ttl_hours=48)
 
         progress_bar.empty()
         status_text.empty()
