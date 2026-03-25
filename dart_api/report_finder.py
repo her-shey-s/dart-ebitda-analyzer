@@ -51,10 +51,13 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
     특정 기업·사업연도의 보고서를 탐색하여 데이터 수집 경로를 결정한다.
 
     탐색 순서: 사업보고서 → 연결감사보고서 → 감사보고서
-    각 유형에서 가장 최근 접수된 공시(정정본 포함)를 선택한다.
+    각 유형에서 요청 사업연도와 일치하는 가장 최근 공시(정정본 포함)를 선택한다.
 
-    사업연도 Y의 보고서는 Y+1년 상반기까지 제출되므로
-    검색 범위를 {year}0101 ~ {year+1}0630으로 설정한다.
+    비상장 외감기업은 감사보고서 제출이 1년 이상 지연되는 경우가 있으므로
+    검색 범위를 {year}0101 ~ {year+2}1231로 넓게 설정한다.
+    오매칭 방지는 _extract_year_from_report_nm()의 연도 검증으로 처리한다.
+    단, 1건만 조회하면 더 최신 연도 보고서에 가로막힐 수 있으므로
+    복수 건을 조회하여 연도가 일치하는 보고서 중 가장 최신 것을 선택한다.
 
     Args:
         corp_code: DART 기업 고유코드 (8자리)
@@ -76,24 +79,21 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
         requests.HTTPError: API 호출 자체가 실패한 경우
     """
     bgn_de = f"{year}0101"
-    end_de = f"{year + 1}0630"
+    end_de = f"{year + 2}1231"
 
     for spec in _SEARCH_ORDER:
-        item = _fetch_latest_disclosure(
+        items = _fetch_disclosures_for_year(
             corp_code=corp_code,
             bgn_de=bgn_de,
             end_de=end_de,
             pblntf_detail_ty=spec["pblntf_detail_ty"],
+            target_year=year,
         )
-        if item is None:
+        if not items:
             continue
 
-        # 보고서명에서 사업연도 추출하여 요청 연도와 일치 여부 검증
-        # 예: "감사보고서 (2024.12)" → 2024 ≠ 2025(요청) → 스킵
-        report_year = _extract_year_from_report_nm(item["report_nm"])
-        if report_year is not None and report_year != year:
-            continue
-
+        # 연도 일치 항목 중 가장 최근 접수(정정본 우선)
+        item = items[0]
         return {
             "path":        spec["path"],
             "rcept_no":    item["rcept_no"],
@@ -106,6 +106,74 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
     return None
 
 
+def _fetch_disclosures_for_year(
+    corp_code: str,
+    bgn_de: str,
+    end_de: str,
+    pblntf_detail_ty: str,
+    target_year: int,
+) -> list[dict]:
+    """
+    DART 공시 목록 API를 호출하여 target_year 사업연도에 해당하는 공시를
+    접수일 내림차순(정정본 우선)으로 반환한다.
+
+    검색 범위를 넓게 잡으면 다른 연도 보고서도 포함될 수 있으므로
+    _extract_year_from_report_nm()으로 연도를 검증하여 필터링한다.
+    연도 추출이 불가능한 보고서는 연도 불명으로 간주하여 포함한다.
+
+    Args:
+        corp_code:          DART 기업 고유코드
+        bgn_de:             검색 시작일 (YYYYMMDD)
+        end_de:             검색 종료일 (YYYYMMDD)
+        pblntf_detail_ty:   공시상세유형코드 (예: A001, F001, F002)
+        target_year:        필터링할 사업연도
+
+    Returns:
+        [{rcept_no, report_nm, rcept_dt}, ...] 리스트 (비어 있을 수 있음)
+
+    Raises:
+        requests.HTTPError: HTTP 레벨 오류 시
+    """
+    params = {
+        "crtfc_key":        DART_API_KEY,
+        "corp_code":        corp_code,
+        "bgn_de":           bgn_de,
+        "end_de":           end_de,
+        "pblntf_detail_ty": pblntf_detail_ty,
+        "page_count":       20,   # 지연 제출·정정본 포함하여 넉넉하게 조회
+    }
+
+    resp = requests.get(
+        DART_ENDPOINTS["disclosure_list"],
+        params=params,
+        timeout=REQUEST_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    # status 013 = 조회된 데이터가 없음
+    if data.get("status") != "000" or not data.get("list"):
+        return []
+
+    # 접수일(rcept_dt) 내림차순 정렬
+    all_items = sorted(data["list"], key=lambda x: x.get("rcept_dt", ""), reverse=True)
+
+    # target_year와 일치하는 보고서만 필터링
+    result = []
+    for item in all_items:
+        report_year = _extract_year_from_report_nm(item["report_nm"])
+        # 연도 추출 불가 → 보수적으로 포함
+        if report_year is not None and report_year != target_year:
+            continue
+        result.append({
+            "rcept_no":  item["rcept_no"],
+            "report_nm": item["report_nm"],
+            "rcept_dt":  item["rcept_dt"],
+        })
+
+    return result
+
+
 def _fetch_latest_disclosure(
     corp_code: str,
     bgn_de: str,
@@ -114,9 +182,7 @@ def _fetch_latest_disclosure(
 ) -> Optional[dict]:
     """
     DART 공시 목록 API를 호출하여 해당 유형의 가장 최근 공시 1건을 반환한다.
-
-    정정보고서는 원본보다 접수일이 늦으므로 rcept_dt 내림차순 정렬로
-    자동으로 우선 선택된다.
+    (하위 호환용 — 내부에서는 _fetch_disclosures_for_year 사용 권장)
 
     Args:
         corp_code:          DART 기업 고유코드
@@ -136,7 +202,7 @@ def _fetch_latest_disclosure(
         "bgn_de":           bgn_de,
         "end_de":           end_de,
         "pblntf_detail_ty": pblntf_detail_ty,
-        "page_count":       10,   # 정정본 포함해서 여유있게 조회
+        "page_count":       10,
     }
 
     resp = requests.get(
@@ -147,11 +213,9 @@ def _fetch_latest_disclosure(
     resp.raise_for_status()
     data = resp.json()
 
-    # status 013 = 조회된 데이터가 없음
     if data.get("status") != "000" or not data.get("list"):
         return None
 
-    # 접수일(rcept_dt) 내림차순 → 가장 최근 제출(정정본 우선)
     items = sorted(data["list"], key=lambda x: x.get("rcept_dt", ""), reverse=True)
     latest = items[0]
 

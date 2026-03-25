@@ -2,9 +2,11 @@
 gemini_parser.py
 Gemini Flash를 이용한 재무 데이터 AI 검증 및 재추출
 
-두 가지 역할:
-  1. verify_financial_data()  : critical 실패 항목을 AI로 재검토
-  2. extract_from_raw_text()  : 파싱 실패 시 테이블 텍스트에서 AI로 재추출
+네 가지 역할:
+  1. verify_financial_data()          : critical 실패 항목을 AI로 재검토 (단건)
+  2. extract_from_raw_text()          : 파싱 실패 시 테이블 텍스트에서 AI로 재추출 (단건)
+  3. batch_extract_from_raw_text()    : 여러 건의 재추출을 1회 API 호출로 배치 처리
+  4. batch_verify_financial_data()    : 여러 건의 AI 검증을 1회 API 호출로 배치 처리
 """
 
 import json
@@ -214,5 +216,166 @@ def extract_from_raw_text(
                 result[k] = float(v) if v is not None else None
             except (TypeError, ValueError):
                 result[k] = None
+
+    return result
+
+
+# ── 배치 API (RPD 절약) ──────────────────────────────────────────────────
+
+def batch_extract_from_raw_text(
+    requests: list[dict],
+) -> dict[str, dict[str, Optional[float]]]:
+    """
+    여러 건의 재추출 요청을 1회 Gemini API 호출로 배치 처리한다.
+
+    Args:
+        requests: [
+            {
+                "task_id":       "삼성전자_2023",
+                "table_text":    재무제표 테이블 원문 텍스트,
+                "missing_items": ["매출액", "영업이익", ...],
+            }, ...
+        ]
+
+    Returns:
+        {task_id: {항목명: float|None, ...}, ...}
+        실패 시 빈 딕셔너리
+    """
+    if not requests:
+        return {}
+
+    client = _get_client()
+    if client is None:
+        return {}
+
+    # 프롬프트 조립
+    sections = []
+    for i, req in enumerate(requests, 1):
+        tid = req["task_id"]
+        items_str = ", ".join(req["missing_items"])
+        truncated = req["table_text"][:3000]
+        sections.append(
+            f"=== 기업 {i}: {tid} ===\n"
+            f"요청 항목: {items_str}\n"
+            f"재무제표 텍스트:\n---\n{truncated}\n---"
+        )
+
+    task_ids = [r["task_id"] for r in requests]
+    prompt = (
+        "다음은 여러 기업의 재무제표에서 누락된 항목을 추출하는 요청이다.\n"
+        "각 기업별로 요청된 항목의 금액을 찾아 JSON으로만 응답해.\n"
+        "금액 단위는 원(KRW)이며, 찾을 수 없으면 null로 표시해.\n\n"
+        + "\n\n".join(sections) + "\n\n"
+        "응답 형식 (JSON만, 다른 텍스트 없이):\n"
+        "{" + ", ".join(f'"{tid}": {{"항목명":금액또는null}}' for tid in task_ids) + "}"
+    )
+
+    try:
+        raw = _generate(client, prompt)
+    except RuntimeError:
+        return {}
+
+    parsed = _parse_json(raw)
+    if not isinstance(parsed, dict):
+        return {}
+
+    # task_id별 결과 정규화
+    result: dict[str, dict[str, Optional[float]]] = {}
+    for req in requests:
+        tid = req["task_id"]
+        task_data = parsed.get(tid)
+        if not isinstance(task_data, dict):
+            continue
+        items: dict[str, Optional[float]] = {}
+        for k, v in task_data.items():
+            if k in req["missing_items"]:
+                try:
+                    items[k] = float(v) if v is not None else None
+                except (TypeError, ValueError):
+                    items[k] = None
+        result[tid] = items
+
+    return result
+
+
+def batch_verify_financial_data(
+    requests: list[dict],
+) -> dict[str, dict]:
+    """
+    여러 건의 AI 검증 요청을 1회 Gemini API 호출로 배치 처리한다.
+
+    Args:
+        requests: [
+            {
+                "task_id":    "삼성전자_2023",
+                "items_str":  "총자산=1,234원, ...",
+                "checks_str": "회계항등식 실패(차이=100원); ...",
+                "corp_name":  "삼성전자",
+                "year":       2023,
+            }, ...
+        ]
+
+    Returns:
+        {task_id: {"verdict": str, "issues": list, "corrections": dict}, ...}
+        실패 시 빈 딕셔너리
+    """
+    if not requests:
+        return {}
+
+    client = _get_client()
+    if client is None:
+        return {}
+
+    # 프롬프트 조립
+    sections = []
+    for i, req in enumerate(requests, 1):
+        tid = req["task_id"]
+        sections.append(
+            f"=== 기업 {i}: {tid} ===\n"
+            f"기업: {req['corp_name']}, 연도: {req['year']}\n"
+            f"데이터(원KRW): {req['items_str']}\n"
+            f"검증실패: {req['checks_str']}"
+        )
+
+    task_ids = [r["task_id"] for r in requests]
+    prompt = (
+        "숙련된 재무분석가로서 여러 기업의 재무데이터를 검토해줘.\n"
+        "각 기업별로 데이터가 맞는지 틀린지 판단하고 JSON으로만 응답해.\n\n"
+        + "\n\n".join(sections) + "\n\n"
+        "응답 형식 (JSON만):\n"
+        "{" + ", ".join(
+            f'"{tid}": {{"verdict":"correct"또는"error"또는"uncertain",'
+            f'"issues":["문제설명"],"corrections":{{"항목명":수정값}}}}'
+            for tid in task_ids
+        ) + "}"
+    )
+
+    try:
+        raw = _generate(client, prompt)
+    except RuntimeError:
+        return {}
+
+    parsed = _parse_json(raw)
+    if not isinstance(parsed, dict):
+        return {}
+
+    # task_id별 결과 정규화
+    result: dict[str, dict] = {}
+    for req in requests:
+        tid = req["task_id"]
+        task_data = parsed.get(tid)
+        if not isinstance(task_data, dict):
+            continue
+        corrections: dict[str, float] = {}
+        for k, v in task_data.get("corrections", {}).items():
+            try:
+                corrections[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+        result[tid] = {
+            "verdict":     task_data.get("verdict", "uncertain"),
+            "issues":      task_data.get("issues", []),
+            "corrections": corrections,
+        }
 
     return result
