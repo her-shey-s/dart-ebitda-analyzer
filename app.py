@@ -35,7 +35,7 @@ if "results" not in st.session_state:
 # ── 표시 컬럼 정의 ────────────────────────────────────────────────────────────
 # 요약 테이블에 표시할 재무 항목 (순서 유지)
 _DISPLAY_ITEMS = [
-    "총자산", "총부채", "이익잉여금",
+    "총자산", "총부채", "감가상각비", "무형자산상각비", "이익잉여금",
     "매출액", "매출총이익", "영업이익", "당기순이익",
 ]
 
@@ -53,8 +53,8 @@ def _fmt_억(val: Optional[float]) -> str:
 
 
 def _fmt_억_raw(val: Optional[float]) -> Optional[float]:
-    """Excel 출력용: 억 단위 float 반환."""
-    return round(val / 1e8, 1) if val is not None else None
+    """Excel 출력용: 억 단위 float 반환 (반올림 없이 원본 정밀도 유지)."""
+    return val / 1e8 if val is not None else None
 
 
 # ── 단일 기업·연도 분석 ───────────────────────────────────────────────────────
@@ -129,6 +129,22 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["items"]  = data["items"]
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
+
+    # 4-B. 모듈B: 감가상각비·무형자산상각비 추출 (주석 기반, 독립 실행)
+    try:
+        from dart_api.notes_parser import extract_depreciation
+        depr_result = extract_depreciation(report["rcept_no"])
+        depr_items = depr_result.get("items", {})
+        # 모듈A items에 병합 (기존 항목 덮어쓰지 않음)
+        for key in ("감가상각비", "무형자산상각비"):
+            if depr_items.get(key) is not None:
+                base["items"][key] = depr_items[key]
+            elif key not in base["items"]:
+                base["items"][key] = None
+    except Exception:
+        # 모듈B 실패 시 모듈A 결과에 영향 없음
+        base["items"].setdefault("감가상각비", None)
+        base["items"].setdefault("무형자산상각비", None)
 
     # 5. 검증
     try:
@@ -231,7 +247,7 @@ def _to_excel_summary_df(results: list[dict]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _apply_number_format(ws, df: pd.DataFrame, fmt: str = "#,##0") -> None:
+def _apply_number_format(ws, df: pd.DataFrame, fmt: str = "#,##0_);(#,##0);-_)") -> None:
     """워크시트에서 숫자형 컬럼에 엑셀 숫자 서식을 적용한다."""
     from openpyxl.styles import numbers as xl_numbers
     numeric_cols = [i + 1 for i, col in enumerate(df.columns) if pd.api.types.is_float_dtype(df[col]) or pd.api.types.is_integer_dtype(df[col])]
@@ -251,7 +267,7 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
 
     # 항목 표시 순서: 매출 먼저, 그 다음 BS
     _EXCEL_ITEMS = ["매출액", "매출총이익", "영업이익", "당기순이익",
-                    "총자산", "총부채", "이익잉여금"]
+                    "총자산", "총부채", "감가상각비", "무형자산상각비", "이익잉여금"]
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -313,7 +329,7 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                 for col_idx in range(2, 2 + len(years)):
                     cell = ws.cell(row=row_idx, column=col_idx)
                     if cell.value is not None:
-                        cell.number_format = "#,##0.0"
+                        cell.number_format = "#,##0_);(#,##0);-_)"
                         cell.alignment = Alignment(horizontal="right")
 
             # 항목 컬럼 너비 조정
@@ -461,11 +477,13 @@ with st.sidebar:
         height=180,
     )
 
-    years_selected = st.multiselect(
-        "분석 연도",
-        options=list(range(2025, 2019, -1)),
-        default=[2023],
-    )
+    year_options = list(range(2020, 2026))  # 2020~2025
+    col_y1, col_y2 = st.columns(2)
+    with col_y1:
+        year_start = st.selectbox("시작 연도", options=year_options, index=2)  # 기본 2022
+    with col_y2:
+        year_end = st.selectbox("끝 연도", options=year_options, index=5)      # 기본 2025
+    years_selected = list(range(year_start, year_end + 1)) if year_start <= year_end else []
 
     use_cache = st.checkbox("캐시 사용", value=True)
 
