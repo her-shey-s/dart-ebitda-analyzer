@@ -130,21 +130,17 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
 
-    # 4-B. 모듈B: 감가상각비·무형자산상각비 추출 (주석 기반, 독립 실행)
-    try:
-        from dart_api.notes_parser import extract_depreciation
-        depr_result = extract_depreciation(report["rcept_no"])
-        depr_items = depr_result.get("items", {})
-        # 모듈A items에 병합 (기존 항목 덮어쓰지 않음)
-        for key in ("감가상각비", "무형자산상각비"):
-            if depr_items.get(key) is not None:
-                base["items"][key] = depr_items[key]
-            elif key not in base["items"]:
-                base["items"][key] = None
-    except Exception:
-        # 모듈B 실패 시 모듈A 결과에 영향 없음
-        base["items"].setdefault("감가상각비", None)
-        base["items"].setdefault("무형자산상각비", None)
+    # 4-B. 주석 fallback: CF에서 감가상각비를 못 찾은 경우에만 주석 탐색
+    if base["items"].get("감가상각비") is None or base["items"].get("무형자산상각비") is None:
+        try:
+            from dart_api.notes_parser import extract_depreciation
+            depr_result = extract_depreciation(report["rcept_no"])
+            depr_items = depr_result.get("items", {})
+            for key in ("감가상각비", "무형자산상각비"):
+                if base["items"].get(key) is None and depr_items.get(key) is not None:
+                    base["items"][key] = depr_items[key]
+        except Exception:
+            pass  # 주석 fallback 실패는 무시
 
     # 5. 검증
     try:

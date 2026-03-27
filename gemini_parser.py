@@ -92,16 +92,19 @@ _ITEM_NAMES = [item["name"] for item in FINANCIAL_ITEMS]
 
 def _build_extraction_prompt(table_text: str) -> str:
     """AI 추출용 프롬프트를 생성한다."""
+    fs_type_labels = {"BS": "재무상태표", "IS": "손익계산서", "CF": "현금흐름표"}
     item_lines = []
     for item in FINANCIAL_ITEMS:
         kws = ", ".join(item["keywords"])
-        item_lines.append(f'  - {item["name"]} (재무제표 표기: {kws})')
+        fs_label = fs_type_labels.get(item["fs_type"], "")
+        item_lines.append(f'  - {item["name"]} [{fs_label}] (표기: {kws})')
     item_list = "\n".join(item_lines)
 
     return (
-        "아래는 한국 기업의 감사보고서에서 추출한 재무상태표와 손익계산서 원문이다.\n"
+        "아래는 한국 기업의 감사보고서에서 추출한 재무상태표, 손익계산서, 현금흐름표 원문이다.\n"
         "다음 항목들의 '당기' 금액을 원(KRW) 단위 숫자로 추출해라.\n"
         "괄호 표기 (예: (1,234))는 음수를 의미한다.\n"
+        "감가상각비·무형자산상각비는 [CF](현금흐름표)의 영업활동 조정항목에서 찾아라.\n"
         "찾을 수 없는 항목은 null로 표시해라.\n"
         "JSON으로만 응답해라. 다른 텍스트 없이.\n\n"
         f"추출 항목:\n{item_list}\n\n"

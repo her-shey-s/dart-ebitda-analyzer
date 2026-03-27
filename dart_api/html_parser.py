@@ -369,6 +369,7 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     section_map = _build_section_table_map(soup)
     bs_tables = section_map["BS"]
     is_tables = section_map["IS"]
+    cf_tables = section_map["CF"]
 
     # TITLE 기반 분류 실패 시 (BS/IS 모두 비어있으면) 키워드 fallback
     if not bs_tables and not is_tables:
@@ -382,8 +383,11 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
             elif fs_type == "IS":
                 is_tables.append(rows)
 
+    # fs_type별 테이블 매핑
+    tables_by_type = {"BS": bs_tables, "IS": is_tables, "CF": cf_tables}
+
     for item in FINANCIAL_ITEMS:
-        search_order = bs_tables if item["fs_type"] == "BS" else is_tables
+        search_order = tables_by_type.get(item["fs_type"], is_tables)
 
         for rows in search_order:
             val = find_item_in_table(rows, item["keywords"], item.get("negate_keywords"))
@@ -396,7 +400,7 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
 
 def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
     """
-    BS/IS 테이블의 텍스트를 AI 재추출용으로 압축하여 반환한다.
+    BS/IS/CF 테이블의 텍스트를 AI 재추출용으로 압축하여 반환한다.
 
     TITLE 기반 섹션 분류된 테이블만 포함하여 불필요한 텍스트를 줄인다.
     각 행은 '항목명: 값' 형태로 변환한다.
@@ -410,10 +414,10 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
     section_map = _build_section_table_map(soup)
     lines: list[str] = []
 
-    for fs_type in ("BS", "IS"):
+    for fs_type in ("BS", "IS", "CF"):
         tables = section_map.get(fs_type, [])
-        # TITLE 기반이 비어있으면 키워드 fallback
-        if not tables:
+        # TITLE 기반이 비어있으면 키워드 fallback (BS/IS만)
+        if not tables and fs_type in ("BS", "IS"):
             for table_tag in soup.find_all("table"):
                 rows = _xml_table_to_rows(table_tag)
                 if rows and _classify_table(rows) == fs_type:

@@ -127,6 +127,21 @@ FINANCIAL_ITEMS = [
         "negate_keywords":  ["당기순손실", "분기순손실", "반기순손실"],
         "sign":      1,
     },
+    # ── 현금흐름표 항목 (EBITDA용) ─────────────────────────────────────────
+    {
+        "name":      "감가상각비",
+        "dart_code": None,    # DART 재무제표 API에 없음 (document.xml 파싱 전용)
+        "fs_type":   "CF",
+        "keywords":  ["감가상각비", "감가상각비용"],
+        "sign":      1,
+    },
+    {
+        "name":      "무형자산상각비",
+        "dart_code": None,
+        "fs_type":   "CF",
+        "keywords":  ["무형자산상각비", "무형자산상각비용", "무형자산상각"],
+        "sign":      1,
+    },
 ]
 
 # 항목명 → 설정 딕셔너리 빠른 조회
