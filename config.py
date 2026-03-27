@@ -9,8 +9,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API 키 ──────────────────────────────────────────────────────────────
-DART_API_KEY = os.getenv("DART_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# Streamlit Community Cloud secrets 우선, 로컬 환경변수 fallback
+try:
+    import streamlit as st
+    DART_API_KEY = st.secrets.get("DART_API_KEY", "") or os.getenv("DART_API_KEY", "")
+    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
+except Exception:
+    DART_API_KEY = os.getenv("DART_API_KEY", "")
+    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ── DART API 엔드포인트 ──────────────────────────────────────────────────
 DART_BASE_URL = "https://opendart.fss.or.kr/api"
