@@ -1,10 +1,9 @@
 """
 dart_api/notes_parser.py
-모듈B: DART 주석(Notes)에서 감가상각비·무형자산상각비 추출
+모듈B: 감가상각비·무형자산상각비 추출 (EBITDA용)
 
 목적:
-  EBITDA 계산에 필요한 **전체 비용 기준** 감가상각비·무형자산상각비를
-  감사보고서/사업보고서의 주석 섹션에서 추출한다.
+  EBITDA 계산에 필요한 **전체 비용 기준** 감가상각비·무형자산상각비를 추출한다.
 
 설계 원칙:
   - 기존 모듈A(재무상태표·손익계산서 추출)와 완전 독립
@@ -12,10 +11,9 @@ dart_api/notes_parser.py
   - html_parser.py의 유틸 함수만 재사용 (상태 공유 없음)
 
 워크플로우:
-  1. DART XML 다운로드 → 주석 섹션에서 "감가상각" 관련 테이블 추출
-  2. 각 테이블의 단위(원/천원/백만원) 감지 및 원 단위로 보정
-  3. AI(Gemini)가 전체 비용 기준 감가상각비 식별
-  4. Python으로 교차검증 (당기 비용 테이블 중 최대값 vs AI 결과)
+  1. DART XML 다운로드 + 파싱
+  2. [1차] 현금흐름표(CF)에서 Python 키워드 매칭으로 추출 (AI 불필요)
+  3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback (Python + AI 교차검증)
 """
 
 import re
@@ -24,6 +22,7 @@ from typing import Optional
 from bs4 import BeautifulSoup, Tag
 
 from dart_api.html_parser import (
+    _build_section_table_map,
     _download_dart_document,
     _parse_dart_xml,
     _xml_table_to_rows,
@@ -441,6 +440,59 @@ def _cross_validate(
     return final
 
 
+# ── 현금흐름표(CF) 추출 ───────────────────────────────────────────────────────
+
+def _extract_from_cf(soup: BeautifulSoup) -> dict[str, Optional[float]]:
+    """
+    현금흐름표(CF) 섹션에서 감가상각비·무형자산상각비를 추출한다.
+
+    현금흐름표의 "영업활동" 조정 항목에는 전체 비용 기준 감가상각비가
+    별도 행으로 기재되므로, 주석보다 신뢰도가 높다.
+    단위는 재무제표와 동일(원)이므로 보정이 불필요하다.
+
+    Args:
+        soup: _parse_dart_xml() 반환값
+
+    Returns:
+        {"감가상각비": float|None, "무형자산상각비": float|None}
+    """
+    section_map = _build_section_table_map(soup)
+    cf_tables = section_map.get("CF", [])
+
+    result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
+
+    for rows in cf_tables:
+        # 감가상각 키워드가 포함된 CF 테이블만 대상
+        full_text = " ".join(" ".join(r) for r in rows)
+        if "감가상각" not in full_text:
+            continue
+
+        for row in rows:
+            if not row:
+                continue
+            label = row[0].replace(" ", "").strip()
+
+            # 감가상각비: 정확 매칭 ("감가상각비" == label)
+            if label == "감가상각비" or label == "감가상각비용":
+                # CF 테이블은 보통 4~5열: 항목 | 당기금액 | 당기소계 | 전기금액 | 전기소계
+                # 첫 번째 숫자 컬럼(당기)을 가져온다
+                for cell in row[1:]:
+                    val = _parse_number(cell)
+                    if val is not None:
+                        result["감가상각비"] = val
+                        break
+
+            # 무형자산상각비
+            if label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
+                for cell in row[1:]:
+                    val = _parse_number(cell)
+                    if val is not None:
+                        result["무형자산상각비"] = val
+                        break
+
+    return result
+
+
 # ── 공개 API ──────────────────────────────────────────────────────────────────
 
 def extract_depreciation(rcept_no: str) -> dict:
@@ -483,44 +535,67 @@ def extract_depreciation(rcept_no: str) -> dict:
     except Exception as e:
         return {**base, "error": f"문서 로드 실패: {e}"}
 
-    # 2. 주석에서 감가상각 관련 테이블 수집
+    # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
+    try:
+        cf_result = _extract_from_cf(soup)
+    except Exception:
+        cf_result = {"감가상각비": None, "무형자산상각비": None}
+
+    if cf_result.get("감가상각비") is not None and cf_result.get("무형자산상각비") is not None:
+        # CF에서 둘 다 찾음 → 즉시 반환
+        return {
+            **base,
+            "items":        cf_result,
+            "source":       "cf",
+            "python_result": cf_result,
+        }
+
+    # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
         tables = _collect_depreciation_tables(soup)
     except Exception as e:
-        return {**base, "error": f"테이블 수집 실패: {e}"}
+        tables = []
+        base["error"] = f"테이블 수집 실패: {e}"
 
     base["tables_found"] = len(tables)
 
-    if not tables:
-        return {**base, "error": "감가상각 관련 주석 테이블 없음"}
-
-    # 3. Python 추출
+    # 주석 Python 추출
     try:
-        python_result = _python_extract_depreciation(tables)
-    except Exception as e:
-        python_result = {"감가상각비": None, "무형자산상각비": None}
-        base["error"] = f"Python 추출 오류: {e}"
+        notes_python = _python_extract_depreciation(tables) if tables else {"감가상각비": None, "무형자산상각비": None}
+    except Exception:
+        notes_python = {"감가상각비": None, "무형자산상각비": None}
 
-    base["python_result"] = python_result
+    # 주석 AI 추출
+    notes_ai = None
+    if tables:
+        try:
+            notes_ai = _ai_extract_depreciation(tables)
+            base["ai_result"] = notes_ai
+        except Exception as e:
+            base["error"] = f"AI 추출 실패: {e}"
 
-    # 4. AI 추출
-    try:
-        ai_result = _ai_extract_depreciation(tables)
-        base["ai_result"] = ai_result
-    except Exception as e:
-        # AI 실패 → Python 결과만 사용
-        return {
-            **base,
-            "items":  python_result,
-            "source": "python",
-            "error":  f"AI 추출 실패 (Python fallback): {e}",
-        }
+    # 주석 교차검증
+    if notes_ai:
+        notes_final = _cross_validate(notes_python, notes_ai)
+    else:
+        notes_final = notes_python
 
-    # 5. 교차검증
-    final = _cross_validate(python_result, ai_result)
+    # CF 결과와 주석 결과 병합 (CF 우선)
+    final: dict[str, Optional[float]] = {}
+    for key in ("감가상각비", "무형자산상각비"):
+        final[key] = cf_result.get(key) or notes_final.get(key)
+
+    base["python_result"] = {
+        "cf": cf_result,
+        "notes": notes_python,
+    }
+
+    source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
+             "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
+             "notes"
 
     return {
         **base,
         "items":  final,
-        "source": "cross_validated",
+        "source": source,
     }
