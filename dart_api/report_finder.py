@@ -76,7 +76,10 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
         requests.HTTPError: API 호출 자체가 실패한 경우
     """
     bgn_de = f"{year}0101"
-    end_de = f"{year + 1}0630"
+    # 일부 감사보고서는 사업연도 종료 후 2년 이상 뒤에 제출되는 경우가 있음
+    # (예: 광천김 2023 연결감사보고서 → 2025.04.18 제출)
+    # _extract_year_from_report_nm()이 사업연도를 검증하므로 넓게 잡아도 안전
+    end_de = f"{year + 2}0630"
 
     for spec in _SEARCH_ORDER:
         item = _fetch_latest_disclosure(

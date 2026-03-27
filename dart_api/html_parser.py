@@ -45,7 +45,7 @@ def normalize_label(text: str) -> str:
     재무제표 항목명을 정규화하여 keywords 매칭에 사용할 형태로 변환한다.
 
     처리 순서:
-      1. DART 주석 참조 제거: <주석XX>, <주석XX,YY> 등
+      1. DART 주석 참조 제거: <주석XX>, (주석XX) 등 양쪽 형식
       2. 모든 공백 제거 (스페이스·탭·nbsp·전각공백·제로폭공백 등)
       3. 선두 로마자 번호 + 마침표 제거 (I., II., III. 등, 대소문자)
       4. 선두 아라비아 숫자 번호 + 마침표 제거 (1., 2. 등)
@@ -55,13 +55,16 @@ def normalize_label(text: str) -> str:
 
     Examples:
         "I. 매출액<주석20>"         → "매출액"
+        "매출원가(주석15,16,21)"    → "매출원가"
         "자      산      총      계" → "자산총계"
         "III. 영 업 이 익"           → "영업이익"
         "V. 영업이익(손실)"          → "영업이익(손실)"
         "(2)영업이익(손실)"          → "영업이익(손실)"
     """
-    # 1. DART 주석 참조 제거 (예: <주석3,16>)
+    # 1. DART 주석 참조 제거 — 두 가지 형식 모두 처리
+    #    꺾쇠형: <주석3,16>  /  괄호형: (주석15,16,21)
     text = re.sub(r"<주석[\d,\s]+>", "", text)
+    text = re.sub(r"\(주석[\d,\s]+\)", "", text)
     # 2. 모든 공백 변종 제거
     text = re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
     # 3. 선두 로마자 번호 + 마침표 (ASCII: I., II. 등 / 전각 유니코드: Ⅰ Ⅱ … Ⅻ)
@@ -185,9 +188,90 @@ def _xml_table_to_rows(table_tag) -> list[list[str]]:
     return rows
 
 
+# ── TITLE 태그 기반 섹션 경계 탐지 ─────────────────────────────────────────
+
+# DART XML <TITLE> 태그의 섹션명 → fs_type 매핑
+# 재무상태표 항목: "재무상태표" ~ "손익계산서" TITLE 사이
+# 손익계산서 항목: "손익계산서" ~ "현금흐름표" TITLE 사이
+# 주석은 제외하지 않음 → 추후 감가상각비 등 주석 기반 추출 확장 가능
+_SECTION_ORDER = ["재무상태표", "손익계산서", "자본변동표", "현금흐름표", "주석"]
+
+
+def _normalize_title(text: str) -> str:
+    """TITLE 태그 텍스트에서 공백을 제거하여 섹션명을 정규화한다.
+
+    DART XML의 TITLE 태그는 '재 무 상 태 표' 처럼 전각/반각 공백이 섞여 있다.
+    """
+    return re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
+
+
+def _build_section_table_map(
+    soup: BeautifulSoup,
+) -> dict[str, list[list[list[str]]]]:
+    """
+    TITLE 태그 위치를 기준으로 각 섹션에 속하는 테이블을 분류한다.
+
+    DART XML 구조:
+      <TITLE>재 무 상 태 표</TITLE>  (pos A)
+      <TABLE> ... </TABLE>           ← BS 테이블
+      <TITLE>손 익 계 산 서</TITLE>  (pos B)
+      <TABLE> ... </TABLE>           ← IS 테이블
+      ...
+
+    각 테이블은 자신 바로 앞에 있는 TITLE의 섹션에 배정된다.
+
+    Returns:
+        {"BS": [...], "IS": [...], "CF": [...], "NOTES": [...]}
+    """
+    # 1. 모든 TITLE 태그의 위치 + 섹션명 수집
+    title_positions: list[tuple[int, str]] = []  # (source_pos, section_key)
+    section_key_map = {
+        "재무상태표": "BS",
+        "손익계산서": "IS",
+        "포괄손익계산서": "IS",
+        "자본변동표": "EQ",
+        "현금흐름표": "CF",
+        "주석": "NOTES",
+    }
+
+    for title_tag in soup.find_all("title"):
+        raw = title_tag.get_text(strip=True)
+        norm = _normalize_title(raw)
+        # TITLE 텍스트에 섹션명이 포함되어 있으면 매핑
+        for section_name, key in section_key_map.items():
+            if section_name in norm:
+                # sourcepos 대용: 태그의 문서 내 순서를 유지하기 위해 리스트 순서 사용
+                title_positions.append((id(title_tag), key))
+                break
+
+    # 2. 모든 TABLE 태그를 순회하면서 직전 TITLE의 섹션에 배정
+    #    soup의 descendants 순서 = 문서 순서이므로, TITLE과 TABLE을 함께 순회
+    result: dict[str, list[list[list[str]]]] = {
+        "BS": [], "IS": [], "CF": [], "EQ": [], "NOTES": [],
+    }
+
+    current_section: str | None = None
+    for tag in soup.descendants:
+        if tag.name == "title":
+            raw = tag.get_text(strip=True)
+            norm = _normalize_title(raw)
+            for section_name, key in section_key_map.items():
+                if section_name in norm:
+                    current_section = key
+                    break
+        elif tag.name == "table" and current_section is not None:
+            rows = _xml_table_to_rows(tag)
+            if rows:
+                result[current_section].append(rows)
+
+    return result
+
+
 def _classify_table(rows: list[list[str]]) -> str:
     """
-    행 데이터로 테이블 유형을 분류한다.
+    행 데이터로 테이블 유형을 분류한다. (fallback용)
+
+    TITLE 기반 섹션 분류가 실패했을 때 키워드 기반으로 분류한다.
 
     Args:
         rows: _xml_table_to_rows() 반환값
@@ -234,8 +318,12 @@ def find_item_in_table(
     negate_set  = set(negate_keywords) if negate_keywords else set()
 
     # 주석 컬럼 인덱스 탐지: 헤더 행에 "주석" 포함 → 금액 컬럼 탐색 시 제외
+    # 공백 제거 후 비교: DART XML에서 "주  석", "주   석" 등 변종 대응
     header = rows[0] if rows else []
-    skip_cols = {ci for ci, cell in enumerate(header) if "주석" in cell}
+    skip_cols = {
+        ci for ci, cell in enumerate(header)
+        if "주석" in re.sub(r"\s+", "", cell)
+    }
 
     # 매칭된 행마다 동적으로 첫 번째 숫자 컬럼을 탐색한다.
     # → 고정 amount_col을 사용하지 않음:
@@ -262,8 +350,12 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     """
     파싱된 DART XML에서 모든 FINANCIAL_ITEMS를 추출한다.
 
-    재무상태표(BS) 항목은 BS 테이블에서만, 손익계산서(IS) 항목은 IS 테이블에서만 탐색한다.
-    전체 테이블 fallback 없음: 오분류 방지를 위해 유형이 맞는 테이블만 사용한다.
+    1차: TITLE 태그 기반 섹션 경계로 테이블 분류
+         - BS 항목: <TITLE>재무상태표 ~ <TITLE>손익계산서 사이 테이블
+         - IS 항목: <TITLE>손익계산서 ~ <TITLE>현금흐름표 사이 테이블
+    2차: TITLE이 없는 문서를 위한 fallback → 키워드 기반 테이블 분류
+
+    주석 섹션은 제외하지 않음: 추후 감가상각비 등 주석 기반 추출 확장 가능.
 
     Args:
         soup: _parse_dart_xml() 반환값
@@ -273,24 +365,24 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     """
     result: dict[str, Optional[float]] = {item["name"]: None for item in FINANCIAL_ITEMS}
 
-    # 테이블을 유형별로 분류
-    bs_tables: list[list[list[str]]] = []
-    is_tables: list[list[list[str]]] = []
-    all_tables: list[list[list[str]]] = []
+    # 1차: TITLE 태그 기반 섹션 분류
+    section_map = _build_section_table_map(soup)
+    bs_tables = section_map["BS"]
+    is_tables = section_map["IS"]
 
-    for table_tag in soup.find_all("table"):
-        rows = _xml_table_to_rows(table_tag)
-        if not rows:
-            continue
-        all_tables.append(rows)
-        fs_type = _classify_table(rows)
-        if fs_type == "BS":
-            bs_tables.append(rows)
-        elif fs_type == "IS":
-            is_tables.append(rows)
+    # TITLE 기반 분류 실패 시 (BS/IS 모두 비어있으면) 키워드 fallback
+    if not bs_tables and not is_tables:
+        for table_tag in soup.find_all("table"):
+            rows = _xml_table_to_rows(table_tag)
+            if not rows:
+                continue
+            fs_type = _classify_table(rows)
+            if fs_type == "BS":
+                bs_tables.append(rows)
+            elif fs_type == "IS":
+                is_tables.append(rows)
 
     for item in FINANCIAL_ITEMS:
-        # fs_type에 맞는 테이블에서만 탐색 (fallback 없음)
         search_order = bs_tables if item["fs_type"] == "BS" else is_tables
 
         for rows in search_order:
@@ -306,33 +398,39 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
     """
     BS/IS 테이블의 텍스트를 AI 재추출용으로 압축하여 반환한다.
 
-    분류된 테이블만 포함하여 불필요한 텍스트를 줄인다.
+    TITLE 기반 섹션 분류된 테이블만 포함하여 불필요한 텍스트를 줄인다.
     각 행은 '항목명: 값' 형태로 변환한다.
 
     Args:
         soup: _parse_dart_xml() 반환값
 
     Returns:
-        테이블 텍스트 문자열 (최대 4000자)
+        테이블 텍스트 문자열 (최대 8000자)
     """
+    section_map = _build_section_table_map(soup)
     lines: list[str] = []
-    for table_tag in soup.find_all("table"):
-        rows = _xml_table_to_rows(table_tag)
-        if not rows:
-            continue
-        fs_type = _classify_table(rows)
-        if fs_type not in ("BS", "IS"):
-            continue
-        lines.append(f"[{fs_type}]")
-        for row in rows:
-            if row and len(row) >= 2:
-                label = normalize_label(row[0])
-                vals  = " | ".join(c for c in row[1:] if c.strip())
-                if label and vals:
-                    lines.append(f"{label}: {vals}")
-        if len("\n".join(lines)) > 4000:
-            break
-    return "\n".join(lines)[:4000]
+
+    for fs_type in ("BS", "IS"):
+        tables = section_map.get(fs_type, [])
+        # TITLE 기반이 비어있으면 키워드 fallback
+        if not tables:
+            for table_tag in soup.find_all("table"):
+                rows = _xml_table_to_rows(table_tag)
+                if rows and _classify_table(rows) == fs_type:
+                    tables.append(rows)
+
+        for rows in tables:
+            lines.append(f"[{fs_type}]")
+            for row in rows:
+                if row and len(row) >= 2:
+                    label = normalize_label(row[0])
+                    vals  = " | ".join(c for c in row[1:] if c.strip())
+                    if label and vals:
+                        lines.append(f"{label}: {vals}")
+            if len("\n".join(lines)) > 8000:
+                break
+
+    return "\n".join(lines)[:8000]
 
 
 # ── 경로B 메인 함수 ────────────────────────────────────────────────────────
@@ -345,64 +443,63 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
       1. document.xml API로 보고서 ZIP 다운로드
       2. ZIP 내 XML 파일 추출
       3. BeautifulSoup으로 TABLE 파싱
-      4. BS/IS 테이블 분류 → 항목별 금액 추출
-
-    반환 형식은 financial_api.get_financial_data_path_a()와 동일하다.
+      4. BS/IS 테이블 분류 → Python 항목별 금액 추출
+      5. AI 독립 추출 + Python 결과 비교 + 불일치 시 AI 판정
 
     Args:
         rcept_no: 공시 접수번호 (report_finder.find_report()의 반환값)
 
     Returns:
         {
-            "items":       {항목명: 금액(float|None), ...},
-            "cross_check": {},   # 경로B는 교차검증 없음
-            "fs_div":      "OFS",  # 감사보고서는 별도 기준
-            "error":       None | 오류 메시지 문자열,
+            "items":          {항목명: 금액(float|None), ...},
+            "cross_check":    {},   # 경로B는 교차검증 없음
+            "fs_div":         "OFS",  # 감사보고서는 별도 기준
+            "error":          None | 오류 메시지 문자열,
+            "ai_comparison":  AI 비교 결과 딕셔너리 | None,
         }
     """
+    empty_items = {item["name"]: None for item in FINANCIAL_ITEMS}
+
     # 1. 다운로드
     xml_bytes = _download_dart_document(rcept_no)
     if xml_bytes is None:
         return {
-            "items": {item["name"]: None for item in FINANCIAL_ITEMS},
-            "cross_check": {},
-            "fs_div": None,
-            "error": f"document.xml 다운로드 실패 (rcept_no={rcept_no})",
+            "items": empty_items, "cross_check": {},
+            "fs_div": None, "error": f"document.xml 다운로드 실패 (rcept_no={rcept_no})",
+            "ai_comparison": None,
         }
 
     # 2. 파싱
     soup = _parse_dart_xml(xml_bytes)
     if soup is None:
         return {
-            "items": {item["name"]: None for item in FINANCIAL_ITEMS},
-            "cross_check": {},
-            "fs_div": None,
-            "error": "DART XML 파싱 실패",
+            "items": empty_items, "cross_check": {},
+            "fs_div": None, "error": "DART XML 파싱 실패",
+            "ai_comparison": None,
         }
 
-    # 3. 항목 추출
+    # 3. Python 항목 추출
     items = _extract_all_items(soup)
 
-    # 4. AI 재추출: 못 찾은 항목이 4개 이상이고 GEMINI_API_KEY가 있을 때
-    missing = [k for k, v in items.items() if v is None]
-    if len(missing) >= 4:
-        try:
-            from config import GEMINI_API_KEY
-            if GEMINI_API_KEY:
-                from gemini_parser import extract_from_raw_text
-                table_text = _extract_table_text_for_ai(soup)
-                ai_items = extract_from_raw_text(table_text, missing)
-                for k, v in ai_items.items():
-                    if v is not None and items.get(k) is None:
-                        items[k] = v
-        except Exception:
-            pass  # AI 재추출 실패는 무시
+    # 4. AI 추출 + 비교 (GEMINI_API_KEY가 있을 때만)
+    ai_comparison = None
+    try:
+        from config import GEMINI_API_KEY
+        if GEMINI_API_KEY:
+            table_text = _extract_table_text_for_ai(soup)
+            if table_text.strip():
+                from gemini_parser import extract_with_ai_comparison
+                ai_comparison = extract_with_ai_comparison(table_text, items)
+                items = ai_comparison["items"]  # 최종 결과 사용
+    except Exception:
+        pass  # AI 실패 시 Python 결과 유지
 
     return {
-        "items":       items,
-        "cross_check": {},
-        "fs_div":      "OFS",
-        "error":       None,
+        "items":         items,
+        "cross_check":   {},
+        "fs_div":        "OFS",
+        "error":         None,
+        "ai_comparison": ai_comparison,
     }
 
 

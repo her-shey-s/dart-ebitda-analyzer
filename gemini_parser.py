@@ -1,17 +1,23 @@
 """
 gemini_parser.py
-Gemini Flash를 이용한 재무 데이터 AI 검증 및 재추출
+Gemini Flash를 이용한 재무 데이터 AI 추출·검증
 
-두 가지 역할:
-  1. verify_financial_data()  : critical 실패 항목을 AI로 재검토
-  2. extract_from_raw_text()  : 파싱 실패 시 테이블 텍스트에서 AI로 재추출
+역할:
+  경로B (감사보고서 XML 파싱):
+    1. ai_extract_items()           : 재무제표 원문에서 9개 항목 독립 추출 (AI 1회차)
+    2. ai_adjudicate()              : Python vs AI 불일치 시 원문 기반 판정 (AI 2회차)
+    3. extract_with_ai_comparison() : 위 두 함수를 조율하는 오케스트레이터
+
+  경로A (사업보고서 JSON API) — 기존 유지:
+    4. verify_financial_data()      : critical 실패 항목을 AI로 재검토
+    5. extract_from_raw_text()      : 파싱 실패 시 테이블 텍스트에서 AI로 재추출
 """
 
 import json
 import re
 from typing import Optional
 
-from config import GEMINI_API_KEY, GEMINI_MODEL
+from config import FINANCIAL_ITEMS, GEMINI_API_KEY, GEMINI_MODEL
 
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────
@@ -75,7 +81,268 @@ def _parse_json(text: str) -> Optional[dict]:
         return None
 
 
-# ── 공개 API ───────────────────────────────────────────────────────────────
+# ── 경로B: AI 추출 + 비교 검증 ─────────────────────────────────────────────
+#
+# Python 파싱 결과와 AI 독립 추출 결과를 비교하여 최종 값을 결정한다.
+# AI 호출: 최소 1회(추출), 불일치 시 최대 2회(추출 + 판정).
+#
+
+_ITEM_NAMES = [item["name"] for item in FINANCIAL_ITEMS]
+
+
+def _build_extraction_prompt(table_text: str) -> str:
+    """AI 추출용 프롬프트를 생성한다."""
+    item_lines = []
+    for item in FINANCIAL_ITEMS:
+        kws = ", ".join(item["keywords"])
+        item_lines.append(f'  - {item["name"]} (재무제표 표기: {kws})')
+    item_list = "\n".join(item_lines)
+
+    return (
+        "아래는 한국 기업의 감사보고서에서 추출한 재무상태표와 손익계산서 원문이다.\n"
+        "다음 항목들의 '당기' 금액을 원(KRW) 단위 숫자로 추출해라.\n"
+        "괄호 표기 (예: (1,234))는 음수를 의미한다.\n"
+        "찾을 수 없는 항목은 null로 표시해라.\n"
+        "JSON으로만 응답해라. 다른 텍스트 없이.\n\n"
+        f"추출 항목:\n{item_list}\n\n"
+        f"응답 형식:\n"
+        f'{{"총자산": 1234567890, "총부채": null, ...}}\n\n'
+        f"재무제표 원문:\n---\n{table_text}\n---"
+    )
+
+
+def _build_adjudication_prompt(
+    table_text: str,
+    disagreements: dict[str, tuple],
+) -> str:
+    """AI 판정용 프롬프트를 생성한다. 편향 방지를 위해 A/B로 익명 표기."""
+    diff_lines = []
+    for name, (val_a, val_b) in disagreements.items():
+        a_str = f"{val_a:,.0f}" if val_a is not None else "없음"
+        b_str = f"{val_b:,.0f}" if val_b is not None else "없음"
+        diff_lines.append(f"  - {name}: 추출A={a_str}, 추출B={b_str}")
+    diff_text = "\n".join(diff_lines)
+
+    return (
+        "아래 재무제표 원문을 두 가지 방법으로 추출했더니 결과가 다르다.\n"
+        "원문을 직접 확인하여 각 항목의 올바른 '당기' 금액을 판정해라.\n"
+        "금액은 원(KRW) 단위 숫자, 괄호는 음수, 찾을 수 없으면 null.\n"
+        "JSON으로만 응답해라.\n\n"
+        f"불일치 항목:\n{diff_text}\n\n"
+        f"응답 형식:\n"
+        f'{{"항목명": 올바른금액또는null}}\n\n'
+        f"재무제표 원문:\n---\n{table_text}\n---"
+    )
+
+
+def ai_extract_items(table_text: str) -> dict[str, Optional[float]]:
+    """
+    재무제표 원문 테이블 텍스트에서 AI로 9개 항목을 독립 추출한다.
+
+    경로B의 AI 1회차 호출. Python 파싱 결과와 무관하게 독립적으로 추출한다.
+
+    Args:
+        table_text: _extract_table_text_for_ai() 반환값
+
+    Returns:
+        {항목명: 금액(float) | None, ...}
+
+    Raises:
+        RuntimeError: Gemini API 호출 또는 응답 파싱 실패
+    """
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY 미설정")
+
+    prompt = _build_extraction_prompt(table_text)
+    raw = _generate(client, prompt)
+    parsed = _parse_json(raw)
+    if parsed is None:
+        raise RuntimeError(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
+
+    result: dict[str, Optional[float]] = {}
+    for name in _ITEM_NAMES:
+        val = parsed.get(name)
+        try:
+            result[name] = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            result[name] = None
+
+    return result
+
+
+def _compare_results(
+    python_items: dict[str, Optional[float]],
+    ai_items: dict[str, Optional[float]],
+    rel_tol: float = 0.001,
+    abs_tol: float = 1.0,
+) -> dict[str, tuple]:
+    """
+    Python 추출 결과와 AI 추출 결과를 비교하여 불일치 항목을 반환한다.
+
+    비교 기준:
+      - 둘 다 None → 일치
+      - 하나만 None → 불일치
+      - 둘 다 숫자 → 상대오차 > rel_tol AND 절대오차 > abs_tol → 불일치
+
+    Args:
+        python_items: Python 파싱 결과
+        ai_items:     AI 추출 결과
+        rel_tol:      상대 허용 오차 (0.1%)
+        abs_tol:      절대 허용 오차 (1원)
+
+    Returns:
+        {항목명: (python값, ai값)} — 불일치 항목만
+    """
+    disagreements: dict[str, tuple] = {}
+
+    for name in _ITEM_NAMES:
+        py_val = python_items.get(name)
+        ai_val = ai_items.get(name)
+
+        # 둘 다 None → 일치
+        if py_val is None and ai_val is None:
+            continue
+
+        # 하나만 None → 불일치
+        if py_val is None or ai_val is None:
+            disagreements[name] = (py_val, ai_val)
+            continue
+
+        # 둘 다 숫자 → 오차 비교
+        diff = abs(py_val - ai_val)
+        base = max(abs(py_val), abs(ai_val), 1.0)
+        if diff > abs_tol and diff / base > rel_tol:
+            disagreements[name] = (py_val, ai_val)
+
+    return disagreements
+
+
+def ai_adjudicate(
+    table_text: str,
+    python_items: dict[str, Optional[float]],
+    ai_items: dict[str, Optional[float]],
+    disagreements: dict[str, tuple],
+) -> dict[str, Optional[float]]:
+    """
+    Python vs AI 불일치 항목에 대해 AI가 원문을 보고 올바른 값을 판정한다.
+
+    경로B의 AI 2회차 호출. 편향 방지를 위해 '추출A/추출B'로 익명 표기한다.
+
+    Args:
+        table_text:    재무제표 원문
+        python_items:  Python 파싱 결과
+        ai_items:      AI 1회차 추출 결과
+        disagreements: _compare_results() 반환값
+
+    Returns:
+        최종 병합 결과 {항목명: 금액(float) | None}
+        (일치 항목은 python_items 값 유지, 불일치 항목은 판정 결과로 교체)
+
+    Raises:
+        RuntimeError: Gemini API 호출 또는 응답 파싱 실패
+    """
+    client = _get_client()
+    if client is None:
+        raise RuntimeError("GEMINI_API_KEY 미설정")
+
+    # 편향 방지: A/B를 랜덤하게 배정하지 않고 고정 (Python=A, AI=B)
+    # → 프롬프트에는 어느 쪽이 Python/AI인지 명시하지 않음
+    prompt = _build_adjudication_prompt(table_text, disagreements)
+    raw = _generate(client, prompt)
+    parsed = _parse_json(raw)
+    if parsed is None:
+        raise RuntimeError(f"AI 판정 응답 JSON 파싱 실패: {raw[:300]}")
+
+    # 최종 결과: python_items 기반으로 판정 결과 병합
+    final = dict(python_items)
+    for name in disagreements:
+        val = parsed.get(name)
+        try:
+            final[name] = float(val) if val is not None else None
+        except (TypeError, ValueError):
+            # 판정 실패 시 AI 1회차 결과 사용 (Python보다 원문 기반)
+            final[name] = ai_items.get(name)
+
+    return final
+
+
+def extract_with_ai_comparison(
+    table_text: str,
+    python_items: dict[str, Optional[float]],
+) -> dict:
+    """
+    경로B 오케스트레이터: AI 추출 + Python 비교 + 불일치 시 AI 판정.
+
+    흐름:
+      1. AI로 9개 항목 독립 추출 (1회차 호출)
+      2. Python 결과와 비교
+      3. 일치 → Python 결과 반환
+      4. 불일치 → AI에게 원문 + 양쪽 결과를 주고 판정 요청 (2회차 호출)
+
+    AI 호출 실패 시 Python 결과로 graceful fallback.
+
+    Args:
+        table_text:   _extract_table_text_for_ai() 반환값
+        python_items: _extract_all_items() 반환값
+
+    Returns:
+        {
+            "items":         최종 항목 딕셔너리,
+            "source":        "agreed" | "adjudicated" | "python_fallback",
+            "ai_calls":      AI 호출 횟수 (0, 1, 2),
+            "disagreements": {항목명: (python값, ai값)},  # 불일치 내역
+            "ai_items":      AI 1회차 추출 결과 (디버깅용),
+            "error":         오류 메시지 또는 None,
+        }
+    """
+    base = {
+        "items":         python_items,
+        "source":        "python_fallback",
+        "ai_calls":      0,
+        "disagreements": {},
+        "ai_items":      None,
+        "error":         None,
+    }
+
+    # 1. AI 독립 추출 (1회차)
+    try:
+        ai_items = ai_extract_items(table_text)
+    except RuntimeError as e:
+        return {**base, "error": f"AI 추출 실패: {e}"}
+
+    base["ai_calls"] = 1
+    base["ai_items"] = ai_items
+
+    # 2. 비교
+    disagreements = _compare_results(python_items, ai_items)
+    base["disagreements"] = disagreements
+
+    if not disagreements:
+        # 완전 일치 → Python 결과 사용 (AI가 확인해준 셈)
+        return {**base, "source": "agreed"}
+
+    # 3. 불일치 → AI 판정 (2회차)
+    try:
+        final_items = ai_adjudicate(table_text, python_items, ai_items, disagreements)
+    except RuntimeError as e:
+        # 2회차 실패 → AI 1회차 결과로 fallback (원문을 본 결과이므로)
+        merged = dict(python_items)
+        for name, val in ai_items.items():
+            if val is not None and merged.get(name) is None:
+                merged[name] = val
+        return {
+            **base,
+            "items":  merged,
+            "source": "ai_extract_only",
+            "error":  f"AI 판정 실패, 1회차 결과 사용: {e}",
+        }
+
+    base["ai_calls"] = 2
+    return {**base, "items": final_items, "source": "adjudicated"}
+
+
+# ── 경로A: 기존 AI 검증 (유지) ─────────────────────────────────────────────
 
 def verify_financial_data(
     items: dict[str, Optional[float]],

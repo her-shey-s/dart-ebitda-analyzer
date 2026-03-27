@@ -68,17 +68,18 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         items, validation, status, error_msg
     """
     base: dict = {
-        "corp_name":   corp_name,
-        "year":        year,
-        "corp_code":   "-",
-        "path":        "-",
-        "report_nm":   "-",
-        "report_type": "-",
-        "fs_div":      "-",
-        "items":       {item["name"]: None for item in FINANCIAL_ITEMS},
-        "validation":  None,
-        "status":      "ok",
-        "error_msg":   "",
+        "corp_name":     corp_name,
+        "year":          year,
+        "corp_code":     "-",
+        "path":          "-",
+        "report_nm":     "-",
+        "report_type":   "-",
+        "fs_div":        "-",
+        "items":         {item["name"]: None for item in FINANCIAL_ITEMS},
+        "validation":    None,
+        "ai_comparison": None,
+        "status":        "ok",
+        "error_msg":     "",
     }
 
     # 1. corp_code 조회
@@ -127,6 +128,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
     base["items"]  = data["items"]
     base["fs_div"] = data.get("fs_div", "-")
+    base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
 
     # 5. 검증
     try:
@@ -134,8 +136,12 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
 
-    # 6. AI 검증 (GEMINI_API_KEY 있고 needs_ai_validation인 경우만)
-    if GEMINI_API_KEY and needs_ai_validation(validation):
+    # 6. AI 검증 (경로A만 — 경로B는 이미 AI 비교 완료)
+    if (
+        report["path"] == "A"
+        and GEMINI_API_KEY
+        and needs_ai_validation(validation)
+    ):
         try:
             validation = validate_with_ai(validation, data["items"], corp_name, year)
         except Exception:
@@ -237,15 +243,90 @@ def _apply_number_format(ws, df: pd.DataFrame, fmt: str = "#,##0") -> None:
 
 
 def _to_excel_bytes(results: list[dict]) -> bytes:
-    """결과 리스트를 Excel bytes로 변환한다. 두 시트(요약·원본) 포함."""
+    """결과 리스트를 Excel bytes로 변환한다.
+
+    시트 구성: 회사별 1시트 (가로=연도, 세로=계정항목) + 원본 시트 1개.
+    """
+    from openpyxl.styles import Alignment, Font, PatternFill, numbers as xl_numbers
+
+    # 항목 표시 순서: 매출 먼저, 그 다음 BS
+    _EXCEL_ITEMS = ["매출액", "매출총이익", "영업이익", "당기순이익",
+                    "총자산", "총부채", "이익잉여금"]
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        # 시트1: 요약 (억원 단위 숫자)
-        df_summary = _to_excel_summary_df(results)
-        df_summary.to_excel(writer, sheet_name="요약(억원)", index=False)
-        _apply_number_format(writer.sheets["요약(억원)"], df_summary)
 
-        # 시트2: 원본 금액 (원 단위 숫자)
+        # ── 회사별 시트 ──────────────────────────────────────────────────
+        # 결과를 기업별로 그룹핑
+        from collections import defaultdict
+        corp_results: dict[str, list[dict]] = defaultdict(list)
+        for r in results:
+            corp_results[r["corp_name"]].append(r)
+
+        for corp_name, corp_data in corp_results.items():
+            # 연도 오름차순 정렬
+            corp_data.sort(key=lambda x: x["year"])
+            years = [r["year"] for r in corp_data]
+
+            # DataFrame 구성: 항목명 | 2022 | 2023 | 2024 ...
+            rows = []
+            for item_name in _EXCEL_ITEMS:
+                row: dict = {"항목": item_name}
+                for r in corp_data:
+                    yr = r["year"]
+                    val = r.get("items", {}).get(item_name)
+                    row[str(yr)] = _fmt_억_raw(val)
+                rows.append(row)
+
+            df = pd.DataFrame(rows)
+
+            # 시트명은 최대 31자, 특수문자 제거
+            sheet_name = corp_name[:28]
+            # 중복 시트명 방지
+            existing = [s for s in writer.sheets]
+            if sheet_name in existing:
+                sheet_name = sheet_name[:25] + f"_{len(existing)}"
+
+            df.to_excel(writer, sheet_name=sheet_name, startrow=2, index=False)
+            ws = writer.sheets[sheet_name]
+
+            # 헤더 행1: 기업명
+            ws.cell(row=1, column=1, value=corp_name).font = Font(bold=True, size=13)
+
+            # 헤더 행2: 각 연도 아래 연결/별도 + 경로 표시
+            for col_idx, r in enumerate(corp_data):
+                fs = _fs_label(r)
+                path = r["path"]
+                cell = ws.cell(row=2, column=col_idx + 2,
+                               value=f"{fs} (경로{path})")
+                cell.font = Font(italic=True, color="666666", size=9)
+                cell.alignment = Alignment(horizontal="center")
+
+            # 연도 헤더(행3)는 pandas가 이미 기록 — 가운데 정렬 + 볼드
+            for col_idx in range(len(years)):
+                cell = ws.cell(row=3, column=col_idx + 2)
+                cell.font = Font(bold=True)
+                cell.alignment = Alignment(horizontal="center")
+
+            # 데이터 영역 숫자 서식 적용
+            for row_idx in range(4, 4 + len(_EXCEL_ITEMS)):
+                for col_idx in range(2, 2 + len(years)):
+                    cell = ws.cell(row=row_idx, column=col_idx)
+                    if cell.value is not None:
+                        cell.number_format = "#,##0.0"
+                        cell.alignment = Alignment(horizontal="right")
+
+            # 항목 컬럼 너비 조정
+            ws.column_dimensions["A"].width = 14
+            for col_idx in range(len(years)):
+                from openpyxl.utils import get_column_letter
+                ws.column_dimensions[get_column_letter(col_idx + 2)].width = 16
+
+            # 단위 표기
+            ws.cell(row=2, column=1, value="(단위: 억원)").font = Font(
+                italic=True, color="999999", size=9)
+
+        # ── 원본 시트 (원 단위 — 기존과 동일) ───────────────────────────
         raw_rows = []
         for r in results:
             items = r.get("items", {})
@@ -306,7 +387,7 @@ def _render_validation_detail(result: dict) -> None:
     else:
         st.success("이상 없음")
 
-    # AI 검증 결과
+    # AI 검증 결과 (경로A)
     ai = val.get("ai_result")
     if ai and ai.get("verdict") != "skipped":
         st.markdown("**AI 검증 결과 (Gemini Flash):**")
@@ -320,6 +401,36 @@ def _render_validation_detail(result: dict) -> None:
             st.markdown("**AI 수정 제안:**")
             corr_rows = [{"항목": k, "수정값(원)": f"{v:,.0f}"} for k, v in ai["corrections"].items()]
             st.dataframe(pd.DataFrame(corr_rows), hide_index=True, use_container_width=True)
+
+    # AI 비교 결과 (경로B)
+    ai_comp = result.get("ai_comparison")
+    if ai_comp:
+        source = ai_comp.get("source", "unknown")
+        ai_calls = ai_comp.get("ai_calls", 0)
+        source_label = {
+            "agreed":          "✅ Python·AI 일치",
+            "adjudicated":     "⚖️ AI 판정 (불일치 해소)",
+            "ai_extract_only": "🤖 AI 추출 (판정 실패)",
+            "python_fallback":  "🐍 Python만 (AI 실패)",
+        }.get(source, source)
+        st.markdown(f"**AI 비교 결과:** {source_label} (AI 호출: {ai_calls}회)")
+
+        # 불일치 내역 표시
+        disagreements = ai_comp.get("disagreements", {})
+        if disagreements:
+            comp_rows = []
+            for name, (py_val, ai_val) in disagreements.items():
+                final_val = result.get("items", {}).get(name)
+                comp_rows.append({
+                    "항목":         name,
+                    "Python(원)":   f"{py_val:,.0f}" if py_val is not None else "-",
+                    "AI(원)":       f"{ai_val:,.0f}" if ai_val is not None else "-",
+                    "최종 채택(원)": f"{final_val:,.0f}" if final_val is not None else "-",
+                })
+            st.dataframe(pd.DataFrame(comp_rows), hide_index=True, use_container_width=True)
+
+        if ai_comp.get("error"):
+            st.warning(f"AI 오류: {ai_comp['error']}")
 
     # 재무 상세
     items = result.get("items", {})
