@@ -225,11 +225,13 @@ def _build_section_table_map(
     """
     # 1. 모든 TITLE 태그의 위치 + 섹션명 수집
     title_positions: list[tuple[int, str]] = []  # (source_pos, section_key)
+    # 연결현금흐름표는 반드시 현금흐름표보다 먼저 등록해야 부분 문자열 우선 매칭됨
     section_key_map = {
         "재무상태표": "BS",
         "손익계산서": "IS",
         "포괄손익계산서": "IS",
         "자본변동표": "EQ",
+        "연결현금흐름표": "CF_CONSOL",   # 사업보고서 내 연결CF — 별도CF와 분리
         "현금흐름표": "CF",
         "주석": "NOTES",
     }
@@ -247,7 +249,7 @@ def _build_section_table_map(
     # 2. 모든 TABLE 태그를 순회하면서 직전 TITLE의 섹션에 배정
     #    soup의 descendants 순서 = 문서 순서이므로, TITLE과 TABLE을 함께 순회
     result: dict[str, list[list[list[str]]]] = {
-        "BS": [], "IS": [], "CF": [], "EQ": [], "NOTES": [],
+        "BS": [], "IS": [], "CF": [], "CF_CONSOL": [], "EQ": [], "NOTES": [],
     }
 
     current_section: str | None = None
@@ -369,7 +371,8 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     section_map = _build_section_table_map(soup)
     bs_tables = section_map["BS"]
     is_tables = section_map["IS"]
-    cf_tables = section_map["CF"]
+    # CF_CONSOL(연결현금흐름표) + CF(별도현금흐름표) 통합
+    cf_tables = section_map.get("CF_CONSOL", []) + section_map["CF"]
 
     # TITLE 기반 분류 실패 시 (BS/IS 모두 비어있으면) 키워드 fallback
     if not bs_tables and not is_tables:
