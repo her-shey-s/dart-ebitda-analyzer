@@ -14,7 +14,7 @@ import pandas as pd
 import streamlit as st
 
 from config import FINANCIAL_ITEMS, GEMINI_API_KEY
-from dart_api.corp_search import search_corp
+from dart_api.corp_search import get_corp_code, search_corp
 from dart_api.financial_api import get_financial_data_path_a
 from dart_api.html_parser import get_financial_data_path_b
 from dart_api.report_finder import find_report
@@ -65,7 +65,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
     반환 키:
         corp_name, year, corp_code, path, report_nm, report_type, fs_div,
-        items, validation, status, error_msg, 비고
+        items, validation, status, error_msg
     """
     base: dict = {
         "corp_name":     corp_name,
@@ -80,31 +80,18 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "ai_comparison": None,
         "status":        "ok",
         "error_msg":     "",
-        "비고":           "",
     }
 
-    # 1. corp_code 조회 (동일 기업명 중복 검사 포함)
-    all_corps  = search_corp(corp_name)
-    exact_corps = all_corps[all_corps["corp_name"] == corp_name]
-
-    if len(exact_corps) > 1:
-        # 동일 기업명이 여러 개 → 재무정보 기입 불가, 비고에 명시
-        return {
-            **base,
-            "status":    "ambiguous_corp",
-            "error_msg": f"동일 기업명 {len(exact_corps)}개 존재",
-            "비고":       f"동일 기업명({corp_name})을 가진 회사가 {len(exact_corps)}개 존재하여 재무정보를 기입할 수 없음",
-        }
-
-    if exact_corps.empty:
-        # 기업 미발견 — 부분 일치 힌트 제공
+    # 1. corp_code 조회
+    corp_code = get_corp_code(corp_name)
+    if corp_code is None:
+        # 유사 기업명 힌트 제공
+        similar = search_corp(corp_name)
         hint = ""
-        if not all_corps.empty:
-            names = all_corps["corp_name"].head(3).tolist()
+        if not similar.empty:
+            names = similar["corp_name"].head(3).tolist()
             hint = f" (유사: {', '.join(names)})"
         return {**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"}
-
-    corp_code = exact_corps.iloc[0]["corp_code"]
     base["corp_code"] = corp_code
 
     # 2. 캐시 확인
@@ -143,26 +130,15 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
 
-    # 4-B. 감가상각비 fallback: CF에서 못 찾은 경우 주석 탐색
-    #      사업보고서(CFS) 기업은 연결CF를 우선 사용 (Fix: 위니아 등 연결/별도 혼재)
+    # 4-B. 주석 fallback: CF에서 감가상각비를 못 찾은 경우에만 주석 탐색
     if base["items"].get("감가상각비") is None or base["items"].get("무형자산상각비") is None:
         try:
             from dart_api.notes_parser import extract_depreciation
-            prefer_consol = data.get("fs_div") == "CFS"
-            depr_result   = extract_depreciation(report["rcept_no"], prefer_consol=prefer_consol)
-            depr_items    = depr_result.get("items", {})
+            depr_result = extract_depreciation(report["rcept_no"])
+            depr_items = depr_result.get("items", {})
             for key in ("감가상각비", "무형자산상각비"):
                 if base["items"].get(key) is None and depr_items.get(key) is not None:
                     base["items"][key] = depr_items[key]
-
-            # 합산 항목 비고 처리 (Fix: 환경이엔지 등 "감가상각비 및 무형자산상각비" 표기)
-            if depr_result.get("is_combined"):
-                base["비고"] = (
-                    "비용의 성격별 분류에서 '감가상각비 및 무형자산상각비'가 합산 표기되어 "
-                    "감가상각비란에 합산값을 기입함. 무형자산상각비는 별도 확인 필요."
-                )
-                # 합산 항목이므로 무형자산상각비는 기입하지 않음
-                base["items"]["무형자산상각비"] = None
         except Exception:
             pass  # 주석 fallback 실패는 무시
 
@@ -314,12 +290,6 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                     row[str(yr)] = _fmt_억_raw(val)
                 rows.append(row)
 
-            # 비고 행 추가 (합산 항목, 동일 기업명 등 특이사항)
-            bigo_row: dict = {"항목": "비고"}
-            for r in corp_data:
-                bigo_row[str(r["year"])] = r.get("비고", "") or ""
-            rows.append(bigo_row)
-
             df = pd.DataFrame(rows)
 
             # 시트명은 최대 31자, 특수문자 제거
@@ -380,7 +350,6 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
-            row["비고"] = r.get("비고", "") or ""
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
