@@ -36,6 +36,8 @@ _MAJOR_ACCT_NAME_MAP: dict[str, str] = {
     "당기순이익": "당기순이익",
 }
 
+_VALID_FS_DIVS = {"CFS", "OFS"}
+
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────
 
@@ -73,6 +75,24 @@ def _build_id_index(raw_list: list[dict]) -> dict[str, dict]:
             # 같은 account_id가 여러 번 나올 수 있을 때 첫 번째 우선
             idx.setdefault(acc_id, row)
     return idx
+
+
+def _infer_fs_div(raw_list: list[dict], requested_div: str) -> str:
+    """
+    API 응답 행들에서 실제 재무제표 구분(CFS/OFS)을 추론한다.
+
+    DART가 요청한 fs_div와 다른 기준의 데이터를 돌려주는 경우가 있어,
+    응답 행의 fs_div 값을 우선 신뢰한다. 유효한 값이 없으면 요청값을 사용한다.
+    """
+    counts: dict[str, int] = {}
+    for row in raw_list:
+        div = (row.get("fs_div") or "").strip().upper()
+        if div in _VALID_FS_DIVS:
+            counts[div] = counts.get(div, 0) + 1
+
+    if counts:
+        return max(counts, key=counts.get)
+    return requested_div
 
 
 def _extract_by_id_then_nm(
@@ -274,8 +294,10 @@ def get_financial_data_path_a(
     """
     경로A 메인 함수: 전체 재무제표 + 주요계정을 조회하여 통합 결과를 반환한다.
 
-    연결(CFS) 우선 시도 → 데이터 없으면 별도(OFS) 폴백.
-    주요계정 API도 같은 fs_div로 호출하여 교차검증 데이터를 제공한다.
+    1. CFS/OFS 각각 조회 가능한지 확인
+    2. 둘 다 있으면 연결(CFS) 우선
+    3. 연결이 없으면 별도(OFS) 사용
+    4. 주요계정 API는 선택된 fs_div와 실제 응답 fs_div가 일치할 때만 교차검증에 사용
 
     Args:
         corp_code:   DART 기업 고유코드
@@ -294,31 +316,49 @@ def get_financial_data_path_a(
     empty = {"items": {}, "cross_check": {}, "fs_div": None, "error": None}
 
     last_error = ""
-    for div in (FS_DIV["consolidated"], FS_DIV["separate"]):
-        # ── 전체 재무제표 ──────────────────────────────────────────────────
+    available_statements: dict[str, dict] = {}
+
+    # 1. 어떤 재무제표 구분이 실제로 존재하는지 확인
+    for requested_div in (FS_DIV["consolidated"], FS_DIV["separate"]):
         try:
-            raw = fetch_full_financial_statement(corp_code, bsns_year, reprt_code, div)
+            raw = fetch_full_financial_statement(corp_code, bsns_year, reprt_code, requested_div)
         except (ValueError, requests.RequestException) as e:
             last_error = str(e)
             continue
 
-        items = extract_target_items(raw)
-
-        # ── 주요계정 (교차검증, 실패해도 무시) ────────────────────────────
-        cross_check: dict[str, Optional[float]] = {}
-        try:
-            major_raw = fetch_major_accounts(corp_code, bsns_year, reprt_code, div)
-            cross_check = extract_major_account_items(major_raw)
-        except Exception:
-            pass  # 교차검증 실패는 주 데이터에 영향 없음
-
-        return {
-            "items":       items,
-            "cross_check": cross_check,
-            "fs_div":      div,
-            "error":       None,
+        actual_div = _infer_fs_div(raw, requested_div)
+        available_statements[actual_div] = {
+            "raw": raw,
+            "requested_div": requested_div,
         }
 
-    # CFS/OFS 모두 실패
-    empty["error"] = last_error or "재무제표 데이터를 가져올 수 없습니다."
-    return empty
+    # 2. 연결 우선, 없으면 별도
+    selected_div = None
+    for candidate in (FS_DIV["consolidated"], FS_DIV["separate"]):
+        if candidate in available_statements:
+            selected_div = candidate
+            break
+
+    if selected_div is None:
+        empty["error"] = last_error or "재무제표 데이터를 가져올 수 없습니다."
+        return empty
+
+    selected = available_statements[selected_div]
+    items = extract_target_items(selected["raw"])
+
+    # 3. 주요계정 (교차검증, 실제 fs_div가 선택 결과와 일치할 때만 사용)
+    cross_check: dict[str, Optional[float]] = {}
+    try:
+        major_raw = fetch_major_accounts(corp_code, bsns_year, reprt_code, selected_div)
+        major_div = _infer_fs_div(major_raw, selected_div)
+        if major_div == selected_div:
+            cross_check = extract_major_account_items(major_raw)
+    except Exception:
+        pass  # 교차검증 실패는 주 데이터에 영향 없음
+
+    return {
+        "items":       items,
+        "cross_check": cross_check,
+        "fs_div":      selected_div,
+        "error":       None,
+    }
