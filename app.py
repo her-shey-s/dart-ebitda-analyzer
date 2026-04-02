@@ -39,6 +39,9 @@ _DISPLAY_ITEMS = [
     "매출액", "매출총이익", "영업이익", "당기순이익",
 ]
 
+# 주요계정 API(교차검증)에서 내려오는 핵심 항목
+_CROSS_CHECK_ITEMS = ["총자산", "총부채", "자본총계", "매출액", "영업이익", "당기순이익"]
+
 
 # ── 금액 포맷 ─────────────────────────────────────────────────────────────────
 
@@ -222,6 +225,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "report_type":   "-",
         "fs_div":        "-",
         "items":         {item["name"]: None for item in FINANCIAL_ITEMS},
+        "cross_check":   {},
         "validation":    None,
         "ai_comparison": None,
         "status":        "ok",
@@ -273,6 +277,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         return {**base, "status": "error", "error_msg": data["error"]}
 
     base["items"]  = data["items"]
+    base["cross_check"] = data.get("cross_check", {})
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
 
@@ -476,18 +481,38 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
         raw_rows = []
         for r in results:
             items = r.get("items", {})
+            cross_check = r.get("cross_check", {})
+            cross_mismatches = []
+            for name in _CROSS_CHECK_ITEMS:
+                base_val = items.get(name)
+                check_val = cross_check.get(name)
+                if base_val is not None and check_val is not None and base_val != check_val:
+                    cross_mismatches.append(name)
+
             row = {
                 "기업명":       r["corp_name"],
                 "연도":         r["year"],
+                "corp_code":   r.get("corp_code", "-"),
                 "재무제표기준": _fs_label(r),
                 "경로":         r["path"],
+                "보고서":       r.get("report_nm", "-"),
                 "처리상태":     r["status"],
                 "처리상세":     _processing_status_detail(r),
                 "검증":         _validation_status_label(r, use_icon=False),
                 "검증상세":     _format_validation_detail(r),
+                "교차검증불일치항목": ", ".join(cross_mismatches) if cross_mismatches else "",
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
+            for name in _CROSS_CHECK_ITEMS:
+                row[f"교차_{name}"] = cross_check.get(name)
+                base_val = items.get(name)
+                check_val = cross_check.get(name)
+                row[f"차이_{name}"] = (
+                    abs(base_val - check_val)
+                    if isinstance(base_val, (int, float)) and isinstance(check_val, (int, float))
+                    else None
+                )
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
@@ -495,13 +520,16 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
         _apply_number_format(ws_raw, df_raw)
         ws_raw.column_dimensions["A"].width = 16
         ws_raw.column_dimensions["B"].width = 10
-        ws_raw.column_dimensions["C"].width = 14
-        ws_raw.column_dimensions["D"].width = 8
-        ws_raw.column_dimensions["E"].width = 12
-        ws_raw.column_dimensions["F"].width = 55
-        ws_raw.column_dimensions["G"].width = 22
-        ws_raw.column_dimensions["H"].width = 90
-        for row in ws_raw.iter_rows(min_row=2, min_col=5, max_col=8):
+        ws_raw.column_dimensions["C"].width = 12
+        ws_raw.column_dimensions["D"].width = 14
+        ws_raw.column_dimensions["E"].width = 8
+        ws_raw.column_dimensions["F"].width = 24
+        ws_raw.column_dimensions["G"].width = 12
+        ws_raw.column_dimensions["H"].width = 55
+        ws_raw.column_dimensions["I"].width = 22
+        ws_raw.column_dimensions["J"].width = 90
+        ws_raw.column_dimensions["K"].width = 26
+        for row in ws_raw.iter_rows(min_row=2, min_col=6, max_col=10):
             for cell in row:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
