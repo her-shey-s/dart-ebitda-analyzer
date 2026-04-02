@@ -57,6 +57,152 @@ def _fmt_억_raw(val: Optional[float]) -> Optional[float]:
     return val / 1e8 if val is not None else None
 
 
+def _validation_status_label(result: dict, use_icon: bool = True) -> str:
+    """결과 딕셔너리의 검증 상태를 짧은 라벨로 반환한다."""
+    val = result.get("validation")
+    if result["status"] != "ok":
+        return result["error_msg"]
+    if not val:
+        return "검증정보 없음"
+
+    if val["is_valid"]:
+        label = "통과"
+        if val and needs_ai_validation(val):
+            label += " / AI검토필요"
+        return f"✓ {label}" if use_icon else label
+
+    label = "검증실패"
+    if val and needs_ai_validation(val):
+        label += " / AI검토필요"
+    return f"✗ {label}" if use_icon else label
+
+
+def _processing_status_detail(result: dict) -> str:
+    """분석/추출 단계 상태를 사람이 읽기 쉬운 설명으로 반환한다."""
+    status = result.get("status")
+    if status == "ok":
+        report_nm = result.get("report_nm") or "-"
+        return (
+            f"데이터 추출 성공. 사용 보고서: {report_nm}, "
+            f"경로 {result.get('path', '-')}, 재무제표 기준 {_fs_label(result)}."
+        )
+
+    if status == "no_corp":
+        msg = result.get("error_msg") or "기업명을 찾지 못했습니다."
+        if "유사:" in msg:
+            return (
+                f"{msg}. 입력한 이름과 정확히 일치하는 DART 기업명이 없어 자동 선택하지 않았습니다. "
+                "동명이인이나 유사 상호가 많을 수 있으니 정식 법인명으로 다시 조회해 주세요."
+            )
+        return (
+            f"{msg}. DART 기업코드 목록에서 정확 일치 기업명을 찾지 못했습니다."
+        )
+
+    if status == "no_report":
+        year = result.get("year")
+        return (
+            f"{year} 사업연도 기준 사업보고서, 연결감사보고서, 감사보고서를 순서대로 찾았지만 "
+            "사용 가능한 보고서를 찾지 못했습니다."
+        )
+
+    if status == "error":
+        msg = result.get("error_msg") or "분석 중 오류가 발생했습니다."
+        if "보고서 탐색 오류" in msg:
+            return f"{msg}. DART 공시 목록 조회 단계에서 실패했습니다."
+        if "재무데이터 추출 오류" in msg:
+            return f"{msg}. 보고서는 찾았지만 재무 항목 추출 단계에서 실패했습니다."
+        if "document.xml 다운로드 실패" in msg:
+            return f"{msg}. 감사보고서 원문(document.xml)을 내려받지 못했습니다."
+        return msg
+
+    return result.get("error_msg") or "상세 사유 정보가 없습니다."
+
+
+def _validation_reason_lines(result: dict, include_ai: bool = True) -> list[str]:
+    """결과 딕셔너리의 검증/처리 사유를 상세 문장 리스트로 반환한다."""
+    if result["status"] != "ok":
+        return [_processing_status_detail(result)]
+
+    val = result.get("validation")
+    if not val:
+        return ["검증 정보가 없습니다."]
+
+    lines: list[str] = []
+    failed_checks = [c for c in val.get("checks", []) if not c.get("passed")]
+    skipped_checks = [c for c in val.get("checks", []) if c.get("passed") and c.get("note")]
+
+    if failed_checks:
+        severity_map = {"critical": "치명", "warning": "경고", "info": "참고"}
+        for check in failed_checks:
+            severity = severity_map.get(check.get("severity"), str(check.get("severity", "")).upper())
+            line = f"[{severity}] {check.get('rule', '-')}"
+            diff = check.get("diff")
+            if isinstance(diff, (int, float)):
+                line += f" (차이 {diff:,.0f}원)"
+            note = check.get("note")
+            if note:
+                line += f" - {note}"
+            lines.append(line)
+    else:
+        lines.append("실패한 검증은 없습니다.")
+
+    if skipped_checks:
+        for check in skipped_checks:
+            lines.append(f"[스킵] {check.get('rule', '-')} - {check.get('note', '사유 없음')}")
+
+    if needs_ai_validation(val):
+        critical_fails = sum(
+            1 for c in val.get("checks", [])
+            if not c.get("passed") and c.get("severity") == "critical"
+        )
+        warning_fails = sum(
+            1 for c in val.get("checks", [])
+            if not c.get("passed") and c.get("severity") == "warning"
+        )
+        if critical_fails > 0:
+            lines.append("AI검토필요 사유: critical 실패가 있어 추가 확인 대상으로 분류되었습니다.")
+        elif warning_fails >= 2:
+            lines.append("AI검토필요 사유: warning 실패가 2건 이상이라 추가 확인 대상으로 분류되었습니다.")
+
+    if include_ai:
+        ai = val.get("ai_result")
+        if ai and ai.get("verdict"):
+            verdict_label = {
+                "correct": "AI판정 정상",
+                "error": "AI판정 오류",
+                "uncertain": "AI판정 불확실",
+                "skipped": "AI판정 생략",
+            }.get(ai.get("verdict"), f"AI판정 {ai.get('verdict')}")
+            ai_line = verdict_label
+            if ai.get("issues"):
+                ai_line += " - " + "; ".join(str(issue) for issue in ai["issues"] if issue)
+            if ai.get("corrections"):
+                corr_text = ", ".join(f"{k}={v:,.0f}원" for k, v in ai["corrections"].items())
+                ai_line += f" / 수정제안: {corr_text}"
+            lines.append(ai_line)
+
+    ai_comp = result.get("ai_comparison")
+    if include_ai and ai_comp:
+        source_label = {
+            "agreed": "경로B 비교: Python·AI 일치",
+            "adjudicated": "경로B 비교: AI 판정으로 불일치 해소",
+            "ai_extract_only": "경로B 비교: AI 추출값 채택",
+            "python_fallback": "경로B 비교: AI 실패로 Python 결과 사용",
+        }.get(ai_comp.get("source"), f"경로B 비교: {ai_comp.get('source', '비교 수행')}")
+        if ai_comp.get("disagreements"):
+            source_label += f" (불일치 항목: {', '.join(ai_comp['disagreements'].keys())})"
+        if ai_comp.get("error"):
+            source_label += f" / AI 오류: {ai_comp['error']}"
+        lines.append(source_label)
+
+    return lines
+
+
+def _format_validation_detail(result: dict, include_ai: bool = True) -> str:
+    """결과 딕셔너리의 검증 상세를 한 줄 문자열로 반환한다."""
+    return " | ".join(_validation_reason_lines(result, include_ai=include_ai))
+
+
 # ── 단일 기업·연도 분석 ───────────────────────────────────────────────────────
 
 def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
@@ -188,14 +334,6 @@ def _to_summary_df(results: list[dict]) -> pd.DataFrame:
     rows = []
     for r in results:
         items = r.get("items", {})
-        val   = r.get("validation")
-
-        if r["status"] == "ok":
-            valid_str = "✓ 통과" if (val and val["is_valid"]) else "✗ 검증실패"
-            if val and needs_ai_validation(val):
-                valid_str += " ⚠"
-        else:
-            valid_str = r["error_msg"]
 
         row = {
             "기업명":       r["corp_name"],
@@ -206,7 +344,9 @@ def _to_summary_df(results: list[dict]) -> pd.DataFrame:
         }
         for name in _DISPLAY_ITEMS:
             row[f"{name}(억)"] = _fmt_억(items.get(name))
-        row["검증"] = valid_str
+        row["검증"] = _validation_status_label(r, use_icon=True)
+        row["처리상세"] = _processing_status_detail(r)
+        row["검증상세"] = _format_validation_detail(r)
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -219,14 +359,6 @@ def _to_excel_summary_df(results: list[dict]) -> pd.DataFrame:
     rows = []
     for r in results:
         items = r.get("items", {})
-        val   = r.get("validation")
-
-        if r["status"] == "ok":
-            valid_str = "통과" if (val and val["is_valid"]) else "검증실패"
-            if val and needs_ai_validation(val):
-                valid_str += "(AI검토필요)"
-        else:
-            valid_str = r["error_msg"]
 
         row = {
             "기업명":       r["corp_name"],
@@ -237,7 +369,9 @@ def _to_excel_summary_df(results: list[dict]) -> pd.DataFrame:
         }
         for name in _DISPLAY_ITEMS:
             row[f"{name}(억원)"] = _fmt_억_raw(items.get(name))
-        row["검증"] = valid_str
+        row["검증"] = _validation_status_label(r, use_icon=False)
+        row["처리상세"] = _processing_status_detail(r)
+        row["검증상세"] = _format_validation_detail(r)
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -347,13 +481,29 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                 "연도":         r["year"],
                 "재무제표기준": _fs_label(r),
                 "경로":         r["path"],
+                "처리상태":     r["status"],
+                "처리상세":     _processing_status_detail(r),
+                "검증":         _validation_status_label(r, use_icon=False),
+                "검증상세":     _format_validation_detail(r),
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
-        _apply_number_format(writer.sheets["원본(원단위)"], df_raw)
+        ws_raw = writer.sheets["원본(원단위)"]
+        _apply_number_format(ws_raw, df_raw)
+        ws_raw.column_dimensions["A"].width = 16
+        ws_raw.column_dimensions["B"].width = 10
+        ws_raw.column_dimensions["C"].width = 14
+        ws_raw.column_dimensions["D"].width = 8
+        ws_raw.column_dimensions["E"].width = 12
+        ws_raw.column_dimensions["F"].width = 55
+        ws_raw.column_dimensions["G"].width = 22
+        ws_raw.column_dimensions["H"].width = 90
+        for row in ws_raw.iter_rows(min_row=2, min_col=5, max_col=8):
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     return buf.getvalue()
 
@@ -363,10 +513,18 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
 def _render_validation_detail(result: dict) -> None:
     """단일 결과의 검증 상세 내역을 Streamlit으로 렌더링한다."""
     if result["status"] != "ok" or result["validation"] is None:
-        st.warning(result["error_msg"] or "데이터 없음")
+        st.warning(_processing_status_detail(result))
         return
 
     val = result["validation"]
+    reason_lines = _validation_reason_lines(result)
+
+    st.markdown("**처리 상태:**")
+    st.info(_processing_status_detail(result))
+
+    st.markdown("**검증 요약:**")
+    for line in reason_lines:
+        st.write(f"- {line}")
 
     # 검증 항목 테이블
     rows = []

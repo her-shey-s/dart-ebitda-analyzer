@@ -79,6 +79,7 @@ def _extract_by_id_then_nm(
     raw_list: list[dict],
     dart_code: str,
     keywords: list[str],
+    exclude_keywords: list[str] | None = None,
     negate_keywords: list[str] | None = None,
 ) -> Optional[float]:
     """
@@ -86,18 +87,21 @@ def _extract_by_id_then_nm(
 
     1단계: account_id == dart_code 정확 일치
     2단계: account_nm에 keywords 중 하나가 포함 (account_id 미매칭 시)
+           exclude_keywords가 포함된 라인은 제외
            negate_keywords에 해당하는 키워드로 매칭된 경우 양수 값을 음수로 반전
 
     Args:
         raw_list:        전체 재무제표 원시 리스트
         dart_code:       DART account_id (IFRS 코드)
         keywords:        account_nm 폴백 매칭 키워드
-        negate_keywords: 부호 반전이 필요한 키워드 목록 (선택)
+        exclude_keywords: 제외할 account_nm 키워드 목록 (선택)
+        negate_keywords:  부호 반전이 필요한 키워드 목록 (선택)
 
     Returns:
         float 금액 또는 None
     """
     negate_set = set(negate_keywords) if negate_keywords else set()
+    exclude_set = set(exclude_keywords) if exclude_keywords else set()
 
     # 1단계: account_id 매칭 (DART가 부호를 정확히 기록하므로 반전 불필요)
     for row in raw_list:
@@ -109,6 +113,8 @@ def _extract_by_id_then_nm(
     # 2단계: account_nm 키워드 매칭 (폴백)
     for row in raw_list:
         nm = (row.get("account_nm") or "").replace(" ", "")
+        if exclude_set and any(ex_kw in nm for ex_kw in exclude_set):
+            continue
         for kw in keywords:
             if kw in nm:
                 val = _parse_amount(row)
@@ -230,6 +236,7 @@ def extract_target_items(raw_list: list[dict]) -> dict[str, Optional[float]]:
             raw_list,
             dart_code=item["dart_code"],
             keywords=item["keywords"],
+            exclude_keywords=item.get("exclude_keywords"),
             negate_keywords=item.get("negate_keywords"),
         )
     return result
