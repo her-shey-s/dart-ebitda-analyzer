@@ -100,11 +100,11 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             _corp_df = df
             return _corp_df
 
-    # 3. DART API 다운로드
+    # 3. DART API 다운로드 (수십 MB ZIP이므로 타임아웃 넉넉하게)
     resp = requests.get(
         DART_ENDPOINTS["corp_code"],
         params={"crtfc_key": DART_API_KEY},
-        timeout=REQUEST_TIMEOUT,
+        timeout=max(REQUEST_TIMEOUT, 120),
     )
     resp.raise_for_status()
 
