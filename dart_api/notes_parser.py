@@ -168,6 +168,17 @@ def _infer_document_scope(soup: BeautifulSoup) -> Optional[bool]:
     return None
 
 
+def _strip_title_prefix(norm_title: str) -> str:
+    """
+    제목 정규화 문자열에서 선두 번호/기호 접두어를 제거한다.
+
+    예:
+      "3.연결재무제표주석" -> "연결재무제표주석"
+      "4-5.현금흐름표" -> "현금흐름표"
+    """
+    return re.sub(r"^[\d\-]+\.", "", norm_title)
+
+
 def _resolve_notes_scope(
     norm_title: str,
     document_scope: Optional[bool],
@@ -184,11 +195,13 @@ def _resolve_notes_scope(
         (scope, is_notes_root)
         scope: True=연결, False=별도, None=문서 전체 범위에 위임/판단 불가
     """
-    if norm_title in ("연결재무제표주석", "연결주석"):
+    title_core = _strip_title_prefix(norm_title)
+
+    if title_core in ("연결재무제표주석", "연결주석"):
         return True, True
-    if norm_title in ("별도재무제표주석", "별도주석"):
+    if title_core in ("별도재무제표주석", "별도주석"):
         return False, True
-    if norm_title == "재무제표주석":
+    if title_core == "재무제표주석":
         # 사업보고서 strict 모드에서는 '재무제표 주석'을 별도 주석 루트로 본다.
         if strict_scope:
             return False, True
@@ -197,7 +210,7 @@ def _resolve_notes_scope(
         if has_explicit_separate_root and not has_explicit_consol_root:
             return True, True
         return current_scope if current_scope is not None else document_scope, True
-    if norm_title == "주석":
+    if title_core == "주석":
         # 같은 notes 구간 내부에서 반복되는 generic 제목은 현재 범위를 유지한다.
         if in_notes:
             return current_scope, True
@@ -339,8 +352,9 @@ def _collect_depreciation_tables(
     want_consol = (fs_div == "CFS")
     document_scope = _infer_document_scope(soup)
     title_norms = [_normalize_title(tag.get_text(strip=True)) for tag in soup.find_all("title")]
-    has_explicit_consol_root = any(norm in ("연결재무제표주석", "연결주석") for norm in title_norms)
-    has_explicit_separate_root = any(norm in ("별도재무제표주석", "별도주석") for norm in title_norms)
+    title_cores = [_strip_title_prefix(norm) for norm in title_norms]
+    has_explicit_consol_root = any(core in ("연결재무제표주석", "연결주석") for core in title_cores)
+    has_explicit_separate_root = any(core in ("별도재무제표주석", "별도주석") for core in title_cores)
     if debug_trace is not None:
         debug_trace.append(
             f"[NOTES] title roots scan: explicit_consol={has_explicit_consol_root}, "
