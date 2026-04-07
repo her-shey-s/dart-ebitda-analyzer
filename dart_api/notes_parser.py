@@ -173,14 +173,20 @@ def _extract_depreciation_from_rows(
     """
     테이블 행에서 감가상각비·무형자산상각비의 당기 값을 추출한다.
 
+    "감가상각비 및 무형자산상각비" 처럼 합산 항목인 경우:
+      - 감가상각비에 해당 값을 기입
+      - 무형자산상각비는 None
+      - "combined" 플래그를 True로 설정
+
     Args:
         rows:            2D 테이블 행 리스트
         unit_multiplier: 단위 승수 (1000 = 천원)
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None}
+        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
     """
     result: dict[str, Optional[float]] = {}
+    combined = False
 
     # 당기 컬럼 인덱스 찾기 (보통 "당기"가 포함된 컬럼)
     current_col = 1  # 기본값: 두 번째 컬럼
@@ -196,9 +202,16 @@ def _extract_depreciation_from_rows(
             continue
         label = row[0].replace(" ", "").strip()
 
+        # "감가상각비및무형자산상각비" 합산 항목 감지
+        if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
+            val = _parse_number(row[current_col]) if current_col < len(row) else None
+            if val is not None:
+                result["감가상각비"] = val * unit_multiplier
+                combined = True
+            continue
+
         # 감가상각비 매칭 (단, "사용권자산의 감가상각비", "감가상각누계액" 등 제외)
         if "감가상각비" in label and "누계" not in label:
-            # "사용권자산의감가상각비" → 부분 감가상각이므로 별도 처리하지 않음
             # "감가상각비" 정확 매칭 우선
             if label in ("감가상각비", "감가상각비용"):
                 val = _parse_number(row[current_col]) if current_col < len(row) else None
@@ -207,11 +220,12 @@ def _extract_depreciation_from_rows(
 
         # 무형자산상각비 매칭
         if "무형자산상각비" in label or "무형자산상각" in label:
-            if "누계" not in label:
+            if "누계" not in label and "감가상각" not in label:
                 val = _parse_number(row[current_col]) if current_col < len(row) else None
                 if val is not None:
                     result["무형자산상각비"] = val * unit_multiplier
 
+    result["combined"] = combined
     return result
 
 
@@ -310,12 +324,19 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
     Returns:
         {"감가상각비": float|None, "무형자산상각비": float|None}
     """
-    all_depr: list[float] = []
-    all_amort: list[float] = []
+    # 전체 비용 기준 테이블과 부분 테이블(판관비 등)을 분리
+    _PARTIAL_SECTION_KEYWORDS = ["판매비", "판관비", "관리비"]
+
+    total_depr: list[float] = []
+    total_amort: list[float] = []
+    partial_depr: list[float] = []
+    partial_amort: list[float] = []
+    combined = False
 
     for tbl in tables:
         rows = tbl["rows"]
         unit = tbl["unit"]
+        title = tbl.get("title", "")
 
         # 당기/전기 구조 테이블만 대상
         if not _is_period_table(rows):
@@ -323,14 +344,24 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
 
         extracted = _extract_depreciation_from_rows(rows, unit)
 
-        if extracted.get("감가상각비") is not None:
-            all_depr.append(extracted["감가상각비"])
-        if extracted.get("무형자산상각비") is not None:
-            all_amort.append(extracted["무형자산상각비"])
+        if extracted.get("combined"):
+            combined = True
 
+        is_partial = any(kw in title for kw in _PARTIAL_SECTION_KEYWORDS)
+        depr_list = partial_depr if is_partial else total_depr
+        amort_list = partial_amort if is_partial else total_amort
+
+        if extracted.get("감가상각비") is not None:
+            depr_list.append(extracted["감가상각비"])
+        if extracted.get("무형자산상각비") is not None:
+            amort_list.append(extracted["무형자산상각비"])
+
+    # 전체 비용 기준 우선, 없으면 부분 테이블 fallback은 하지 않음
+    # (판관비만의 감가상각비는 부분값이므로 사용하지 않는다)
     return {
-        "감가상각비":    max(all_depr) if all_depr else None,
-        "무형자산상각비": max(all_amort) if all_amort else None,
+        "감가상각비":    max(total_depr) if total_depr else None,
+        "무형자산상각비": max(total_amort) if total_amort else None,
+        "combined":     combined,
     }
 
 
@@ -342,11 +373,12 @@ def _build_ai_prompt(tables_text: str) -> str:
         "아래는 한국 기업 감사보고서의 주석(Notes)에서 감가상각 관련 테이블을 발췌한 것이다.\n"
         "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비를 추출해라.\n\n"
         "## 주의사항\n"
-        "- '비용의 성격별 분류' 또는 '판매비와관리비+매출원가 합산' 기준의 전체 감가상각비를 찾아라.\n"
-        "- '현금흐름표 조정항목'의 감가상각비도 전체 기준이므로 교차검증에 활용해라.\n"
+        "- '비용의 성격별 분류' 또는 '현금흐름표 조정항목' 기준의 **전체(회사 전체)** 감가상각비를 찾아라.\n"
+        "- **'판매비와 관리비' 주석의 감가상각비는 판관비 내 부분값이므로 절대 선택하지 마라.**\n"
         "- 특정 자산(유형자산, 투자부동산, 사용권자산)만의 감가상각은 부분값이므로 선택하지 마라.\n"
         "- 감가상각누계액(누적값)은 당기 비용이 아니므로 선택하지 마라.\n"
         "- 이연법인세 관련 감가상각비는 완전히 다른 맥락이므로 선택하지 마라.\n"
+        "- '감가상각비 및 무형자산상각비'로 합산 표기된 경우: 감가상각비에 해당 값, 무형자산상각비는 null.\n"
         "- 각 테이블 앞에 표시된 '(단위: XXX)'를 반드시 확인하고, 최종 답은 **원(KRW) 단위**로 변환해라.\n"
         "- 찾을 수 없으면 null로 표시해라.\n\n"
         "JSON으로만 응답해라:\n"
@@ -442,7 +474,60 @@ def _cross_validate(
 
 # ── 현금흐름표(CF) 추출 ───────────────────────────────────────────────────────
 
-def _extract_from_cf(soup: BeautifulSoup) -> dict[str, Optional[float]]:
+def _find_cf_tables_by_fs_type(
+    soup: BeautifulSoup,
+    fs_div: str = "CFS",
+) -> list[list[list[str]]]:
+    """
+    사업보고서에서 연결/별도 구분에 맞는 현금흐름표 테이블을 반환한다.
+
+    DART 사업보고서는 '연결 현금흐름표'와 '현금흐름표' 가 모두 포함되어 있다.
+    fs_div가 CFS이면 '연결' 이 포함된 CF를, OFS이면 '연결' 이 없는 CF를 선택한다.
+
+    Args:
+        soup:   _parse_dart_xml() 반환값
+        fs_div: "CFS" 또는 "OFS"
+
+    Returns:
+        해당 구분에 맞는 CF 테이블의 rows 리스트
+    """
+    want_consol = (fs_div == "CFS")
+    matched_tables: list[list[list[str]]] = []
+    all_cf_tables: list[list[list[str]]] = []
+
+    current_title = ""
+    is_cf_section = False
+
+    for tag in soup.descendants:
+        if tag.name == "title":
+            raw = tag.get_text(strip=True)
+            norm = re.sub(r"[\s\u3000]+", "", raw)
+            if "현금흐름표" in norm:
+                is_cf_section = True
+                current_title = norm
+            else:
+                is_cf_section = False
+
+        elif tag.name == "table" and is_cf_section:
+            from dart_api.html_parser import _xml_table_to_rows
+            rows = _xml_table_to_rows(tag)
+            if not rows:
+                continue
+
+            is_consol = "연결" in current_title
+            all_cf_tables.append(rows)
+
+            if want_consol == is_consol:
+                matched_tables.append(rows)
+
+    # 구분에 맞는 테이블이 없으면 전체 CF 테이블 반환 (fallback)
+    return matched_tables if matched_tables else all_cf_tables
+
+
+def _extract_from_cf(
+    soup: BeautifulSoup,
+    fs_div: str = "CFS",
+) -> dict[str, Optional[float]]:
     """
     현금흐름표(CF) 섹션에서 감가상각비·무형자산상각비를 추출한다.
 
@@ -450,16 +535,19 @@ def _extract_from_cf(soup: BeautifulSoup) -> dict[str, Optional[float]]:
     별도 행으로 기재되므로, 주석보다 신뢰도가 높다.
     단위는 재무제표와 동일(원)이므로 보정이 불필요하다.
 
+    fs_div에 따라 연결/별도 현금흐름표를 구분하여 올바른 테이블에서 추출한다.
+
     Args:
-        soup: _parse_dart_xml() 반환값
+        soup:   _parse_dart_xml() 반환값
+        fs_div: "CFS"=연결, "OFS"=별도
 
     Returns:
         {"감가상각비": float|None, "무형자산상각비": float|None}
     """
-    section_map = _build_section_table_map(soup)
-    cf_tables = section_map.get("CF", [])
+    cf_tables = _find_cf_tables_by_fs_type(soup, fs_div)
 
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
+    combined = False
 
     for rows in cf_tables:
         # 감가상각 키워드가 포함된 CF 테이블만 대상
@@ -472,10 +560,18 @@ def _extract_from_cf(soup: BeautifulSoup) -> dict[str, Optional[float]]:
                 continue
             label = row[0].replace(" ", "").strip()
 
+            # "감가상각비및무형자산상각비" 합산 항목 감지
+            if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
+                for cell in row[1:]:
+                    val = _parse_number(cell)
+                    if val is not None:
+                        result["감가상각비"] = val
+                        combined = True
+                        break
+                continue
+
             # 감가상각비: 정확 매칭 ("감가상각비" == label)
             if label == "감가상각비" or label == "감가상각비용":
-                # CF 테이블은 보통 4~5열: 항목 | 당기금액 | 당기소계 | 전기금액 | 전기소계
-                # 첫 번째 숫자 컬럼(당기)을 가져온다
                 for cell in row[1:]:
                     val = _parse_number(cell)
                     if val is not None:
@@ -490,12 +586,13 @@ def _extract_from_cf(soup: BeautifulSoup) -> dict[str, Optional[float]]:
                         result["무형자산상각비"] = val
                         break
 
+    result["combined"] = combined
     return result
 
 
 # ── 공개 API ──────────────────────────────────────────────────────────────────
 
-def extract_depreciation(rcept_no: str) -> dict:
+def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
     """
     DART 보고서에서 감가상각비·무형자산상각비를 추출한다.
 
@@ -504,6 +601,7 @@ def extract_depreciation(rcept_no: str) -> dict:
 
     Args:
         rcept_no: DART 접수번호
+        fs_div:   "CFS"=연결, "OFS"=별도 (CF 테이블 선택에 사용)
 
     Returns:
         {
@@ -522,6 +620,7 @@ def extract_depreciation(rcept_no: str) -> dict:
         "tables_found":  0,
         "python_result": {"감가상각비": None, "무형자산상각비": None},
         "ai_result":     None,
+        "combined":      False,  # "감가상각비 및 무형자산상각비" 합산 여부
     }
 
     # 1. XML 다운로드 및 파싱
@@ -537,17 +636,20 @@ def extract_depreciation(rcept_no: str) -> dict:
 
     # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
     try:
-        cf_result = _extract_from_cf(soup)
+        cf_result = _extract_from_cf(soup, fs_div=fs_div)
     except Exception:
         cf_result = {"감가상각비": None, "무형자산상각비": None}
 
-    if cf_result.get("감가상각비") is not None and cf_result.get("무형자산상각비") is not None:
-        # CF에서 둘 다 찾음 → 즉시 반환
+    cf_combined = cf_result.pop("combined", False)
+
+    if cf_result.get("감가상각비") is not None and (cf_result.get("무형자산상각비") is not None or cf_combined):
+        # CF에서 찾음 → 즉시 반환
         return {
             **base,
-            "items":        cf_result,
+            "items":        {k: v for k, v in cf_result.items() if k != "combined"},
             "source":       "cf",
             "python_result": cf_result,
+            "combined":     cf_combined,
         }
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
@@ -590,12 +692,16 @@ def extract_depreciation(rcept_no: str) -> dict:
         "notes": notes_python,
     }
 
+    notes_combined = notes_python.get("combined", False) if isinstance(notes_python, dict) else False
+    is_combined = cf_combined or notes_combined
+
     source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "notes"
 
     return {
         **base,
-        "items":  final,
-        "source": source,
+        "items":    final,
+        "source":   source,
+        "combined": is_combined,
     }

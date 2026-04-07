@@ -260,11 +260,14 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     if base["items"].get("감가상각비") is None or base["items"].get("무형자산상각비") is None:
         try:
             from dart_api.notes_parser import extract_depreciation
-            depr_result = extract_depreciation(report["rcept_no"])
+            depr_result = extract_depreciation(report["rcept_no"], fs_div=base.get("fs_div", "CFS"))
             depr_items = depr_result.get("items", {})
             for key in ("감가상각비", "무형자산상각비"):
                 if base["items"].get(key) is None and depr_items.get(key) is not None:
                     base["items"][key] = depr_items[key]
+            # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
+            if depr_result.get("combined"):
+                base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
         except Exception:
             pass  # 주석 fallback 실패는 무시
 
@@ -463,6 +466,7 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
+            row["비고"] = r.get("remarks", "")
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
