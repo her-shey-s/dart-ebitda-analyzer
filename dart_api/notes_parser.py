@@ -171,6 +171,8 @@ def _infer_document_scope(soup: BeautifulSoup) -> Optional[bool]:
 def _resolve_notes_scope(
     norm_title: str,
     document_scope: Optional[bool],
+    current_scope: Optional[bool] = None,
+    in_notes: bool = False,
     has_explicit_consol_root: bool = False,
     has_explicit_separate_root: bool = False,
 ) -> tuple[Optional[bool], bool]:
@@ -186,11 +188,14 @@ def _resolve_notes_scope(
     if norm_title in ("별도재무제표주석", "별도주석"):
         return False, True
     if norm_title in ("재무제표주석", "주석"):
+        # 같은 notes 구간 내부에서 반복되는 generic 제목은 현재 범위를 유지한다.
+        if in_notes:
+            return current_scope, True
         if has_explicit_consol_root and not has_explicit_separate_root:
             return False, True
         if has_explicit_separate_root and not has_explicit_consol_root:
             return True, True
-        return document_scope, True
+        return current_scope if current_scope is not None else document_scope, True
     return None, False
 
 
@@ -343,6 +348,8 @@ def _collect_depreciation_tables(
             notes_scope, is_notes_root = _resolve_notes_scope(
                 norm,
                 document_scope,
+                current_scope=current_notes_scope,
+                in_notes=in_notes,
                 has_explicit_consol_root=has_explicit_consol_root,
                 has_explicit_separate_root=has_explicit_separate_root,
             )
