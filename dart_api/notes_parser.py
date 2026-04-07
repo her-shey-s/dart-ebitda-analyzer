@@ -314,6 +314,7 @@ def _collect_depreciation_tables(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
     strict_scope: bool = True,
+    debug_trace: Optional[list[str]] = None,
 ) -> list[dict]:
     """
     주석 섹션에서 감가상각 관련 테이블을 수집한다.
@@ -340,6 +341,12 @@ def _collect_depreciation_tables(
     title_norms = [_normalize_title(tag.get_text(strip=True)) for tag in soup.find_all("title")]
     has_explicit_consol_root = any(norm in ("연결재무제표주석", "연결주석") for norm in title_norms)
     has_explicit_separate_root = any(norm in ("별도재무제표주석", "별도주석") for norm in title_norms)
+    if debug_trace is not None:
+        debug_trace.append(
+            f"[NOTES] title roots scan: explicit_consol={has_explicit_consol_root}, "
+            f"explicit_separate={has_explicit_separate_root}, document_scope={document_scope}, "
+            f"strict_scope={strict_scope}"
+        )
 
     # 주석 섹션 시작 위치 찾기
     in_notes = False
@@ -365,6 +372,11 @@ def _collect_depreciation_tables(
                 has_explicit_consol_root=has_explicit_consol_root,
                 has_explicit_separate_root=has_explicit_separate_root,
             )
+            if debug_trace is not None and ("주석" in norm or "현금흐름표" in norm or "재무제표" in norm):
+                debug_trace.append(
+                    f"[NOTES] title encountered: raw={raw!r}, norm={norm!r}, "
+                    f"is_notes_root={is_notes_root}, resolved_scope={notes_scope}, in_notes_before={in_notes}"
+                )
 
             if is_notes_root:
                 in_notes = True
@@ -379,14 +391,23 @@ def _collect_depreciation_tables(
             rows = _xml_table_to_rows(tag)
             if not rows:
                 continue
+            if debug_trace is not None:
+                labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                debug_trace.append(
+                    f"[NOTES] table seen in notes scope={current_notes_scope}: labels={labels}"
+                )
 
             # 감가상각 키워드 포함 여부 확인
             full_text = " ".join(" ".join(r) for r in rows)
             if not any(kw in full_text for kw in _DEPRECIATION_KEYWORDS):
+                if debug_trace is not None:
+                    debug_trace.append("[NOTES] -> 감가상각 키워드 없음, 스킵")
                 continue
 
             # 제외 대상 필터링
             if _has_exclude_keywords(rows):
+                if debug_trace is not None:
+                    debug_trace.append("[NOTES] -> 제외 키워드 포함, 스킵")
                 continue
 
             title = _get_section_title(tag)
@@ -417,20 +438,32 @@ def _collect_depreciation_tables(
                 matched_tables.append(entry)
 
     if not strict_scope:
+        if debug_trace is not None:
+            debug_trace.append(f"[NOTES] strict off -> all_notes_tables {len(all_notes_tables)}개 반환")
         return all_notes_tables
 
     if matched_tables:
+        if debug_trace is not None:
+            debug_trace.append(f"[NOTES] matched_tables {len(matched_tables)}개 반환")
         return matched_tables
 
     # 문서 전체가 단일 재무제표 기준이면 범위 미표시 주석도 해당 기준으로 간주한다.
     if unscoped_tables and document_scope is not None and want_consol == document_scope:
+        if debug_trace is not None:
+            debug_trace.append(f"[NOTES] unscoped_tables {len(unscoped_tables)}개를 document_scope 기준으로 반환")
         return unscoped_tables
 
     # 주석 루트에 연결/별도 구분이 아예 없었던 문서만 전체 fallback 허용.
     if not has_scoped_notes_root:
+        if debug_trace is not None:
+            debug_trace.append(
+                f"[NOTES] scoped root 없음 -> unscoped={len(unscoped_tables)}, all={len(all_notes_tables)} 반환"
+            )
         return unscoped_tables if unscoped_tables else all_notes_tables
 
     # 연결/별도 루트가 명시된 문서에서는 다른 범위 주석으로 fallback 하지 않는다.
+    if debug_trace is not None:
+        debug_trace.append("[NOTES] strict scope에서 반환 가능한 주석 테이블 없음")
     return []
 
 
@@ -629,6 +662,7 @@ def _find_cf_tables_by_fs_type(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
     strict_scope: bool = True,
+    debug_trace: Optional[list[str]] = None,
 ) -> list[list[list[str]]]:
     """
     사업보고서에서 연결/별도 구분에 맞는 현금흐름표 테이블을 반환한다.
@@ -663,6 +697,10 @@ def _find_cf_tables_by_fs_type(
                     current_scope = False
                 else:
                     current_scope = document_scope if document_scope is not None else False
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[CF] title encountered: raw={raw!r}, norm={norm!r}, resolved_scope={current_scope}"
+                    )
             else:
                 is_cf_section = False
                 current_scope = None
@@ -673,14 +711,25 @@ def _find_cf_tables_by_fs_type(
                 continue
 
             all_cf_tables.append(rows)
+            if debug_trace is not None:
+                labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                debug_trace.append(
+                    f"[CF] table seen scope={current_scope}: labels={labels}"
+                )
 
             if current_scope is None or want_consol == current_scope:
                 matched_tables.append(rows)
 
     if not strict_scope:
+        if debug_trace is not None:
+            debug_trace.append(f"[CF] strict off -> all_cf_tables {len(all_cf_tables)}개 반환")
         return all_cf_tables
 
     # 구분에 맞는 테이블이 없으면 전체 CF 테이블 반환 (fallback)
+    if debug_trace is not None:
+        debug_trace.append(
+            f"[CF] strict on -> matched={len(matched_tables)}, all={len(all_cf_tables)}"
+        )
     return matched_tables if matched_tables else all_cf_tables
 
 
@@ -706,7 +755,7 @@ def _extract_from_cf(
     Returns:
         {"감가상각비": float|None, "무형자산상각비": float|None}
     """
-    cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope)
+    cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope, debug_trace=debug_trace)
     if debug_trace is not None:
         debug_trace.append(
             f"[CF] 후보 테이블 {len(cf_tables)}개 (fs_div={fs_div}, strict_scope={strict_scope})"
@@ -849,7 +898,12 @@ def extract_depreciation(
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
-        tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=strict_scope)
+        tables = _collect_depreciation_tables(
+            soup,
+            fs_div=fs_div,
+            strict_scope=strict_scope,
+            debug_trace=trace,
+        )
         trace.append(f"[NOTES] 후보 테이블 {len(tables)}개")
         for idx, tbl in enumerate(tables[:5], start=1):
             title = tbl.get("title") or "-"
