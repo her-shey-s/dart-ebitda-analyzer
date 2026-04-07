@@ -11,9 +11,14 @@ Gemini를 이용한 재무 데이터 AI 추출·검증
 
 import json
 import re
+import time
 from typing import Optional
 
 from config import FINANCIAL_ITEMS, GEMINI_API_KEY, GEMINI_MODEL
+
+# ── Rate limit 설정 ──────────────────────────────────────────────────────
+_RATE_LIMIT_RETRY_WAIT = 30   # rate limit 시 대기 시간(초)
+_RATE_LIMIT_MAX_RETRIES = 3   # 최대 재시도 횟수
 
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────
@@ -34,9 +39,18 @@ def _get_client():
         return None
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """예외가 rate limit (429) 오류인지 판별한다."""
+    exc_str = str(exc).lower()
+    return "429" in exc_str or "rate" in exc_str or "quota" in exc_str or "resource_exhausted" in exc_str
+
+
 def _generate(client, prompt: str) -> Optional[str]:
     """
-    Gemini Flash로 텍스트를 생성하고 응답 문자열을 반환한다.
+    Gemini로 텍스트를 생성하고 응답 문자열을 반환한다.
+
+    Rate limit(429) 발생 시 최대 _RATE_LIMIT_MAX_RETRIES회까지
+    _RATE_LIMIT_RETRY_WAIT초 대기 후 재시도한다.
 
     Args:
         client: _get_client() 반환값
@@ -45,14 +59,18 @@ def _generate(client, prompt: str) -> Optional[str]:
     Returns:
         응답 텍스트 또는 None (오류 시)
     """
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        return response.text.strip()
-    except Exception as e:
-        raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
+    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            if _is_rate_limit_error(e) and attempt < _RATE_LIMIT_MAX_RETRIES:
+                time.sleep(_RATE_LIMIT_RETRY_WAIT)
+                continue
+            raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
 
 
 def _parse_json(text: str) -> Optional[dict]:

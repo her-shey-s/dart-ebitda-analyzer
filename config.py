@@ -159,6 +159,6 @@ ACCOUNTING_IDENTITIES = [
 
 # ── 기타 상수 ─────────────────────────────────────────────────────────────
 CACHE_DB_PATH = "cache.db"
-REQUEST_TIMEOUT = 15          # 초
+REQUEST_TIMEOUT = 30          # 초
 MAX_HTML_SIZE_MB = 10         # HTML 다운로드 최대 크기
 GEMINI_MODEL = "gemini-3.1-flash-lite-preview-06-17"
