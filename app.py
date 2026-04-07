@@ -95,6 +95,10 @@ def _processing_status_detail(result: dict) -> str:
             f"{msg}. DART 기업코드 목록에서 정확 일치 기업명을 찾지 못했습니다."
         )
 
+    if status == "ambiguous_corp":
+        msg = result.get("error_msg") or "동일 기업명이 여러 개 존재합니다."
+        return f"{msg} DART에 같은 이름의 법인이 다수 등록되어 있어 재무데이터를 특정할 수 없습니다."
+
     if status == "no_report":
         year = result.get("year")
         return (
@@ -195,16 +199,25 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "error_msg":     "",
     }
 
-    # 1. corp_code 조회
-    corp_code = get_corp_code(corp_name)
-    if corp_code is None:
-        # 유사 기업명 힌트 제공
-        similar = search_corp(corp_name)
+    # 1. corp_code 조회 (동일 기업명 다수 시 추출 중단)
+    all_corps = search_corp(corp_name)
+    exact_corps = all_corps[all_corps["corp_name"] == corp_name]
+
+    if exact_corps.empty:
         hint = ""
-        if not similar.empty:
-            names = similar["corp_name"].head(3).tolist()
+        if not all_corps.empty:
+            names = all_corps["corp_name"].head(3).tolist()
             hint = f" (유사: {', '.join(names)})"
         return {**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"}
+
+    if len(exact_corps) > 1:
+        return {
+            **base,
+            "status": "ambiguous_corp",
+            "error_msg": f"동일 기업명 {len(exact_corps)}개 존재 — 재무데이터를 특정할 수 없습니다.",
+        }
+
+    corp_code = exact_corps.iloc[0]["corp_code"]
     base["corp_code"] = corp_code
 
     # 2. 캐시 확인

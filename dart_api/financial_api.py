@@ -211,12 +211,13 @@ def extract_target_items(raw_list: list[dict]) -> dict[str, Optional[float]]:
 
 # ── API 원시 데이터 → AI용 텍스트 ─────────────────────────────────────────
 
-# 재무제표 유형별 sj_div 코드 → 라벨
+# 재무제표 유형별 sj_div 코드 → AI 텍스트 라벨
 _SJ_DIV_LABELS: dict[str, str] = {
-    "BS": "BS",   # 재무상태표
-    "IS": "IS",   # 손익계산서
-    "CF": "CF",   # 현금흐름표
-    "SCE": "SCE", # 자본변동표
+    "BS":  "BS",   # 재무상태표
+    "IS":  "IS",   # 손익계산서
+    "CIS": "IS",   # 포괄손익계산서 → IS로 통합 (매출액·영업이익 등 포함)
+    "CF":  "CF",   # 현금흐름표
+    "SCE": "SCE",  # 자본변동표
 }
 
 
