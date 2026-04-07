@@ -303,6 +303,7 @@ def _extract_depreciation_from_rows(
 def _collect_depreciation_tables(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
+    strict_scope: bool = True,
 ) -> list[dict]:
     """
     주석 섹션에서 감가상각 관련 테이블을 수집한다.
@@ -406,6 +407,11 @@ def _collect_depreciation_tables(
 
     if matched_tables:
         return matched_tables
+
+    if not strict_scope:
+        if unscoped_tables:
+            return unscoped_tables
+        return all_notes_tables
 
     # 문서 전체가 단일 재무제표 기준이면 범위 미표시 주석도 해당 기준으로 간주한다.
     if unscoped_tables and document_scope is not None and want_consol == document_scope:
@@ -613,6 +619,7 @@ def _cross_validate(
 def _find_cf_tables_by_fs_type(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
+    strict_scope: bool = True,
 ) -> list[list[list[str]]]:
     """
     사업보고서에서 연결/별도 구분에 맞는 현금흐름표 테이블을 반환한다.
@@ -661,6 +668,9 @@ def _find_cf_tables_by_fs_type(
             if current_scope is None or want_consol == current_scope:
                 matched_tables.append(rows)
 
+    if not strict_scope:
+        return matched_tables if matched_tables else all_cf_tables
+
     # 구분에 맞는 테이블이 없으면 전체 CF 테이블 반환 (fallback)
     return matched_tables if matched_tables else all_cf_tables
 
@@ -668,6 +678,7 @@ def _find_cf_tables_by_fs_type(
 def _extract_from_cf(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
+    strict_scope: bool = True,
 ) -> dict[str, Optional[float]]:
     """
     현금흐름표(CF) 섹션에서 감가상각비·무형자산상각비를 추출한다.
@@ -685,7 +696,7 @@ def _extract_from_cf(
     Returns:
         {"감가상각비": float|None, "무형자산상각비": float|None}
     """
-    cf_tables = _find_cf_tables_by_fs_type(soup, fs_div)
+    cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope)
 
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
     combined = False
@@ -777,7 +788,7 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
 
     # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
     try:
-        cf_result = _extract_from_cf(soup, fs_div=fs_div)
+        cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=True)
     except Exception:
         cf_result = {"감가상각비": None, "무형자산상각비": None}
 
@@ -795,7 +806,7 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
-        tables = _collect_depreciation_tables(soup, fs_div=fs_div)
+        tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=True)
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
@@ -833,17 +844,48 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
     for key in ("감가상각비", "무형자산상각비"):
         final[key] = cf_result.get(key) or notes_final.get(key)
 
-    base["python_result"] = {
-        "cf": cf_result,
-        "notes": notes_python,
-    }
-
     notes_combined = notes_python.get("combined", False) if isinstance(notes_python, dict) else False
     is_combined = cf_combined or notes_combined
 
     source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "notes"
+
+    # 엄격한 연결/별도 범위에서 아무것도 찾지 못했으면
+    # 범위 추론이 애매한 테이블까지 포함해 한 번 더 시도한다.
+    if all(final.get(key) is None for key in ("감가상각비", "무형자산상각비")):
+        try:
+            relaxed_cf = _extract_from_cf(soup, fs_div=fs_div, strict_scope=False)
+        except Exception:
+            relaxed_cf = {"감가상각비": None, "무형자산상각비": None}
+
+        try:
+            relaxed_tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=False)
+        except Exception:
+            relaxed_tables = []
+
+        try:
+            relaxed_notes = (
+                _python_extract_depreciation(relaxed_tables)
+                if relaxed_tables else
+                {"감가상각비": None, "무형자산상각비": None}
+            )
+        except Exception:
+            relaxed_notes = {"감가상각비": None, "무형자산상각비": None}
+
+        relaxed_final = {}
+        for key in ("감가상각비", "무형자산상각비"):
+            relaxed_final[key] = relaxed_cf.get(key) or relaxed_notes.get(key)
+
+        if any(relaxed_final.get(key) is not None for key in ("감가상각비", "무형자산상각비")):
+            final = relaxed_final
+            is_combined = is_combined or relaxed_notes.get("combined", False) or relaxed_cf.get("combined", False)
+            source = f"{source}+relaxed" if source != "notes" else "notes+relaxed"
+
+    base["python_result"] = {
+        "cf": cf_result,
+        "notes": notes_python,
+    }
 
     return {
         **base,
