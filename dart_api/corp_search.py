@@ -100,13 +100,25 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             _corp_df = df
             return _corp_df
 
-    # 3. DART API 다운로드 (수십 MB ZIP이므로 타임아웃 넉넉하게)
-    resp = requests.get(
-        DART_ENDPOINTS["corp_code"],
-        params={"crtfc_key": DART_API_KEY},
-        timeout=max(REQUEST_TIMEOUT, 120),
-    )
-    resp.raise_for_status()
+    # 3. DART API 다운로드 (해외 서버에서 연결 불안정할 수 있어 재시도)
+    _DL_TIMEOUT = 120
+    _DL_MAX_RETRIES = 3
+    _DL_RETRY_WAIT = 5
+
+    for attempt in range(_DL_MAX_RETRIES):
+        try:
+            resp = requests.get(
+                DART_ENDPOINTS["corp_code"],
+                params={"crtfc_key": DART_API_KEY},
+                timeout=_DL_TIMEOUT,
+            )
+            resp.raise_for_status()
+            break
+        except (requests.ConnectionError, requests.Timeout):
+            if attempt < _DL_MAX_RETRIES - 1:
+                time.sleep(_DL_RETRY_WAIT)
+                continue
+            raise
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         xml_data = zf.read("CORPCODE.xml")
