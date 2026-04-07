@@ -688,6 +688,7 @@ def _extract_from_cf(
     soup: BeautifulSoup,
     fs_div: str = "CFS",
     strict_scope: bool = True,
+    debug_trace: Optional[list[str]] = None,
 ) -> dict[str, Optional[float]]:
     """
     현금흐름표(CF) 섹션에서 감가상각비·무형자산상각비를 추출한다.
@@ -706,15 +707,22 @@ def _extract_from_cf(
         {"감가상각비": float|None, "무형자산상각비": float|None}
     """
     cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope)
+    if debug_trace is not None:
+        debug_trace.append(
+            f"[CF] 후보 테이블 {len(cf_tables)}개 (fs_div={fs_div}, strict_scope={strict_scope})"
+        )
 
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
     combined = False
 
-    for rows in cf_tables:
+    for idx, rows in enumerate(cf_tables, start=1):
         # 감가상각 키워드가 포함된 CF 테이블만 대상
         full_text = " ".join(" ".join(r) for r in rows)
         if "감가상각" not in full_text:
             continue
+        if debug_trace is not None:
+            labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+            debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
 
         for row in rows:
             if not row:
@@ -748,6 +756,11 @@ def _extract_from_cf(
                         break
 
     result["combined"] = combined
+    if debug_trace is not None:
+        debug_trace.append(
+            f"[CF] Python 추출 결과: 감가상각비={result.get('감가상각비')}, "
+            f"무형자산상각비={result.get('무형자산상각비')}, combined={combined}"
+        )
     return result
 
 
@@ -789,50 +802,75 @@ def extract_depreciation(
         "python_result": {"감가상각비": None, "무형자산상각비": None},
         "ai_result":     None,
         "combined":      False,  # "감가상각비 및 무형자산상각비" 합산 여부
+        "trace":         [],
     }
+    trace: list[str] = [
+        f"[START] rcept_no={rcept_no}, fs_div={fs_div}, strict_scope={strict_scope}",
+    ]
 
     # 1. XML 다운로드 및 파싱
     try:
         xml_bytes = _download_dart_document(rcept_no)
         if xml_bytes is None:
-            return {**base, "error": "XML 다운로드 실패"}
+            trace.append("[LOAD] XML 다운로드 실패")
+            return {**base, "error": "XML 다운로드 실패", "trace": trace}
         soup = _parse_dart_xml(xml_bytes)
         if soup is None:
-            return {**base, "error": "XML 파싱 실패"}
+            trace.append("[LOAD] XML 파싱 실패")
+            return {**base, "error": "XML 파싱 실패", "trace": trace}
+        trace.append(
+            f"[LOAD] XML 파싱 성공, document_scope={_infer_document_scope(soup)}"
+        )
     except Exception as e:
-        return {**base, "error": f"문서 로드 실패: {e}"}
+        trace.append(f"[LOAD] 문서 로드 실패: {e}")
+        return {**base, "error": f"문서 로드 실패: {e}", "trace": trace}
 
     # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
     try:
-        cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=strict_scope)
-    except Exception:
+        cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=strict_scope, debug_trace=trace)
+    except Exception as e:
+        trace.append(f"[CF] 추출 예외: {e}")
         cf_result = {"감가상각비": None, "무형자산상각비": None}
 
     cf_combined = cf_result.pop("combined", False)
+    trace.append(f"[CF] combined={cf_combined}")
 
     if cf_result.get("감가상각비") is not None and (cf_result.get("무형자산상각비") is not None or cf_combined):
         # CF에서 찾음 → 즉시 반환
+        trace.append("[FINAL] CF 결과만으로 종료")
         return {
             **base,
             "items":        {k: v for k, v in cf_result.items() if k != "combined"},
             "source":       "cf",
             "python_result": cf_result,
             "combined":     cf_combined,
+            "trace":        trace,
         }
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
         tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=strict_scope)
+        trace.append(f"[NOTES] 후보 테이블 {len(tables)}개")
+        for idx, tbl in enumerate(tables[:5], start=1):
+            title = tbl.get("title") or "-"
+            labels = ", ".join(row[0].strip() for row in tbl.get("rows", [])[:5] if row)
+            trace.append(f"[NOTES] 테이블 #{idx}: title={title} / labels={labels}")
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
+        trace.append(f"[NOTES] 테이블 수집 실패: {e}")
 
     base["tables_found"] = len(tables)
 
     # 주석 Python 추출
     try:
         notes_python = _python_extract_depreciation(tables) if tables else {"감가상각비": None, "무형자산상각비": None}
-    except Exception:
+        trace.append(
+            f"[NOTES] Python 추출 결과: 감가상각비={notes_python.get('감가상각비')}, "
+            f"무형자산상각비={notes_python.get('무형자산상각비')}, combined={notes_python.get('combined')}"
+        )
+    except Exception as e:
+        trace.append(f"[NOTES] Python 추출 예외: {e}")
         notes_python = {"감가상각비": None, "무형자산상각비": None}
 
     # 주석 AI 추출
@@ -841,12 +879,23 @@ def extract_depreciation(
         try:
             notes_ai = _ai_extract_depreciation(tables)
             base["ai_result"] = notes_ai
+            trace.append(
+                f"[NOTES] AI 추출 결과: 감가상각비={notes_ai.get('감가상각비')}, "
+                f"무형자산상각비={notes_ai.get('무형자산상각비')}"
+            )
         except Exception as e:
             base["error"] = f"AI 추출 실패: {e}"
+            trace.append(f"[NOTES] AI 추출 실패: {e}")
+    else:
+        trace.append("[NOTES] 후보 테이블이 없어 AI 추출 생략")
 
     # 주석 교차검증
     if notes_ai:
         notes_final = _cross_validate(notes_python, notes_ai)
+        trace.append(
+            f"[NOTES] 교차검증 결과: 감가상각비={notes_final.get('감가상각비')}, "
+            f"무형자산상각비={notes_final.get('무형자산상각비')}"
+        )
     else:
         notes_final = notes_python
 
@@ -854,6 +903,7 @@ def extract_depreciation(
     # 혼합 기재하지 않도록 무형자산상각비를 비운다.
     if notes_python.get("combined"):
         notes_final["무형자산상각비"] = None
+        trace.append("[NOTES] combined=True 이므로 무형자산상각비를 None으로 고정")
 
     # CF 결과와 주석 결과 병합 (CF 우선)
     final: dict[str, Optional[float]] = {}
@@ -871,10 +921,15 @@ def extract_depreciation(
         "cf": cf_result,
         "notes": notes_python,
     }
+    trace.append(
+        f"[FINAL] source={source}, combined={is_combined}, "
+        f"감가상각비={final.get('감가상각비')}, 무형자산상각비={final.get('무형자산상각비')}"
+    )
 
     return {
         **base,
         "items":    final,
         "source":   source,
         "combined": is_combined,
+        "trace":    trace,
     }

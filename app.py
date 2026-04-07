@@ -195,6 +195,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "items":         {item["name"]: None for item in FINANCIAL_ITEMS},
         "validation":    None,
         "ai_comparison": None,
+        "depreciation_trace": [],
         "status":        "ok",
         "error_msg":     "",
     }
@@ -272,6 +273,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
                 fs_div=base.get("fs_div", "CFS"),
                 strict_scope=(report["path"] == "A"),
             )
+            base["depreciation_trace"] = depr_result.get("trace", [])
             depr_items = depr_result.get("items", {})
             for key in ("감가상각비", "무형자산상각비"):
                 if depr_items.get(key) is not None:
@@ -479,6 +481,7 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
             row["비고"] = r.get("remarks", "")
+            row["감가상각추적"] = "\n".join(r.get("depreciation_trace", []))
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
@@ -595,6 +598,11 @@ def _render_validation_detail(result: dict) -> None:
                 "금액(원)": f"{val_raw:,.0f}" if val_raw is not None else "-",
             })
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
+
+    trace_lines = result.get("depreciation_trace") or []
+    if trace_lines:
+        st.markdown("**감가상각 추적 로그:**")
+        st.code("\n".join(trace_lines), language="text")
 
 
 # ── 사이드바 ──────────────────────────────────────────────────────────────────
