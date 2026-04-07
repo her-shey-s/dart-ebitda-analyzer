@@ -17,8 +17,10 @@ from typing import Optional
 from config import FINANCIAL_ITEMS, GEMINI_API_KEY, GEMINI_MODEL
 
 # ── Rate limit 설정 ──────────────────────────────────────────────────────
-_RATE_LIMIT_RETRY_WAIT = 30   # rate limit 시 대기 시간(초)
-_RATE_LIMIT_MAX_RETRIES = 3   # 최대 재시도 횟수
+_RATE_LIMIT_RPM = 15          # 분당 최대 호출 횟수
+_RATE_LIMIT_WAIT = 30         # 한도 도달 시 대기 시간(초)
+_call_count = 0               # 현재 윈도우 내 호출 횟수
+_window_start = 0.0           # 현재 윈도우 시작 시각
 
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────
@@ -39,18 +41,29 @@ def _get_client():
         return None
 
 
-def _is_rate_limit_error(exc: Exception) -> bool:
-    """예외가 rate limit (429) 오류인지 판별한다."""
-    exc_str = str(exc).lower()
-    return "429" in exc_str or "rate" in exc_str or "quota" in exc_str or "resource_exhausted" in exc_str
+def _wait_if_rate_limited() -> None:
+    """분당 _RATE_LIMIT_RPM회에 도달하면 _RATE_LIMIT_WAIT초 대기한다."""
+    global _call_count, _window_start
+
+    now = time.time()
+    # 60초 경과 시 윈도우 리셋
+    if now - _window_start >= 60:
+        _call_count = 0
+        _window_start = now
+
+    if _call_count >= _RATE_LIMIT_RPM:
+        time.sleep(_RATE_LIMIT_WAIT)
+        _call_count = 0
+        _window_start = time.time()
+
+    _call_count += 1
 
 
 def _generate(client, prompt: str) -> Optional[str]:
     """
     Gemini로 텍스트를 생성하고 응답 문자열을 반환한다.
 
-    Rate limit(429) 발생 시 최대 _RATE_LIMIT_MAX_RETRIES회까지
-    _RATE_LIMIT_RETRY_WAIT초 대기 후 재시도한다.
+    분당 _RATE_LIMIT_RPM회 호출 후 _RATE_LIMIT_WAIT초 대기한다.
 
     Args:
         client: _get_client() 반환값
@@ -59,18 +72,15 @@ def _generate(client, prompt: str) -> Optional[str]:
     Returns:
         응답 텍스트 또는 None (오류 시)
     """
-    for attempt in range(_RATE_LIMIT_MAX_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-            )
-            return response.text.strip()
-        except Exception as e:
-            if _is_rate_limit_error(e) and attempt < _RATE_LIMIT_MAX_RETRIES:
-                time.sleep(_RATE_LIMIT_RETRY_WAIT)
-                continue
-            raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
+    _wait_if_rate_limited()
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        return response.text.strip()
+    except Exception as e:
+        raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
 
 
 def _parse_json(text: str) -> Optional[dict]:
