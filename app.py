@@ -245,7 +245,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         if report["path"] == "A":
             data = get_financial_data_path_a(corp_code, year, report["reprt_code"])
         else:
-            data = get_financial_data_path_b(report["rcept_no"])
+            data = get_financial_data_path_b(report["rcept_no"], report_type=report.get("report_type"))
     except Exception as e:
         return {**base, "status": "error", "error_msg": f"재무데이터 추출 오류: {e}"}
 
@@ -256,24 +256,32 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
-    # 4-B. 주석 fallback: CF에서 감가상각비를 못 찾은 경우에만 주석 탐색
-    if base["items"].get("감가상각비") is None or base["items"].get("무형자산상각비") is None:
+    # 4-B. 전용 감가상각 추출기 적용
+    # 경로B는 기본 파서가 연결/별도 범위를 구분하지 못할 수 있으므로,
+    # 감가상각비·무형자산상각비는 전용 추출 결과를 우선 반영한다.
+    should_refresh_depr = (
+        report["path"] == "B" or
+        base["items"].get("감가상각비") is None or
+        base["items"].get("무형자산상각비") is None
+    )
+    if should_refresh_depr:
         try:
             from dart_api.notes_parser import extract_depreciation
             depr_result = extract_depreciation(report["rcept_no"], fs_div=base.get("fs_div", "CFS"))
             depr_items = depr_result.get("items", {})
             for key in ("감가상각비", "무형자산상각비"):
-                if base["items"].get(key) is None and depr_items.get(key) is not None:
+                if depr_items.get(key) is not None:
                     base["items"][key] = depr_items[key]
             # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
             if depr_result.get("combined"):
+                base["items"]["무형자산상각비"] = None
                 base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
         except Exception:
             pass  # 주석 fallback 실패는 무시
 
     # 5. 검증 (회계 항등식)
     try:
-        validation = validate(data["items"])
+        validation = validate(base["items"])
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
 

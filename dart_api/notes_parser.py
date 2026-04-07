@@ -22,8 +22,8 @@ from typing import Optional
 from bs4 import BeautifulSoup, Tag
 
 from dart_api.html_parser import (
-    _build_section_table_map,
     _download_dart_document,
+    _normalize_title,
     _parse_dart_xml,
     _xml_table_to_rows,
 )
@@ -48,6 +48,15 @@ _UNIT_MULTIPLIERS = {
     "백만원": 1_000_000,
     "억원":  100_000_000,
 }
+
+_FS_SCOPE_TITLE_KEYWORDS = (
+    "재무상태표",
+    "손익계산서",
+    "포괄손익계산서",
+    "자본변동표",
+    "현금흐름표",
+    "재무제표주석",
+)
 
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
@@ -128,6 +137,61 @@ def _parse_number(text: str) -> Optional[float]:
         return -val if negative else val
     except ValueError:
         return None
+
+
+def _infer_document_scope(soup: BeautifulSoup) -> Optional[bool]:
+    """
+    문서 전체가 연결 전용/별도 전용인지 추론한다.
+
+    Returns:
+        True  -> 연결 전용 문서로 보임
+        False -> 별도 전용 문서로 보임
+        None  -> 연결/별도가 혼재하거나 판별 불가
+    """
+    saw_consol = False
+    saw_separate = False
+
+    for title_tag in soup.find_all("title"):
+        norm = _normalize_title(title_tag.get_text(strip=True))
+        if not any(kw in norm for kw in _FS_SCOPE_TITLE_KEYWORDS):
+            continue
+
+        if "연결" in norm:
+            saw_consol = True
+        else:
+            saw_separate = True
+
+    if saw_consol and not saw_separate:
+        return True
+    if saw_separate and not saw_consol:
+        return False
+    return None
+
+
+def _resolve_notes_scope(
+    norm_title: str,
+    document_scope: Optional[bool],
+    has_explicit_consol_root: bool = False,
+    has_explicit_separate_root: bool = False,
+) -> tuple[Optional[bool], bool]:
+    """
+    주석 루트 제목의 연결/별도 범위를 해석한다.
+
+    Returns:
+        (scope, is_notes_root)
+        scope: True=연결, False=별도, None=문서 전체 범위에 위임/판단 불가
+    """
+    if norm_title in ("연결재무제표주석", "연결주석"):
+        return True, True
+    if norm_title in ("별도재무제표주석", "별도주석"):
+        return False, True
+    if norm_title in ("재무제표주석", "주석"):
+        if has_explicit_consol_root and not has_explicit_separate_root:
+            return False, True
+        if has_explicit_separate_root and not has_explicit_consol_root:
+            return True, True
+        return document_scope, True
+    return None, False
 
 
 def _is_period_table(rows: list[list[str]]) -> bool:
@@ -231,9 +295,15 @@ def _extract_depreciation_from_rows(
 
 # ── 주석 테이블 수집 ──────────────────────────────────────────────────────────
 
-def _collect_depreciation_tables(soup: BeautifulSoup) -> list[dict]:
+def _collect_depreciation_tables(
+    soup: BeautifulSoup,
+    fs_div: str = "CFS",
+) -> list[dict]:
     """
     주석 섹션에서 감가상각 관련 테이블을 수집한다.
+
+    사업보고서에는 '연결재무제표 주석'과 '재무제표 주석'(별도)이 모두 포함되어 있다.
+    fs_div에 따라 올바른 주석 섹션에서만 테이블을 수집한다.
 
     각 테이블에 대해:
       - 섹션 제목
@@ -243,33 +313,48 @@ def _collect_depreciation_tables(soup: BeautifulSoup) -> list[dict]:
     를 포함하는 딕셔너리 리스트를 반환한다.
 
     Args:
-        soup: _parse_dart_xml() 반환값
+        soup:   _parse_dart_xml() 반환값
+        fs_div: "CFS"=연결재무제표 주석, "OFS"=별도재무제표 주석
 
     Returns:
         [{"title": str, "unit": int, "rows": [[str]], "text": str}, ...]
     """
+    want_consol = (fs_div == "CFS")
+    document_scope = _infer_document_scope(soup)
+    title_norms = [_normalize_title(tag.get_text(strip=True)) for tag in soup.find_all("title")]
+    has_explicit_consol_root = any(norm in ("연결재무제표주석", "연결주석") for norm in title_norms)
+    has_explicit_separate_root = any(norm in ("별도재무제표주석", "별도주석") for norm in title_norms)
+
     # 주석 섹션 시작 위치 찾기
     in_notes = False
-    tables: list[dict] = []
+    current_notes_scope: Optional[bool] = None
+    matched_tables: list[dict] = []
+    unscoped_tables: list[dict] = []
+    all_notes_tables: list[dict] = []
+    has_scoped_notes_root = False
 
-    section_key_map = {
-        "재무상태표": False,
-        "손익계산서": False,
-        "포괄손익계산서": False,
-        "자본변동표": False,
-        "현금흐름표": False,
-        "주석": True,
-    }
+    # 주석이 아닌 섹션 키워드 (이들이 나오면 주석 섹션 종료)
+    _NON_NOTES_KEYWORDS = ["재무상태표", "손익계산서", "포괄손익계산서", "자본변동표", "현금흐름표"]
 
     for tag in soup.descendants:
         if tag.name == "title":
             raw = tag.get_text(strip=True)
-            # 정규화: 공백/특수문자 제거
-            norm = re.sub(r"[\s\u3000]+", "", raw)
-            for section_name, is_notes in section_key_map.items():
-                if section_name in norm:
-                    in_notes = is_notes
-                    break
+            norm = _normalize_title(raw)
+            notes_scope, is_notes_root = _resolve_notes_scope(
+                norm,
+                document_scope,
+                has_explicit_consol_root=has_explicit_consol_root,
+                has_explicit_separate_root=has_explicit_separate_root,
+            )
+
+            if is_notes_root:
+                in_notes = True
+                current_notes_scope = notes_scope
+                if notes_scope is not None:
+                    has_scoped_notes_root = True
+            elif any(kw in norm for kw in _NON_NOTES_KEYWORDS):
+                in_notes = False
+                current_notes_scope = None
 
         elif tag.name == "table" and in_notes:
             rows = _xml_table_to_rows(tag)
@@ -297,15 +382,34 @@ def _collect_depreciation_tables(soup: BeautifulSoup) -> list[dict]:
             for row in rows:
                 text_lines.append(" | ".join(row))
 
-            tables.append({
+            entry = {
                 "title":  title,
                 "unit":   unit,
                 "rows":   rows,
                 "text":   "\n".join(text_lines),
                 "tag":    tag,  # 원본 태그 (디버깅용)
-            })
+            }
 
-    return tables
+            all_notes_tables.append(entry)
+
+            if current_notes_scope is None:
+                unscoped_tables.append(entry)
+            elif want_consol == current_notes_scope:
+                matched_tables.append(entry)
+
+    if matched_tables:
+        return matched_tables
+
+    # 문서 전체가 단일 재무제표 기준이면 범위 미표시 주석도 해당 기준으로 간주한다.
+    if unscoped_tables and document_scope is not None and want_consol == document_scope:
+        return unscoped_tables
+
+    # 주석 루트에 연결/별도 구분이 아예 없었던 문서만 전체 fallback 허용.
+    if not has_scoped_notes_root:
+        return unscoped_tables if unscoped_tables else all_notes_tables
+
+    # 연결/별도 루트가 명시된 문서에서는 다른 범위 주석으로 fallback 하지 않는다.
+    return []
 
 
 # ── Python 추출 ───────────────────────────────────────────────────────────────
@@ -318,20 +422,27 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
     여러 테이블에서 발견되면 최대값을 선택한다.
     (전체 비용 기준 값이 부분 값보다 항상 크거나 같으므로)
 
+    합산/분리 처리 규칙:
+      - 분리된 값(감가상각비, 무형자산상각비 각각)이 존재하면 분리 값 사용
+      - 합산 값만 있으면 합산 값 사용하고 무형자산상각비는 None
+      - 합산 값과 별도 무형자산상각비가 동시에 존재하는 경우 이중계산 방지:
+        분리된 감가상각비가 있으면 분리 값 우선, 없으면 합산 값 사용하되 무형자산상각비는 None
+
     Args:
         tables: _collect_depreciation_tables() 반환값
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None}
+        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
     """
     # 전체 비용 기준 테이블과 부분 테이블(판관비 등)을 분리
     _PARTIAL_SECTION_KEYWORDS = ["판매비", "판관비", "관리비"]
 
-    total_depr: list[float] = []
-    total_amort: list[float] = []
-    partial_depr: list[float] = []
-    partial_amort: list[float] = []
-    combined = False
+    # 분리된 항목 (합산이 아닌 개별 감가상각비/무형자산상각비)
+    separate_depr: list[float] = []
+    separate_amort: list[float] = []
+    # 합산 항목 ("감가상각비 및 무형자산상각비")
+    combined_depr: list[float] = []
+    has_combined = False
 
     for tbl in tables:
         rows = tbl["rows"]
@@ -342,26 +453,44 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
         if not _is_period_table(rows):
             continue
 
+        # 판관비 등 부분 테이블은 제외
+        is_partial = any(kw in title for kw in _PARTIAL_SECTION_KEYWORDS)
+        if is_partial:
+            continue
+
         extracted = _extract_depreciation_from_rows(rows, unit)
 
         if extracted.get("combined"):
-            combined = True
+            has_combined = True
+            if extracted.get("감가상각비") is not None:
+                combined_depr.append(extracted["감가상각비"])
+        else:
+            if extracted.get("감가상각비") is not None:
+                separate_depr.append(extracted["감가상각비"])
+            if extracted.get("무형자산상각비") is not None:
+                separate_amort.append(extracted["무형자산상각비"])
 
-        is_partial = any(kw in title for kw in _PARTIAL_SECTION_KEYWORDS)
-        depr_list = partial_depr if is_partial else total_depr
-        amort_list = partial_amort if is_partial else total_amort
+    # 분리된 값이 있으면 분리 값 우선 사용 (이중계산 방지)
+    if separate_depr:
+        return {
+            "감가상각비":    max(separate_depr),
+            "무형자산상각비": max(separate_amort) if separate_amort else None,
+            "combined":     False,
+        }
 
-        if extracted.get("감가상각비") is not None:
-            depr_list.append(extracted["감가상각비"])
-        if extracted.get("무형자산상각비") is not None:
-            amort_list.append(extracted["무형자산상각비"])
+    # 분리된 감가상각비가 없으면 합산 값 사용
+    if combined_depr:
+        return {
+            "감가상각비":    max(combined_depr),
+            "무형자산상각비": None,  # 합산이므로 무형자산상각비 별도 기재 불가
+            "combined":     True,
+        }
 
-    # 전체 비용 기준 우선, 없으면 부분 테이블 fallback은 하지 않음
-    # (판관비만의 감가상각비는 부분값이므로 사용하지 않는다)
+    # 감가상각비 없이 무형자산상각비만 있는 경우
     return {
-        "감가상각비":    max(total_depr) if total_depr else None,
-        "무형자산상각비": max(total_amort) if total_amort else None,
-        "combined":     combined,
+        "감가상각비":    None,
+        "무형자산상각비": max(separate_amort) if separate_amort else None,
+        "combined":     False,
     }
 
 
@@ -492,32 +621,37 @@ def _find_cf_tables_by_fs_type(
         해당 구분에 맞는 CF 테이블의 rows 리스트
     """
     want_consol = (fs_div == "CFS")
+    document_scope = _infer_document_scope(soup)
     matched_tables: list[list[list[str]]] = []
     all_cf_tables: list[list[list[str]]] = []
 
-    current_title = ""
+    current_scope: Optional[bool] = None
     is_cf_section = False
 
     for tag in soup.descendants:
         if tag.name == "title":
             raw = tag.get_text(strip=True)
-            norm = re.sub(r"[\s\u3000]+", "", raw)
+            norm = _normalize_title(raw)
             if "현금흐름표" in norm:
                 is_cf_section = True
-                current_title = norm
+                if "연결" in norm:
+                    current_scope = True
+                elif "별도" in norm:
+                    current_scope = False
+                else:
+                    current_scope = document_scope if document_scope is not None else False
             else:
                 is_cf_section = False
+                current_scope = None
 
         elif tag.name == "table" and is_cf_section:
-            from dart_api.html_parser import _xml_table_to_rows
             rows = _xml_table_to_rows(tag)
             if not rows:
                 continue
 
-            is_consol = "연결" in current_title
             all_cf_tables.append(rows)
 
-            if want_consol == is_consol:
+            if current_scope is None or want_consol == current_scope:
                 matched_tables.append(rows)
 
     # 구분에 맞는 테이블이 없으면 전체 CF 테이블 반환 (fallback)
@@ -654,7 +788,7 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
-        tables = _collect_depreciation_tables(soup)
+        tables = _collect_depreciation_tables(soup, fs_div=fs_div)
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
@@ -681,6 +815,11 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
         notes_final = _cross_validate(notes_python, notes_ai)
     else:
         notes_final = notes_python
+
+    # 합산 표기에서 감가상각비를 사용한 경우, AI가 무형자산상각비만 따로 채워도
+    # 혼합 기재하지 않도록 무형자산상각비를 비운다.
+    if notes_python.get("combined"):
+        notes_final["무형자산상각비"] = None
 
     # CF 결과와 주석 결과 병합 (CF 우선)
     final: dict[str, Optional[float]] = {}

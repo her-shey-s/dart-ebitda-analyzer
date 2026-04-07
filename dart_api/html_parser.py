@@ -267,6 +267,28 @@ def _build_section_table_map(
     return result
 
 
+def _infer_path_b_fs_div(
+    soup: BeautifulSoup,
+    report_type: Optional[str] = None,
+) -> str:
+    """
+    경로B 문서의 재무제표 기준(CFS/OFS)을 추론한다.
+
+    report_finder가 이미 연결/별도 보고서 유형을 식별했으면 그 값을 우선 사용한다.
+    """
+    if report_type == "audit_consol":
+        return "CFS"
+    if report_type == "audit_separate":
+        return "OFS"
+
+    for title_tag in soup.find_all("title"):
+        norm = _normalize_title(title_tag.get_text(strip=True))
+        if "연결" in norm and any(kw in norm for kw in ("재무상태표", "손익계산서", "포괄손익계산서", "현금흐름표", "재무제표주석")):
+            return "CFS"
+
+    return "OFS"
+
+
 def _classify_table(rows: list[list[str]]) -> str:
     """
     행 데이터로 테이블 유형을 분류한다. (fallback용)
@@ -439,7 +461,10 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
 
 # ── 경로B 메인 함수 ────────────────────────────────────────────────────────
 
-def get_financial_data_path_b(rcept_no: str) -> dict:
+def get_financial_data_path_b(
+    rcept_no: str,
+    report_type: Optional[str] = None,
+) -> dict:
     """
     경로B 메인 함수: 감사보고서 rcept_no로 재무 데이터를 추출한다.
 
@@ -456,7 +481,7 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     Returns:
         {
             "items":          {항목명: 금액(float|None), ...},
-            "fs_div":         "OFS",  # 감사보고서는 별도 기준
+            "fs_div":         "CFS" | "OFS",
             "error":          None | 오류 메시지 문자열,
             "ai_comparison":  AI 비교 결과 딕셔너리 | None,
         }
@@ -481,6 +506,8 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
             "ai_comparison": None,
         }
 
+    fs_div = _infer_path_b_fs_div(soup, report_type=report_type)
+
     # 3. Python 항목 추출
     items = _extract_all_items(soup)
 
@@ -499,7 +526,7 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
 
     return {
         "items":         items,
-        "fs_div":        "OFS",
+        "fs_div":        fs_div,
         "error":         None,
         "ai_comparison": ai_comparison,
     }
