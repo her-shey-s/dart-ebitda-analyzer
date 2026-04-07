@@ -280,19 +280,49 @@ def _extract_depreciation_from_rows(
     result: dict[str, Optional[float]] = {}
     combined = False
 
-    # 당기 컬럼 인덱스 찾기 (보통 "당기"가 포함된 컬럼)
-    current_col = 1  # 기본값: 두 번째 컬럼
+    # 우선순위:
+    # 1. 당기 컬럼
+    # 2. 합계 컬럼 (비용의 성격별 분류 표)
+    # 3. 첫 번째 숫자 컬럼
+    current_col = 1
 
-    if rows and len(rows[0]) > 1:
-        for ci, cell in enumerate(rows[0]):
-            if "당기" in cell and "전기" not in cell:
+    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
+    selected_by_header = False
+    for header in header_rows:
+        if len(header) <= 1:
+            continue
+        for ci, cell in enumerate(header):
+            label = cell.replace(" ", "").strip()
+            if "당기" in label and "전기" not in label:
                 current_col = ci
+                selected_by_header = True
+                break
+        if selected_by_header:
+            break
+
+    if not selected_by_header:
+        for header in header_rows:
+            if len(header) <= 1:
+                continue
+            for ci, cell in enumerate(header):
+                label = cell.replace(" ", "").strip()
+                if label in ("합계", "총계"):
+                    current_col = ci
+                    selected_by_header = True
+                    break
+            if selected_by_header:
                 break
 
     for row in rows:
         if not row:
             continue
         label = row[0].replace(" ", "").strip()
+
+        if current_col >= len(row):
+            for ci in range(1, len(row)):
+                if _parse_number(row[ci]) is not None:
+                    current_col = ci
+                    break
 
         # "감가상각비및무형자산상각비" 합산 항목 감지
         if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
@@ -518,10 +548,6 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
         unit = tbl["unit"]
         title = tbl.get("title", "")
 
-        # 당기/전기 구조 테이블만 대상
-        if not _is_period_table(rows):
-            continue
-
         # 판관비 등 부분 테이블은 제외
         is_partial = any(kw in title for kw in _PARTIAL_SECTION_KEYWORDS)
         if is_partial:
@@ -539,20 +565,28 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
             if extracted.get("무형자산상각비") is not None:
                 separate_amort.append(extracted["무형자산상각비"])
 
-    # 분리된 값이 있으면 분리 값 우선 사용 (이중계산 방지)
-    if separate_depr:
+    # 분리된 감가상각비/무형자산상각비가 모두 있으면 분리 값 우선 사용
+    if separate_depr and separate_amort:
         return {
             "감가상각비":    max(separate_depr),
-            "무형자산상각비": max(separate_amort) if separate_amort else None,
+            "무형자산상각비": max(separate_amort),
             "combined":     False,
         }
 
-    # 분리된 감가상각비가 없으면 합산 값 사용
+    # 합산 값이 있으면 합산 우선 사용
     if combined_depr:
         return {
             "감가상각비":    max(combined_depr),
             "무형자산상각비": None,  # 합산이므로 무형자산상각비 별도 기재 불가
             "combined":     True,
+        }
+
+    # 분리된 감가상각비만 있는 경우
+    if separate_depr:
+        return {
+            "감가상각비":    max(separate_depr),
+            "무형자산상각비": None,
+            "combined":     False,
         }
 
     # 감가상각비 없이 무형자산상각비만 있는 경우
