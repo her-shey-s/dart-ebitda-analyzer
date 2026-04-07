@@ -280,13 +280,44 @@ def _extract_depreciation_from_rows(
     result: dict[str, Optional[float]] = {}
     combined = False
 
+    # 가로형 표 대응:
+    # 첫 행(또는 둘째 행)에 비용 항목이 열 헤더로 나열되고,
+    # 그 아래 행에 당기/전기 금액이 배치되는 경우가 있다.
+    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
+    header_targets: dict[str, int] = {}
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            label = cell.replace(" ", "").strip()
+            if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
+                header_targets["combined"] = ci
+            elif label in ("감가상각비", "감가상각비용"):
+                header_targets["depr"] = ci
+            elif label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
+                header_targets["amort"] = ci
+
+    if header_targets:
+        for key, ci in header_targets.items():
+            for row in rows[1:]:
+                if ci >= len(row):
+                    continue
+                val = _parse_number(row[ci])
+                if val is None:
+                    continue
+                if key == "combined":
+                    result["감가상각비"] = val * unit_multiplier
+                    combined = True
+                elif key == "depr":
+                    result["감가상각비"] = val * unit_multiplier
+                elif key == "amort":
+                    result["무형자산상각비"] = val * unit_multiplier
+                break
+
     # 우선순위:
     # 1. 당기 컬럼
     # 2. 합계 컬럼 (비용의 성격별 분류 표)
     # 3. 첫 번째 숫자 컬럼
     current_col = 1
 
-    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
     selected_by_header = False
     for header in header_rows:
         if len(header) <= 1:
