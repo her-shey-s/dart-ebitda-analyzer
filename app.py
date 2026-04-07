@@ -257,8 +257,8 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
     # 4-B. 전용 감가상각 추출기 적용
-    # 경로B는 기본 파서가 연결/별도 범위를 구분하지 못할 수 있으므로,
-    # 감가상각비·무형자산상각비는 전용 추출 결과를 우선 반영한다.
+    # 경로A(사업보고서)는 fs_div 기준으로 주석 범위를 엄격히 구분하고,
+    # 경로B(감사보고서/연결감사보고서)는 선택된 보고서 문서 전체를 사용한다.
     should_refresh_depr = (
         report["path"] == "B" or
         base["items"].get("감가상각비") is None or
@@ -267,7 +267,11 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     if should_refresh_depr:
         try:
             from dart_api.notes_parser import extract_depreciation
-            depr_result = extract_depreciation(report["rcept_no"], fs_div=base.get("fs_div", "CFS"))
+            depr_result = extract_depreciation(
+                report["rcept_no"],
+                fs_div=base.get("fs_div", "CFS"),
+                strict_scope=(report["path"] == "A"),
+            )
             depr_items = depr_result.get("items", {})
             for key in ("감가상각비", "무형자산상각비"):
                 if depr_items.get(key) is not None:

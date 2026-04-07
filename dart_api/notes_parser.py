@@ -173,6 +173,7 @@ def _resolve_notes_scope(
     document_scope: Optional[bool],
     current_scope: Optional[bool] = None,
     in_notes: bool = False,
+    strict_scope: bool = True,
     has_explicit_consol_root: bool = False,
     has_explicit_separate_root: bool = False,
 ) -> tuple[Optional[bool], bool]:
@@ -187,7 +188,16 @@ def _resolve_notes_scope(
         return True, True
     if norm_title in ("별도재무제표주석", "별도주석"):
         return False, True
-    if norm_title in ("재무제표주석", "주석"):
+    if norm_title == "재무제표주석":
+        # 사업보고서 strict 모드에서는 '재무제표 주석'을 별도 주석 루트로 본다.
+        if strict_scope:
+            return False, True
+        if has_explicit_consol_root and not has_explicit_separate_root:
+            return False, True
+        if has_explicit_separate_root and not has_explicit_consol_root:
+            return True, True
+        return current_scope if current_scope is not None else document_scope, True
+    if norm_title == "주석":
         # 같은 notes 구간 내부에서 반복되는 generic 제목은 현재 범위를 유지한다.
         if in_notes:
             return current_scope, True
@@ -351,6 +361,7 @@ def _collect_depreciation_tables(
                 document_scope,
                 current_scope=current_notes_scope,
                 in_notes=in_notes,
+                strict_scope=strict_scope,
                 has_explicit_consol_root=has_explicit_consol_root,
                 has_explicit_separate_root=has_explicit_separate_root,
             )
@@ -405,13 +416,11 @@ def _collect_depreciation_tables(
             elif want_consol == current_notes_scope:
                 matched_tables.append(entry)
 
+    if not strict_scope:
+        return all_notes_tables
+
     if matched_tables:
         return matched_tables
-
-    if not strict_scope:
-        if unscoped_tables:
-            return unscoped_tables
-        return all_notes_tables
 
     # 문서 전체가 단일 재무제표 기준이면 범위 미표시 주석도 해당 기준으로 간주한다.
     if unscoped_tables and document_scope is not None and want_consol == document_scope:
@@ -669,7 +678,7 @@ def _find_cf_tables_by_fs_type(
                 matched_tables.append(rows)
 
     if not strict_scope:
-        return matched_tables if matched_tables else all_cf_tables
+        return all_cf_tables
 
     # 구분에 맞는 테이블이 없으면 전체 CF 테이블 반환 (fallback)
     return matched_tables if matched_tables else all_cf_tables
@@ -744,7 +753,11 @@ def _extract_from_cf(
 
 # ── 공개 API ──────────────────────────────────────────────────────────────────
 
-def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
+def extract_depreciation(
+    rcept_no: str,
+    fs_div: str = "CFS",
+    strict_scope: bool = True,
+) -> dict:
     """
     DART 보고서에서 감가상각비·무형자산상각비를 추출한다.
 
@@ -754,6 +767,9 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
     Args:
         rcept_no: DART 접수번호
         fs_div:   "CFS"=연결, "OFS"=별도 (CF 테이블 선택에 사용)
+        strict_scope:
+            True  -> 사업보고서(경로A)처럼 연결/별도 범위를 엄격히 구분
+            False -> 감사보고서/연결감사보고서(경로B)처럼 문서 전체를 사용
 
     Returns:
         {
@@ -788,7 +804,7 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
 
     # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
     try:
-        cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=True)
+        cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=strict_scope)
     except Exception:
         cf_result = {"감가상각비": None, "무형자산상각비": None}
 
@@ -806,7 +822,7 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
 
     # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
     try:
-        tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=True)
+        tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=strict_scope)
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
@@ -850,37 +866,6 @@ def extract_depreciation(rcept_no: str, fs_div: str = "CFS") -> dict:
     source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "notes"
-
-    # 엄격한 연결/별도 범위에서 아무것도 찾지 못했으면
-    # 범위 추론이 애매한 테이블까지 포함해 한 번 더 시도한다.
-    if all(final.get(key) is None for key in ("감가상각비", "무형자산상각비")):
-        try:
-            relaxed_cf = _extract_from_cf(soup, fs_div=fs_div, strict_scope=False)
-        except Exception:
-            relaxed_cf = {"감가상각비": None, "무형자산상각비": None}
-
-        try:
-            relaxed_tables = _collect_depreciation_tables(soup, fs_div=fs_div, strict_scope=False)
-        except Exception:
-            relaxed_tables = []
-
-        try:
-            relaxed_notes = (
-                _python_extract_depreciation(relaxed_tables)
-                if relaxed_tables else
-                {"감가상각비": None, "무형자산상각비": None}
-            )
-        except Exception:
-            relaxed_notes = {"감가상각비": None, "무형자산상각비": None}
-
-        relaxed_final = {}
-        for key in ("감가상각비", "무형자산상각비"):
-            relaxed_final[key] = relaxed_cf.get(key) or relaxed_notes.get(key)
-
-        if any(relaxed_final.get(key) is not None for key in ("감가상각비", "무형자산상각비")):
-            final = relaxed_final
-            is_combined = is_combined or relaxed_notes.get("combined", False) or relaxed_cf.get("combined", False)
-            source = f"{source}+relaxed" if source != "notes" else "notes+relaxed"
 
     base["python_result"] = {
         "cf": cf_result,
