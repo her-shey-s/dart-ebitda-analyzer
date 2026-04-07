@@ -1,19 +1,13 @@
 """
 validator/rules.py
-재무 데이터 3단계 검증
+재무 데이터 검증 — 회계 항등식
 
-1단계 - 회계 항등식 (비용 0원):
+회계 항등식 검증 (비용 0원):
     총자산 = 총부채 + 자본총계
     매출총이익 = 매출액 - 매출원가
     영업이익 ≤ 매출총이익 (판관비는 항상 양수)
 
-2단계 - 교차 검증 (비용 0원, 경로A만):
-    전체재무제표(items) vs 주요계정 API(cross_check) 수치 비교
-    DART가 CFS 요청에 OFS를 반환하는 알려진 혼동 패턴 감지
-
-3단계 - AI 검증 (최소 비용):
-    1·2단계에서 critical 플래그가 달린 건만 gemini_parser.py로 연결
-    (현재는 시그니처만 정의)
+AI 독립 추출 교차검증은 경로A·B 모두 gemini_parser.py에서 처리한다.
 
 공통 반환 형식:
     {
@@ -150,164 +144,16 @@ def check_accounting_identities(items: dict[str, Optional[float]]) -> list[dict]
     ]
 
 
-# ── 2단계: 교차 검증 ────────────────────────────────────────────────────────
-
-# DART 주요계정 API가 CFS 요청에 OFS 값을 반환하는 알려진 패턴:
-# 여러 항목이 일정 비율(40%~80%)로 일관되게 낮으면 CFS/OFS 혼동으로 간주
-_CFS_OFS_MIN_ITEMS = 2       # 패턴 판별에 필요한 최소 불일치 항목 수
-_CFS_OFS_RATIO_MIN = 0.20   # 불일치 비율이 이 값 이상이면 CFS/OFS 가능
-_CFS_OFS_RATIO_MAX = 0.95   # 이 값을 넘으면 너무 달라서 다른 원인 가능
-
-# DART 두 API 간 집계 기준 차이(비지배지분 포함 여부 등)로 발생하는 근소 차이:
-# 비율이 0.95~1.05 사이면 API 특성으로 인한 소수 차이로 간주 → warning
-_NEAR_MATCH_MIN = 0.95
-_NEAR_MATCH_MAX = 1.05
-
-
-def _is_cfs_ofs_confusion(ratios: list[float]) -> bool:
-    """
-    cross_check 값들이 items 값 대비 일정 비율 범위에 있으면
-    CFS/OFS 혼동으로 판단한다.
-
-    Args:
-        ratios: cross_check[i] / items[i] 비율 리스트
-
-    Returns:
-        True이면 CFS/OFS 혼동 가능성
-    """
-    if len(ratios) < _CFS_OFS_MIN_ITEMS:
-        return False
-    in_range = [_CFS_OFS_RATIO_MIN < r < _CFS_OFS_RATIO_MAX for r in ratios]
-    # 과반수가 같은 비율 범위 안에 있으면 혼동 패턴
-    return sum(in_range) >= len(ratios) * 0.5
-
-
-def check_cross_validation(
-    items: dict[str, Optional[float]],
-    cross_check: dict[str, Optional[float]],
-) -> list[dict]:
-    """
-    2단계: 전체재무제표(items)와 주요계정 API(cross_check) 수치를 비교한다.
-
-    경로A에서만 유효. cross_check가 비어 있으면 빈 리스트를 반환한다.
-
-    불일치 원인 분류:
-      - CFS/OFS 혼동: DART가 CFS 요청에 OFS를 반환하는 알려진 버그 → severity=warning
-      - API 근소 차이: 비율 0.95~1.05, DART 두 API 간 집계 기준 차이 → severity=warning
-      - 실제 불일치: 원인 불명의 수치 차이 → severity=critical
-
-    Args:
-        items:       전체재무제표에서 추출한 항목 딕셔너리
-        cross_check: 주요계정 API에서 추출한 항목 딕셔너리
-
-    Returns:
-        check 딕셔너리 리스트
-    """
-    if not cross_check:
-        return []
-
-    mismatches = []
-    ratios = []
-
-    for name, v1 in items.items():
-        v2 = cross_check.get(name)
-        if v1 is None or v2 is None or v1 == 0:
-            continue
-
-        diff = abs(v1 - v2)
-        if _passes(diff, v1):
-            continue  # 허용 오차 이내 → 통과
-
-        mismatches.append((name, v1, v2, diff))
-        ratios.append(abs(v2) / abs(v1))
-
-    if not mismatches:
-        return []
-
-    # 원인 분류
-    is_confusion  = _is_cfs_ofs_confusion(ratios)
-    near_match_count = sum(_NEAR_MATCH_MIN < r < _NEAR_MATCH_MAX for r in ratios)
-    is_near_match = (
-        len(ratios) >= _CFS_OFS_MIN_ITEMS
-        and near_match_count >= len(ratios) * 0.5
-        and not is_confusion  # CFS/OFS 혼동과 중복 분류 방지
-    )
-
-    if is_confusion:
-        severity = "warning"
-        cause    = "DART API CFS/OFS 혼동 가능성"
-    elif is_near_match:
-        severity = "warning"
-        cause    = "DART API 집계 기준 차이"
-    else:
-        severity = "critical"
-        cause    = "수치 불일치"
-
-    checks = []
-    for name, v1, v2, diff in mismatches:
-        checks.append({
-            "rule":     f"교차검증: {name} ({cause})",
-            "expected": v1,
-            "actual":   v2,
-            "diff":     diff,
-            "passed":   False,
-            "severity": severity,
-        })
-
-    return checks
-
-
-# ── 3단계: AI 검증 (시그니처만) ─────────────────────────────────────────────
-
-def validate_with_ai(
-    validation_result: dict,
-    items: dict[str, Optional[float]],
-    corp_name: str,
-    year: int,
-) -> dict:
-    """
-    3단계: AI(Gemini Flash)로 검증한다.
-
-    critical 실패가 있는 건에 대해 gemini_parser.verify_financial_data()를 호출하여
-    데이터 정합성을 AI로 재검토한다. API 키 미설정 또는 호출 실패 시 기존 결과 유지.
-
-    Args:
-        validation_result: validate() 반환값 (1·2단계 결과)
-        items:             항목명 → 금액 딕셔너리
-        corp_name:         기업명 (AI 컨텍스트용)
-        year:              사업연도
-
-    Returns:
-        validate()와 동일한 형식에 "ai_result" 키 추가된 딕셔너리
-        ai_result: {
-            "verdict":     "correct"|"error"|"uncertain"|"skipped",
-            "issues":      [...],
-            "corrections": {...},
-        }
-    """
-    try:
-        from gemini_parser import verify_financial_data
-        ai_result = verify_financial_data(items, validation_result, corp_name, year)
-    except Exception as e:
-        ai_result = {"verdict": "skipped", "issues": [f"AI 모듈 오류: {e}"], "corrections": {}}
-
-    return {**validation_result, "ai_result": ai_result}
-
-
 # ── 메인 검증 함수 ────────────────────────────────────────────────────────
 
-def validate(
-    items: dict[str, Optional[float]],
-    cross_check: dict[str, Optional[float]] | None = None,
-    path: str = "A",
-) -> dict:
+def validate(items: dict[str, Optional[float]]) -> dict:
     """
-    1·2단계 검증을 실행하고 통합 결과를 반환한다.
+    회계 항등식 검증을 실행하고 통합 결과를 반환한다.
+
+    AI 독립 추출 교차검증은 경로A·B 모두 gemini_parser.py에서 별도 처리한다.
 
     Args:
-        items:       항목명 → 금액 딕셔너리 (필수)
-        cross_check: 교차검증용 딕셔너리 (경로A만 전달, 경로B는 None 또는 {})
-        path:        "A" (사업보고서) | "B" (감사보고서)
+        items: 항목명 → 금액 딕셔너리 (필수)
 
     Returns:
         {
@@ -318,12 +164,8 @@ def validate(
     """
     checks: list[dict] = []
 
-    # 1단계: 회계 항등식
+    # 회계 항등식
     checks.extend(check_accounting_identities(items))
-
-    # 2단계: 교차 검증 (경로A + cross_check 있을 때만)
-    if path == "A" and cross_check:
-        checks.extend(check_cross_validation(items, cross_check))
 
     # 플래그: 실패한 항목의 요약 메시지
     flags = [_check_to_flag(c) for c in checks if not c["passed"]]
@@ -339,29 +181,6 @@ def validate(
         "checks":   checks,
         "flags":    flags,
     }
-
-
-def needs_ai_validation(result: dict) -> bool:
-    """
-    3단계 AI 검증이 필요한지 판단한다.
-
-    critical 실패가 있거나 warning이 2개 이상이면 AI 검증 권장.
-
-    Args:
-        result: validate() 반환값
-
-    Returns:
-        True이면 AI 검증 필요
-    """
-    critical_fails = sum(
-        1 for c in result["checks"]
-        if not c["passed"] and c["severity"] == "critical"
-    )
-    warning_fails = sum(
-        1 for c in result["checks"]
-        if not c["passed"] and c["severity"] == "warning"
-    )
-    return critical_fails > 0 or warning_fails >= 2
 
 
 # ── 내부 유틸 ──────────────────────────────────────────────────────────────

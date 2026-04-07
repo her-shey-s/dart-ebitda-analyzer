@@ -25,7 +25,6 @@ DART_ENDPOINTS = {
     "company_info":   f"{DART_BASE_URL}/company.json",       # 기업 기본정보
     "disclosure_list":f"{DART_BASE_URL}/list.json",          # 공시 목록
     "financial_stmt": f"{DART_BASE_URL}/fnlttSinglAcntAll.json",  # 단일회사 전체 재무제표 (경로A)
-    "major_account":  f"{DART_BASE_URL}/fnlttSinglAcnt.json",     # 주요계정 (교차검증용)
     "doc_index":      f"{DART_BASE_URL}/index.json",         # 보고서 원문 문서 목록
 }
 
@@ -162,4 +161,4 @@ ACCOUNTING_IDENTITIES = [
 CACHE_DB_PATH = "cache.db"
 REQUEST_TIMEOUT = 15          # 초
 MAX_HTML_SIZE_MB = 10         # HTML 다운로드 최대 크기
-GEMINI_MODEL = "gemini-3.1-flash-lite-preview"
+GEMINI_MODEL = "gemma-4-31b-it"

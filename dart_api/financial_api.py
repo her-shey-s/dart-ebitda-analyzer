@@ -3,9 +3,8 @@ dart_api/financial_api.py
 경로A: DART 재무제표 API 직접 호출
 
 사업보고서가 존재하는 기업에 대해
-  1. 단일회사 전체 재무제표(fnlttSinglAcntAll) — 주 데이터 소스
-  2. 단일회사 주요계정(fnlttSinglAcnt)          — 교차검증 소스
-두 API를 호출하여 config.FINANCIAL_ITEMS에 정의된 항목을 추출한다.
+  단일회사 전체 재무제표(fnlttSinglAcntAll) API를 호출하여
+  config.FINANCIAL_ITEMS에 정의된 항목을 추출한다.
 
 계정 매칭 전략 (두 단계):
   1차: account_id (IFRS 코드) 정확 일치
@@ -24,17 +23,6 @@ from config import (
     REQUEST_TIMEOUT,
 )
 
-
-# ── 주요계정 API account_nm → FINANCIAL_ITEMS name 매핑 ──────────────────
-# fnlttSinglAcnt가 반환하는 고정 계정명을 우리 항목명으로 변환
-_MAJOR_ACCT_NAME_MAP: dict[str, str] = {
-    "자산총계":   "총자산",
-    "부채총계":   "총부채",
-    "자본총계":   "자본총계",
-    "매출액":     "매출액",
-    "영업이익":   "영업이익",
-    "당기순이익": "당기순이익",
-}
 
 _VALID_FS_DIVS = {"CFS", "OFS"}
 
@@ -194,47 +182,6 @@ def fetch_full_financial_statement(
     return items
 
 
-def fetch_major_accounts(
-    corp_code: str,
-    bsns_year: str,
-    reprt_code: str,
-    fs_div: str = "CFS",
-) -> list[dict]:
-    """
-    단일회사 주요계정 API(fnlttSinglAcnt)를 호출한다. 교차검증에 사용.
-
-    Args:
-        corp_code:   DART 기업 고유코드
-        bsns_year:   사업연도 문자열
-        reprt_code:  보고서 코드
-        fs_div:      "CFS"=연결, "OFS"=별도
-
-    Returns:
-        주요계정 딕셔너리 리스트
-
-    Raises:
-        requests.HTTPError, ValueError
-    """
-    params = {
-        "crtfc_key":  DART_API_KEY,
-        "corp_code":  corp_code,
-        "bsns_year":  bsns_year,
-        "reprt_code": reprt_code,
-        "fs_div":     fs_div,
-    }
-    resp = requests.get(DART_ENDPOINTS["major_account"], params=params, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-    data = resp.json()
-
-    status = data.get("status")
-    if status != "000":
-        raise ValueError(
-            f"주요계정 API 오류 [{fs_div}]: {data.get('message', '')} (status={status})"
-        )
-
-    return data.get("list", [])
-
-
 # ── 항목 추출 함수 ────────────────────────────────────────────────────────
 
 def extract_target_items(raw_list: list[dict]) -> dict[str, Optional[float]]:
@@ -262,26 +209,58 @@ def extract_target_items(raw_list: list[dict]) -> dict[str, Optional[float]]:
     return result
 
 
-def extract_major_account_items(major_list: list[dict]) -> dict[str, Optional[float]]:
-    """
-    주요계정 원시 리스트에서 교차검증용 항목을 추출한다.
+# ── API 원시 데이터 → AI용 텍스트 ─────────────────────────────────────────
 
-    주요계정 API는 account_nm 기준으로 고정된 항목을 반환하므로
-    _MAJOR_ACCT_NAME_MAP을 통해 우리 항목명으로 변환한다.
+# 재무제표 유형별 sj_div 코드 → 라벨
+_SJ_DIV_LABELS: dict[str, str] = {
+    "BS": "BS",   # 재무상태표
+    "IS": "IS",   # 손익계산서
+    "CF": "CF",   # 현금흐름표
+    "SCE": "SCE", # 자본변동표
+}
+
+
+def format_raw_for_ai(raw_list: list[dict], max_chars: int = 8000) -> str:
+    """
+    전체재무제표 API 원시 행 리스트를 AI 추출용 텍스트로 변환한다.
+
+    경로B의 _extract_table_text_for_ai()와 동일한 역할.
+    각 행을 "[재무제표유형] 계정명: 금액" 형식으로 변환하여
+    AI가 독립적으로 항목을 추출할 수 있게 한다.
 
     Args:
-        major_list: fetch_major_accounts() 반환값
+        raw_list: fetch_full_financial_statement() 반환값
+        max_chars: 최대 문자 수 (기본 8000)
 
     Returns:
-        항목명 → 금액 딕셔너리 (매핑된 항목만 포함)
+        AI에게 전달할 텍스트 문자열
     """
-    result: dict[str, Optional[float]] = {}
-    for row in major_list:
+    sections: dict[str, list[str]] = {}
+
+    for row in raw_list:
+        sj_div = (row.get("sj_div") or "").strip().upper()
+        label = _SJ_DIV_LABELS.get(sj_div, "")
+        if not label:
+            continue
+
         nm = (row.get("account_nm") or "").strip()
-        our_name = _MAJOR_ACCT_NAME_MAP.get(nm)
-        if our_name:
-            result[our_name] = _parse_amount(row)
-    return result
+        if not nm:
+            continue
+
+        amount = (row.get("thstrm_amount") or "").strip()
+        if not amount or amount in ("-", ""):
+            continue
+
+        sections.setdefault(label, []).append(f"{nm}: {amount}")
+
+    lines: list[str] = []
+    for sec in ("BS", "IS", "CF", "SCE"):
+        if sec in sections:
+            lines.append(f"[{sec}]")
+            lines.extend(sections[sec])
+
+    text = "\n".join(lines)
+    return text[:max_chars] if len(text) > max_chars else text
 
 
 # ── 경로A 메인 함수 ────────────────────────────────────────────────────────
@@ -292,12 +271,12 @@ def get_financial_data_path_a(
     reprt_code: str,
 ) -> dict:
     """
-    경로A 메인 함수: 전체 재무제표 + 주요계정을 조회하여 통합 결과를 반환한다.
+    경로A 메인 함수: 전체 재무제표를 조회하고 AI 독립 추출로 교차검증한다.
 
     1. CFS/OFS 각각 조회 가능한지 확인
     2. 둘 다 있으면 연결(CFS) 우선
     3. 연결이 없으면 별도(OFS) 사용
-    4. 주요계정 API는 선택된 fs_div와 실제 응답 fs_div가 일치할 때만 교차검증에 사용
+    4. AI 독립 추출 + Python 결과 비교 + 불일치 시 AI 판정
 
     Args:
         corp_code:   DART 기업 고유코드
@@ -306,14 +285,14 @@ def get_financial_data_path_a(
 
     Returns:
         {
-            "items":       {항목명: 금액(float|None), ...},   # 주 데이터
-            "cross_check": {항목명: 금액(float|None), ...},   # 교차검증용
-            "fs_div":      "CFS" | "OFS" | None,              # 실제 사용 구분
-            "error":       오류 메시지 문자열 (정상이면 None),
+            "items":          {항목명: 금액(float|None), ...},
+            "fs_div":         "CFS" | "OFS" | None,
+            "error":          오류 메시지 문자열 (정상이면 None),
+            "ai_comparison":  AI 비교 결과 딕셔너리 | None,
         }
     """
     bsns_year = str(year)
-    empty = {"items": {}, "cross_check": {}, "fs_div": None, "error": None}
+    empty = {"items": {}, "fs_div": None, "error": None, "ai_comparison": None}
 
     last_error = ""
     available_statements: dict[str, dict] = {}
@@ -346,19 +325,22 @@ def get_financial_data_path_a(
     selected = available_statements[selected_div]
     items = extract_target_items(selected["raw"])
 
-    # 3. 주요계정 (교차검증, 실제 fs_div가 선택 결과와 일치할 때만 사용)
-    cross_check: dict[str, Optional[float]] = {}
+    # 3. AI 독립 추출 + Python 결과 비교 (GEMINI_API_KEY가 있을 때만)
+    ai_comparison = None
     try:
-        major_raw = fetch_major_accounts(corp_code, bsns_year, reprt_code, selected_div)
-        major_div = _infer_fs_div(major_raw, selected_div)
-        if major_div == selected_div:
-            cross_check = extract_major_account_items(major_raw)
+        from config import GEMINI_API_KEY
+        if GEMINI_API_KEY:
+            table_text = format_raw_for_ai(selected["raw"])
+            if table_text.strip():
+                from gemini_parser import extract_with_ai_comparison
+                ai_comparison = extract_with_ai_comparison(table_text, items)
+                items = ai_comparison["items"]  # 최종 결과 사용
     except Exception:
-        pass  # 교차검증 실패는 주 데이터에 영향 없음
+        pass  # AI 실패 시 Python 결과 유지
 
     return {
-        "items":       items,
-        "cross_check": cross_check,
-        "fs_div":      selected_div,
-        "error":       None,
+        "items":          items,
+        "fs_div":         selected_div,
+        "error":          None,
+        "ai_comparison":  ai_comparison,
     }

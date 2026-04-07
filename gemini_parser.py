@@ -1,16 +1,12 @@
 """
 gemini_parser.py
-Gemini Flash를 이용한 재무 데이터 AI 추출·검증
+Gemini를 이용한 재무 데이터 AI 추출·검증
 
-역할:
-  경로B (감사보고서 XML 파싱):
-    1. ai_extract_items()           : 재무제표 원문에서 9개 항목 독립 추출 (AI 1회차)
-    2. ai_adjudicate()              : Python vs AI 불일치 시 원문 기반 판정 (AI 2회차)
-    3. extract_with_ai_comparison() : 위 두 함수를 조율하는 오케스트레이터
-
-  경로A (사업보고서 JSON API) — 기존 유지:
-    4. verify_financial_data()      : critical 실패 항목을 AI로 재검토
-    5. extract_from_raw_text()      : 파싱 실패 시 테이블 텍스트에서 AI로 재추출
+역할 (경로A·B 공통):
+  1. ai_extract_items()           : 재무제표 원문에서 항목 독립 추출 (AI 1회차)
+  2. ai_adjudicate()              : Python vs AI 불일치 시 원문 기반 판정 (AI 2회차)
+  3. extract_with_ai_comparison() : 위 두 함수를 조율하는 오케스트레이터
+  4. extract_from_raw_text()      : 파싱 실패 시 테이블 텍스트에서 AI로 재추출
 """
 
 import json
@@ -343,97 +339,6 @@ def extract_with_ai_comparison(
 
     base["ai_calls"] = 2
     return {**base, "items": final_items, "source": "adjudicated"}
-
-
-# ── 경로A: 기존 AI 검증 (유지) ─────────────────────────────────────────────
-
-def verify_financial_data(
-    items: dict[str, Optional[float]],
-    validation: dict,
-    corp_name: str,
-    year: int,
-) -> dict:
-    """
-    Gemini Flash로 재무 데이터 검증 결과를 AI 검토한다.
-
-    실패한 checks 정보와 관련 항목 수치만 전송하여 토큰을 최소화한다.
-    API 호출 실패 또는 키 미설정 시 graceful하게 처리한다.
-
-    Args:
-        items:      항목명 → 금액(원) 딕셔너리
-        validation: validate() 반환값
-        corp_name:  기업명 (컨텍스트용)
-        year:       사업연도
-
-    Returns:
-        {
-            "verdict":     "correct" | "error" | "uncertain" | "skipped",
-            "issues":      [문제점 설명, ...],
-            "corrections": {항목명: 수정값(float), ...},
-            "raw_response": str (원본 응답, 디버깅용, 오류 시 생략),
-        }
-    """
-    client = _get_client()
-    if client is None:
-        return {"verdict": "skipped", "issues": ["GEMINI_API_KEY 미설정"], "corrections": {}}
-
-    failed_checks = [c for c in validation.get("checks", []) if not c["passed"]]
-    if not failed_checks:
-        return {"verdict": "correct", "issues": [], "corrections": {}}
-
-    # 실패 규칙에 언급된 항목만 추출 (전체 전송 금지)
-    relevant: dict[str, float] = {}
-    for name, val in items.items():
-        if val is not None and any(name in c.get("rule", "") for c in failed_checks):
-            relevant[name] = val
-    if not relevant:
-        relevant = {k: v for k, v in items.items() if v is not None}
-
-    items_str  = ", ".join(f"{k}={v:,.0f}원" for k, v in relevant.items())
-    checks_str = "; ".join(
-        f"{c['rule']}(차이={c['diff']:,.0f}원)" if isinstance(c.get("diff"), (int, float))
-        else c["rule"]
-        for c in failed_checks
-    )
-
-    prompt = (
-        f"숙련된 재무분석가로서 {corp_name} {year}년 재무데이터를 검토해줘.\n"
-        f"데이터(원KRW): {items_str}\n"
-        f"검증실패: {checks_str}\n"
-        f"데이터가 맞는지 틀린지 판단하고 JSON으로만 응답해:\n"
-        f'{{"verdict":"correct"또는"error"또는"uncertain",'
-        f'"issues":["문제설명"],'
-        f'"corrections":{{"항목명":수정값}}}}'
-    )
-
-    try:
-        raw = _generate(client, prompt)
-    except RuntimeError as e:
-        return {"verdict": "skipped", "issues": [str(e)], "corrections": {}}
-
-    parsed = _parse_json(raw)
-    if parsed is None:
-        return {
-            "verdict":      "uncertain",
-            "issues":       ["AI 응답 JSON 파싱 실패"],
-            "corrections":  {},
-            "raw_response": raw,
-        }
-
-    # 숫자형 corrections 정규화
-    corrections: dict[str, float] = {}
-    for k, v in parsed.get("corrections", {}).items():
-        try:
-            corrections[k] = float(v)
-        except (TypeError, ValueError):
-            pass
-
-    return {
-        "verdict":      parsed.get("verdict", "uncertain"),
-        "issues":       parsed.get("issues", []),
-        "corrections":  corrections,
-        "raw_response": raw,
-    }
 
 
 def extract_from_raw_text(

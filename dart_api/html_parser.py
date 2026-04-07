@@ -456,7 +456,6 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     Returns:
         {
             "items":          {항목명: 금액(float|None), ...},
-            "cross_check":    {},   # 경로B는 교차검증 없음
             "fs_div":         "OFS",  # 감사보고서는 별도 기준
             "error":          None | 오류 메시지 문자열,
             "ai_comparison":  AI 비교 결과 딕셔너리 | None,
@@ -468,7 +467,7 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     xml_bytes = _download_dart_document(rcept_no)
     if xml_bytes is None:
         return {
-            "items": empty_items, "cross_check": {},
+            "items": empty_items,
             "fs_div": None, "error": f"document.xml 다운로드 실패 (rcept_no={rcept_no})",
             "ai_comparison": None,
         }
@@ -477,7 +476,7 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
     soup = _parse_dart_xml(xml_bytes)
     if soup is None:
         return {
-            "items": empty_items, "cross_check": {},
+            "items": empty_items,
             "fs_div": None, "error": "DART XML 파싱 실패",
             "ai_comparison": None,
         }
@@ -500,7 +499,6 @@ def get_financial_data_path_b(rcept_no: str) -> dict:
 
     return {
         "items":         items,
-        "cross_check":   {},
         "fs_div":        "OFS",
         "error":         None,
         "ai_comparison": ai_comparison,

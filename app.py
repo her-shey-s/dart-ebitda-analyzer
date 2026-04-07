@@ -19,7 +19,7 @@ from dart_api.financial_api import get_financial_data_path_a
 from dart_api.html_parser import get_financial_data_path_b
 from dart_api.report_finder import find_report
 from utils.cache import clear_all_cache, get_cache, make_cache_key, purge_expired, set_cache
-from validator.rules import needs_ai_validation, validate, validate_with_ai
+from validator.rules import validate
 
 # ── 페이지 설정 ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -39,8 +39,6 @@ _DISPLAY_ITEMS = [
     "매출액", "매출총이익", "영업이익", "당기순이익",
 ]
 
-# 주요계정 API(교차검증)에서 내려오는 핵심 항목
-_CROSS_CHECK_ITEMS = ["총자산", "총부채", "자본총계", "매출액", "영업이익", "당기순이익"]
 
 
 # ── 금액 포맷 ─────────────────────────────────────────────────────────────────
@@ -70,13 +68,9 @@ def _validation_status_label(result: dict, use_icon: bool = True) -> str:
 
     if val["is_valid"]:
         label = "통과"
-        if val and needs_ai_validation(val):
-            label += " / AI검토필요"
         return f"✓ {label}" if use_icon else label
 
     label = "검증실패"
-    if val and needs_ai_validation(val):
-        label += " / AI검토필요"
     return f"✗ {label}" if use_icon else label
 
 
@@ -153,45 +147,15 @@ def _validation_reason_lines(result: dict, include_ai: bool = True) -> list[str]
         for check in skipped_checks:
             lines.append(f"[스킵] {check.get('rule', '-')} - {check.get('note', '사유 없음')}")
 
-    if needs_ai_validation(val):
-        critical_fails = sum(
-            1 for c in val.get("checks", [])
-            if not c.get("passed") and c.get("severity") == "critical"
-        )
-        warning_fails = sum(
-            1 for c in val.get("checks", [])
-            if not c.get("passed") and c.get("severity") == "warning"
-        )
-        if critical_fails > 0:
-            lines.append("AI검토필요 사유: critical 실패가 있어 추가 확인 대상으로 분류되었습니다.")
-        elif warning_fails >= 2:
-            lines.append("AI검토필요 사유: warning 실패가 2건 이상이라 추가 확인 대상으로 분류되었습니다.")
-
-    if include_ai:
-        ai = val.get("ai_result")
-        if ai and ai.get("verdict"):
-            verdict_label = {
-                "correct": "AI판정 정상",
-                "error": "AI판정 오류",
-                "uncertain": "AI판정 불확실",
-                "skipped": "AI판정 생략",
-            }.get(ai.get("verdict"), f"AI판정 {ai.get('verdict')}")
-            ai_line = verdict_label
-            if ai.get("issues"):
-                ai_line += " - " + "; ".join(str(issue) for issue in ai["issues"] if issue)
-            if ai.get("corrections"):
-                corr_text = ", ".join(f"{k}={v:,.0f}원" for k, v in ai["corrections"].items())
-                ai_line += f" / 수정제안: {corr_text}"
-            lines.append(ai_line)
-
+    # AI 비교 결과 (경로A·경로B 공통)
     ai_comp = result.get("ai_comparison")
     if include_ai and ai_comp:
         source_label = {
-            "agreed": "경로B 비교: Python·AI 일치",
-            "adjudicated": "경로B 비교: AI 판정으로 불일치 해소",
-            "ai_extract_only": "경로B 비교: AI 추출값 채택",
-            "python_fallback": "경로B 비교: AI 실패로 Python 결과 사용",
-        }.get(ai_comp.get("source"), f"경로B 비교: {ai_comp.get('source', '비교 수행')}")
+            "agreed": "AI 비교: Python·AI 일치",
+            "adjudicated": "AI 비교: AI 판정으로 불일치 해소",
+            "ai_extract_only": "AI 비교: AI 추출값 채택",
+            "python_fallback": "AI 비교: AI 실패로 Python 결과 사용",
+        }.get(ai_comp.get("source"), f"AI 비교: {ai_comp.get('source', '비교 수행')}")
         if ai_comp.get("disagreements"):
             source_label += f" (불일치 항목: {', '.join(ai_comp['disagreements'].keys())})"
         if ai_comp.get("error"):
@@ -225,7 +189,6 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "report_type":   "-",
         "fs_div":        "-",
         "items":         {item["name"]: None for item in FINANCIAL_ITEMS},
-        "cross_check":   {},
         "validation":    None,
         "ai_comparison": None,
         "status":        "ok",
@@ -277,9 +240,8 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         return {**base, "status": "error", "error_msg": data["error"]}
 
     base["items"]  = data["items"]
-    base["cross_check"] = data.get("cross_check", {})
     base["fs_div"] = data.get("fs_div", "-")
-    base["ai_comparison"] = data.get("ai_comparison")  # 경로B AI 비교 결과
+    base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
     # 4-B. 주석 fallback: CF에서 감가상각비를 못 찾은 경우에만 주석 탐색
     if base["items"].get("감가상각비") is None or base["items"].get("무형자산상각비") is None:
@@ -293,22 +255,11 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         except Exception:
             pass  # 주석 fallback 실패는 무시
 
-    # 5. 검증
+    # 5. 검증 (회계 항등식)
     try:
-        validation = validate(data["items"], data.get("cross_check", {}), path=report["path"])
+        validation = validate(data["items"])
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
-
-    # 6. AI 검증 (경로A만 — 경로B는 이미 AI 비교 완료)
-    if (
-        report["path"] == "A"
-        and GEMINI_API_KEY
-        and needs_ai_validation(validation)
-    ):
-        try:
-            validation = validate_with_ai(validation, data["items"], corp_name, year)
-        except Exception:
-            pass  # AI 검증 실패는 기존 결과 유지
 
     base["validation"] = validation
 
@@ -477,17 +428,11 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
             ws.cell(row=2, column=1, value="(단위: 억원)").font = Font(
                 italic=True, color="999999", size=9)
 
-        # ── 원본 시트 (원 단위 — 기존과 동일) ───────────────────────────
+        # ── 원본 시트 (원 단위) ───────────────────────────────────────
         raw_rows = []
         for r in results:
             items = r.get("items", {})
-            cross_check = r.get("cross_check", {})
-            cross_mismatches = []
-            for name in _CROSS_CHECK_ITEMS:
-                base_val = items.get(name)
-                check_val = cross_check.get(name)
-                if base_val is not None and check_val is not None and base_val != check_val:
-                    cross_mismatches.append(name)
+            ai_comp = r.get("ai_comparison")
 
             row = {
                 "기업명":       r["corp_name"],
@@ -500,19 +445,11 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                 "처리상세":     _processing_status_detail(r),
                 "검증":         _validation_status_label(r, use_icon=False),
                 "검증상세":     _format_validation_detail(r),
-                "교차검증불일치항목": ", ".join(cross_mismatches) if cross_mismatches else "",
+                "AI비교결과":   (ai_comp or {}).get("source", ""),
+                "AI불일치항목": ", ".join((ai_comp or {}).get("disagreements", {}).keys()),
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
-            for name in _CROSS_CHECK_ITEMS:
-                row[f"교차_{name}"] = cross_check.get(name)
-                base_val = items.get(name)
-                check_val = cross_check.get(name)
-                row[f"차이_{name}"] = (
-                    abs(base_val - check_val)
-                    if isinstance(base_val, (int, float)) and isinstance(check_val, (int, float))
-                    else None
-                )
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
@@ -585,22 +522,7 @@ def _render_validation_detail(result: dict) -> None:
     else:
         st.success("이상 없음")
 
-    # AI 검증 결과 (경로A)
-    ai = val.get("ai_result")
-    if ai and ai.get("verdict") != "skipped":
-        st.markdown("**AI 검증 결과 (Gemini Flash):**")
-        verdict = ai.get("verdict", "uncertain")
-        verdict_display = {"correct": "✅ 정상", "error": "❌ 오류", "uncertain": "⚠️ 불확실"}.get(verdict, verdict)
-        st.info(f"판정: {verdict_display}")
-        if ai.get("issues"):
-            for issue in ai["issues"]:
-                st.warning(issue)
-        if ai.get("corrections"):
-            st.markdown("**AI 수정 제안:**")
-            corr_rows = [{"항목": k, "수정값(원)": f"{v:,.0f}"} for k, v in ai["corrections"].items()]
-            st.dataframe(pd.DataFrame(corr_rows), hide_index=True, use_container_width=True)
-
-    # AI 비교 결과 (경로B)
+    # AI 비교 결과 (경로A·B 공통)
     ai_comp = result.get("ai_comparison")
     if ai_comp:
         source = ai_comp.get("source", "unknown")
