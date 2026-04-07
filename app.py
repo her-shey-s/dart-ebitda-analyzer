@@ -258,32 +258,26 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
     # 4-B. 전용 감가상각 추출기 적용
-    # 경로A(사업보고서)는 fs_div 기준으로 주석 범위를 엄격히 구분하고,
-    # 경로B(감사보고서/연결감사보고서)는 선택된 보고서 문서 전체를 사용한다.
-    should_refresh_depr = (
-        report["path"] == "B" or
-        base["items"].get("감가상각비") is None or
-        base["items"].get("무형자산상각비") is None
-    )
-    if should_refresh_depr:
-        try:
-            from dart_api.notes_parser import extract_depreciation
-            depr_result = extract_depreciation(
-                report["rcept_no"],
-                fs_div=base.get("fs_div", "CFS"),
-                strict_scope=(report["path"] == "A"),
-            )
-            base["depreciation_trace"] = depr_result.get("trace", [])
-            depr_items = depr_result.get("items", {})
-            for key in ("감가상각비", "무형자산상각비"):
-                if depr_items.get(key) is not None:
-                    base["items"][key] = depr_items[key]
-            # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
-            if depr_result.get("combined"):
-                base["items"]["무형자산상각비"] = None
-                base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
-        except Exception:
-            pass  # 주석 fallback 실패는 무시
+    # 감가상각비·무형자산상각비는 본문 AI 비교보다 이 전용 추출기가 최종 기준이 되도록
+    # 항상 마지막에 실행한다. 그래야 합산/분리 규칙을 일관되게 적용할 수 있다.
+    try:
+        from dart_api.notes_parser import extract_depreciation
+        depr_result = extract_depreciation(
+            report["rcept_no"],
+            fs_div=base.get("fs_div", "CFS"),
+            strict_scope=(report["path"] == "A"),
+        )
+        base["depreciation_trace"] = depr_result.get("trace", [])
+        depr_items = depr_result.get("items", {})
+        for key in ("감가상각비", "무형자산상각비"):
+            if depr_items.get(key) is not None:
+                base["items"][key] = depr_items[key]
+        # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
+        if depr_result.get("combined"):
+            base["items"]["무형자산상각비"] = None
+            base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
+    except Exception:
+        pass  # 주석 fallback 실패는 무시
 
     # 5. 검증 (회계 항등식)
     try:
