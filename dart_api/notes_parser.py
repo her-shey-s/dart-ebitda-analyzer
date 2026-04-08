@@ -711,6 +711,17 @@ def _infer_ai_combined(meta: dict[str, str] | None) -> bool:
     return False
 
 
+def _has_separate_notes_pair(result: dict[str, Optional[float]] | None) -> bool:
+    """주석 추출 결과가 감가/무형 분리 기재 쌍인지 판별한다."""
+    if not isinstance(result, dict):
+        return False
+    return (
+        not result.get("combined")
+        and result.get("감가상각비") is not None
+        and result.get("무형자산상각비") is not None
+    )
+
+
 def _format_ai_source_log(item_name: str, meta: dict[str, str]) -> str:
     """AI가 고른 출처를 한 줄 로그로 포맷한다."""
     if not meta:
@@ -1168,8 +1179,17 @@ def extract_depreciation(
         trace.append("[NOTES] 후보 테이블이 없어 AI 추출 생략")
 
     # 주석 교차검증
+    ai_combined = bool(notes_ai.get("combined")) if isinstance(notes_ai, dict) else False
+    python_has_separate_pair = _has_separate_notes_pair(notes_python)
+
     if notes_ai:
         notes_final = _cross_validate(notes_python, notes_ai)
+        if python_has_separate_pair and ai_combined:
+            notes_final = {
+                "감가상각비": notes_python.get("감가상각비"),
+                "무형자산상각비": notes_python.get("무형자산상각비"),
+            }
+            trace.append("[NOTES] Python 분리 기재 우선: AI가 합산 공시를 선택했지만 주석에 분리 기재 쌍이 있어 Python 결과를 유지")
         trace.append(
             f"[NOTES] 교차검증 결과: 감가상각비={notes_final.get('감가상각비')}, "
             f"무형자산상각비={notes_final.get('무형자산상각비')}"
@@ -1178,11 +1198,9 @@ def extract_depreciation(
     else:
         notes_final = notes_python
 
-    ai_combined = bool(notes_ai.get("combined")) if isinstance(notes_ai, dict) else False
-
     # 합산 표기에서 감가상각비를 사용한 경우, AI가 무형자산상각비만 따로 채워도
     # 혼합 기재하지 않도록 무형자산상각비를 비운다.
-    if notes_python.get("combined") or ai_combined:
+    if (notes_python.get("combined") or ai_combined) and not python_has_separate_pair:
         notes_final["무형자산상각비"] = None
         if notes_python.get("combined") and ai_combined:
             trace.append("[NOTES] Python/AI 모두 combined=True 이므로 무형자산상각비를 None으로 고정")
@@ -1197,6 +1215,9 @@ def extract_depreciation(
         final[key] = cf_result.get(key) or notes_final.get(key)
 
     notes_combined = notes_python.get("combined", False) if isinstance(notes_python, dict) else False
+    if python_has_separate_pair:
+        notes_combined = False
+        ai_combined = False
     is_combined = cf_combined or notes_combined or ai_combined
 
     source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
