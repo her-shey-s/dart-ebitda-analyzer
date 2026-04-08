@@ -697,6 +697,20 @@ def _normalize_ai_source_meta(value) -> dict[str, str]:
     return normalized
 
 
+def _infer_ai_combined(meta: dict[str, str] | None) -> bool:
+    """AI 출처 메타데이터만으로 합산 공시 여부를 추론한다."""
+    if not isinstance(meta, dict):
+        return False
+
+    for key in ("row_label", "reason"):
+        text = str(meta.get(key, "")).replace(" ", "")
+        if "감가상각비" in text and "무형자산상각비" in text:
+            return True
+        if "합산공시" in text:
+            return True
+    return False
+
+
 def _format_ai_source_log(item_name: str, meta: dict[str, str]) -> str:
     """AI가 고른 출처를 한 줄 로그로 포맷한다."""
     if not meta:
@@ -757,7 +771,7 @@ def _build_ai_prompt(tables_text: str, guide_text: str) -> str:
         "- reason에는 왜 그 행이 전체 비용 기준이라고 판단했는지 짧게 적어라.\n"
         "- 찾을 수 없으면 null로 표시해라.\n\n"
         "JSON으로만 응답해라:\n"
-        '{"감가상각비": 숫자또는null, "무형자산상각비": 숫자또는null, '
+        '{"감가상각비": 숫자또는null, "무형자산상각비": 숫자또는null, "combined": true또는false, '
         '"sources": {"감가상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}, '
         '"무형자산상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}}}\n\n'
         f"주석 테이블:\n---\n{tables_text}\n---"
@@ -772,7 +786,7 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
         tables: _collect_depreciation_tables() 반환값
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "sources": {...}}
+        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool, "sources": {...}}
 
     Raises:
         RuntimeError: Gemini API 호출 또는 응답 파싱 실패
@@ -810,6 +824,15 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
             "감가상각비": _normalize_ai_source_meta(sources.get("감가상각비")),
             "무형자산상각비": _normalize_ai_source_meta(sources.get("무형자산상각비")),
         }
+
+    combined = parsed.get("combined")
+    if isinstance(combined, bool):
+        result["combined"] = combined
+    else:
+        result["combined"] = _infer_ai_combined((result.get("sources") or {}).get("감가상각비"))
+
+    if result.get("combined"):
+        result["무형자산상각비"] = None
 
     return result
 
@@ -1136,7 +1159,7 @@ def extract_depreciation(
             base["ai_result"] = notes_ai
             trace.append(
                 f"[NOTES] AI 추출 결과: 감가상각비={notes_ai.get('감가상각비')}, "
-                f"무형자산상각비={notes_ai.get('무형자산상각비')}"
+                f"무형자산상각비={notes_ai.get('무형자산상각비')}, combined={notes_ai.get('combined')}"
             )
         except Exception as e:
             base["error"] = f"AI 추출 실패: {e}"
@@ -1155,11 +1178,18 @@ def extract_depreciation(
     else:
         notes_final = notes_python
 
+    ai_combined = bool(notes_ai.get("combined")) if isinstance(notes_ai, dict) else False
+
     # 합산 표기에서 감가상각비를 사용한 경우, AI가 무형자산상각비만 따로 채워도
     # 혼합 기재하지 않도록 무형자산상각비를 비운다.
-    if notes_python.get("combined"):
+    if notes_python.get("combined") or ai_combined:
         notes_final["무형자산상각비"] = None
-        trace.append("[NOTES] combined=True 이므로 무형자산상각비를 None으로 고정")
+        if notes_python.get("combined") and ai_combined:
+            trace.append("[NOTES] Python/AI 모두 combined=True 이므로 무형자산상각비를 None으로 고정")
+        elif ai_combined:
+            trace.append("[NOTES] AI combined=True 이므로 무형자산상각비를 None으로 고정")
+        else:
+            trace.append("[NOTES] Python combined=True 이므로 무형자산상각비를 None으로 고정")
 
     # CF 결과와 주석 결과 병합 (CF 우선)
     final: dict[str, Optional[float]] = {}
@@ -1167,7 +1197,7 @@ def extract_depreciation(
         final[key] = cf_result.get(key) or notes_final.get(key)
 
     notes_combined = notes_python.get("combined", False) if isinstance(notes_python, dict) else False
-    is_combined = cf_combined or notes_combined
+    is_combined = cf_combined or notes_combined or ai_combined
 
     source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
              "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
