@@ -16,6 +16,8 @@ dart_api/notes_parser.py
   3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback (Python + AI 교차검증)
 """
 
+from functools import lru_cache
+from pathlib import Path
 import re
 from typing import Optional
 
@@ -630,6 +632,30 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
 
 # ── AI 추출 ───────────────────────────────────────────────────────────────────
 
+_DEPRECIATION_AI_GUIDE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "depreciation_ai_guide.md"
+
+
+@lru_cache(maxsize=1)
+def _load_depreciation_ai_guide() -> str:
+    """감가상각 AI 추출 규칙 문서를 로드한다."""
+    try:
+        text = _DEPRECIATION_AI_GUIDE_PATH.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+    return (
+        "# 감가상각 추출 규칙\n"
+        "- 회사 전체 기준 값을 우선한다.\n"
+        "- 비용의 성격별 분류 또는 현금흐름표 조정항목을 우선한다.\n"
+        "- 판매비와관리비, 기능별 배분, 특정 자산 감가상각, 누계액은 제외한다.\n"
+        "- '감가상각비 및 무형자산상각비' 합산 표기는 감가상각비에만 기록하고 무형자산상각비는 null로 둔다.\n"
+    )
+
+
 def _format_tables_for_ai(tables: list[dict]) -> str:
     """AI가 근거를 인용할 수 있도록 테이블/행 번호를 포함한 텍스트를 만든다."""
     chunks: list[str] = []
@@ -711,9 +737,12 @@ def _log_selected_ai_sources(
             trace.append(_format_ai_source_log(key, meta))
 
 
-def _build_ai_prompt(tables_text: str) -> str:
+def _build_ai_prompt(tables_text: str, guide_text: str) -> str:
     """감가상각비 추출용 AI 프롬프트를 생성한다."""
     return (
+        "다음은 이 프로젝트에서 반드시 따라야 하는 감가상각/무형자산상각비 추출 규칙 문서다.\n"
+        "규칙 문서를 먼저 읽고, 그 기준에 맞게만 판단해라.\n\n"
+        f"{guide_text}\n\n"
         "아래는 한국 기업 감사보고서의 주석(Notes)에서 감가상각 관련 테이블을 발췌한 것이다.\n"
         "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비를 추출해라.\n\n"
         "## 주의사항\n"
@@ -760,7 +789,8 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
     if len(combined) > 8000:
         combined = combined[:8000]
 
-    prompt = _build_ai_prompt(combined)
+    guide_text = _load_depreciation_ai_guide()
+    prompt = _build_ai_prompt(combined, guide_text)
     raw = _generate(client, prompt)
     parsed = _parse_json(raw)
     if parsed is None:
