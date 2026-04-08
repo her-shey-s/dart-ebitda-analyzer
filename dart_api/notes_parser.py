@@ -630,6 +630,87 @@ def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float
 
 # ── AI 추출 ───────────────────────────────────────────────────────────────────
 
+def _format_tables_for_ai(tables: list[dict]) -> str:
+    """AI가 근거를 인용할 수 있도록 테이블/행 번호를 포함한 텍스트를 만든다."""
+    chunks: list[str] = []
+
+    for idx, tbl in enumerate(tables, start=1):
+        table_id = f"T{idx}"
+        title = tbl.get("title") or "-"
+        unit = tbl.get("unit", 1)
+        unit_label = {1: "원", 1000: "천원", 1_000_000: "백만원", 100_000_000: "억원"}.get(unit, f"{unit}원")
+
+        lines = [
+            f"[TABLE {table_id}]",
+            f"[SECTION] {title}",
+            f"[UNIT] {unit_label}",
+        ]
+
+        for row_idx, row in enumerate(tbl.get("rows", []), start=1):
+            row_text = " | ".join(row)
+            lines.append(f"[ROW R{row_idx}] {row_text}")
+
+        chunks.append("\n".join(lines))
+
+    return "\n\n".join(chunks)
+
+
+def _normalize_ai_source_meta(value) -> dict[str, str]:
+    """AI 응답의 source 메타데이터를 로그용 dict로 정규화한다."""
+    if not isinstance(value, dict):
+        return {}
+
+    normalized: dict[str, str] = {}
+    for key in ("table_id", "section", "row_id", "row_label", "reason"):
+        raw = value.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if text:
+            normalized[key] = text
+    return normalized
+
+
+def _format_ai_source_log(item_name: str, meta: dict[str, str]) -> str:
+    """AI가 고른 출처를 한 줄 로그로 포맷한다."""
+    if not meta:
+        return f"[NOTES] AI 출처({item_name}): 미기재"
+
+    parts = []
+    if meta.get("table_id"):
+        parts.append(f"table={meta['table_id']}")
+    if meta.get("section"):
+        parts.append(f"section={meta['section']}")
+    if meta.get("row_id"):
+        parts.append(f"row={meta['row_id']}")
+    if meta.get("row_label"):
+        parts.append(f"label={meta['row_label']}")
+    if meta.get("reason"):
+        parts.append(f"reason={meta['reason']}")
+
+    return f"[NOTES] AI 출처({item_name}): " + ", ".join(parts)
+
+
+def _log_selected_ai_sources(
+    trace: list[str],
+    ai_result: dict[str, Optional[float]],
+    final_result: dict[str, Optional[float]],
+) -> None:
+    """최종 채택된 항목에 대해 AI가 제시한 출처를 로그에 남긴다."""
+    sources = ai_result.get("sources") if isinstance(ai_result, dict) else None
+    if not isinstance(sources, dict):
+        return
+
+    for key in ("감가상각비", "무형자산상각비"):
+        ai_val = ai_result.get(key)
+        final_val = final_result.get(key)
+        if ai_val is None or final_val is None or ai_val != final_val:
+            continue
+        meta = sources.get(key)
+        if isinstance(meta, dict):
+            trace.append(_format_ai_source_log(key, meta))
+
+
 def _build_ai_prompt(tables_text: str) -> str:
     """감가상각비 추출용 AI 프롬프트를 생성한다."""
     return (
@@ -643,9 +724,13 @@ def _build_ai_prompt(tables_text: str) -> str:
         "- 이연법인세 관련 감가상각비는 완전히 다른 맥락이므로 선택하지 마라.\n"
         "- '감가상각비 및 무형자산상각비'로 합산 표기된 경우: 감가상각비에 해당 값, 무형자산상각비는 null.\n"
         "- 각 테이블 앞에 표시된 '(단위: XXX)'를 반드시 확인하고, 최종 답은 **원(KRW) 단위**로 변환해라.\n"
+        "- 답을 고를 때 반드시 [TABLE Tn], [ROW Rn] 표기를 그대로 인용해 출처를 남겨라.\n"
+        "- reason에는 왜 그 행이 전체 비용 기준이라고 판단했는지 짧게 적어라.\n"
         "- 찾을 수 없으면 null로 표시해라.\n\n"
         "JSON으로만 응답해라:\n"
-        '{"감가상각비": 숫자또는null, "무형자산상각비": 숫자또는null}\n\n'
+        '{"감가상각비": 숫자또는null, "무형자산상각비": 숫자또는null, '
+        '"sources": {"감가상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}, '
+        '"무형자산상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}}}\n\n'
         f"주석 테이블:\n---\n{tables_text}\n---"
     )
 
@@ -658,7 +743,7 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
         tables: _collect_depreciation_tables() 반환값
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None}
+        {"감가상각비": float|None, "무형자산상각비": float|None, "sources": {...}}
 
     Raises:
         RuntimeError: Gemini API 호출 또는 응답 파싱 실패
@@ -671,7 +756,7 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
         raise RuntimeError("GEMINI_API_KEY 미설정")
 
     # 테이블 텍스트 병합 (토큰 절약: 8000자 제한)
-    combined = "\n\n".join(tbl["text"] for tbl in tables)
+    combined = _format_tables_for_ai(tables)
     if len(combined) > 8000:
         combined = combined[:8000]
 
@@ -688,6 +773,13 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
             result[key] = float(val) if val is not None else None
         except (TypeError, ValueError):
             result[key] = None
+
+    sources = parsed.get("sources")
+    if isinstance(sources, dict):
+        result["sources"] = {
+            "감가상각비": _normalize_ai_source_meta(sources.get("감가상각비")),
+            "무형자산상각비": _normalize_ai_source_meta(sources.get("무형자산상각비")),
+        }
 
     return result
 
@@ -1029,6 +1121,7 @@ def extract_depreciation(
             f"[NOTES] 교차검증 결과: 감가상각비={notes_final.get('감가상각비')}, "
             f"무형자산상각비={notes_final.get('무형자산상각비')}"
         )
+        _log_selected_ai_sources(trace, notes_ai, notes_final)
     else:
         notes_final = notes_python
 
