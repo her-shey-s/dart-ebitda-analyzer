@@ -18,6 +18,7 @@ from dart_api.corp_search import get_corp_code, search_corp
 from dart_api.financial_api import get_financial_data_path_a
 from dart_api.html_parser import get_financial_data_path_b
 from dart_api.report_finder import find_report
+from utils.analysis_logger import AnalysisLogger, format_amount
 from utils.cache import clear_all_cache, get_cache, make_cache_key, purge_expired, set_cache
 from validator.rules import validate
 
@@ -31,6 +32,8 @@ st.set_page_config(
 # ── 세션 상태 초기화 ──────────────────────────────────────────────────────────
 if "results" not in st.session_state:
     st.session_state.results: list[dict] = []
+if "analysis_logs" not in st.session_state:
+    st.session_state.analysis_logs: list[str] = []
 
 # ── 표시 컬럼 정의 ────────────────────────────────────────────────────────────
 # 요약 테이블에 표시할 재무 항목 (순서 유지)
@@ -182,8 +185,11 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
     반환 키:
         corp_name, year, corp_code, path, report_nm, report_type, fs_div,
-        items, validation, status, error_msg
+        items, validation, status, error_msg, analysis_log
     """
+    logger = AnalysisLogger(corp_name, year)
+    log = logger.log
+
     base: dict = {
         "corp_name":     corp_name,
         "year":          year,
@@ -200,7 +206,14 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "error_msg":     "",
     }
 
+    def _finish(result: dict) -> dict:
+        """공통 종료 처리: 로그를 result에 추가하고 반환."""
+        log("DONE", f"=== {corp_name} {year} 종료 ({logger.elapsed():.3f}초) status={result.get('status')} ===")
+        result["analysis_log"] = logger.get_lines()
+        return result
+
     # 1. corp_code 조회 (동일 기업명 다수 시 추출 중단)
+    log("CORP", "기업코드 조회 시작")
     all_corps = search_corp(corp_name)
     exact_corps = all_corps[all_corps["corp_name"] == corp_name]
 
@@ -209,57 +222,78 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         if not all_corps.empty:
             names = all_corps["corp_name"].head(3).tolist()
             hint = f" (유사: {', '.join(names)})"
-        return {**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"}
+        log("CORP", f"기업 미발견{hint}")
+        return _finish({**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"})
 
     if len(exact_corps) > 1:
-        return {
+        log("CORP", f"동일 기업명 {len(exact_corps)}개 존재")
+        return _finish({
             **base,
             "status": "ambiguous_corp",
             "error_msg": f"동일 기업명 {len(exact_corps)}개 존재 — 재무데이터를 특정할 수 없습니다.",
-        }
+        })
 
     corp_code = exact_corps.iloc[0]["corp_code"]
     base["corp_code"] = corp_code
+    log("CORP", f"기업코드 발견: {corp_code}")
 
     # 2. 캐시 확인
     cache_key = make_cache_key(corp_code, str(year))
     if use_cache:
+        log("CACHE", "캐시 확인 중...")
         cached = get_cache(cache_key)
         if cached:
-            return {**cached, "from_cache": True}
+            log("CACHE", "캐시 히트 → 캐시 결과 반환")
+            return _finish({**cached, "from_cache": True})
+        log("CACHE", "캐시 미스")
+    else:
+        log("CACHE", "캐시 사용 안 함")
 
     # 3. 보고서 탐색
+    log("REPORT", f"보고서 탐색 시작 (corp_code={corp_code}, year={year})")
     try:
-        report = find_report(corp_code, year)
+        report = find_report(corp_code, year, log_fn=log)
     except Exception as e:
-        return {**base, "status": "error", "error_msg": f"보고서 탐색 오류: {e}"}
+        log("ERROR", f"보고서 탐색 오류: {e}")
+        return _finish({**base, "status": "error", "error_msg": f"보고서 탐색 오류: {e}"})
 
     if report is None:
-        return {**base, "status": "no_report", "error_msg": "보고서 없음"}
+        log("REPORT", "보고서 없음")
+        return _finish({**base, "status": "no_report", "error_msg": "보고서 없음"})
 
     base["path"]        = report["path"]
     base["report_nm"]   = report["report_nm"]
     base["report_type"] = report.get("report_type", "-")
+    log("REPORT", f"보고서 확정: {report['report_nm']} (path={report['path']}, rcept_no={report['rcept_no']})")
 
     # 4. 재무 데이터 추출
     try:
         if report["path"] == "A":
-            data = get_financial_data_path_a(corp_code, year, report["reprt_code"])
+            log("DATA_A", f"경로A 재무데이터 추출 시작 (reprt_code={report['reprt_code']})")
+            data = get_financial_data_path_a(corp_code, year, report["reprt_code"], log_fn=log)
         else:
-            data = get_financial_data_path_b(report["rcept_no"], report_type=report.get("report_type"))
+            log("DATA_B", f"경로B 재무데이터 추출 시작 (rcept_no={report['rcept_no']})")
+            data = get_financial_data_path_b(report["rcept_no"], report_type=report.get("report_type"), log_fn=log)
     except Exception as e:
-        return {**base, "status": "error", "error_msg": f"재무데이터 추출 오류: {e}"}
+        log("ERROR", f"재무데이터 추출 오류: {e}")
+        return _finish({**base, "status": "error", "error_msg": f"재무데이터 추출 오류: {e}"})
 
     if data.get("error"):
-        return {**base, "status": "error", "error_msg": data["error"]}
+        log("ERROR", f"재무데이터 추출 에러: {data['error']}")
+        return _finish({**base, "status": "error", "error_msg": data["error"]})
 
     base["items"]  = data["items"]
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
+    matched = sum(1 for v in base["items"].values() if v is not None)
+    path_label = "A" if report["path"] == "A" else "B"
+    log(f"DATA_{path_label}", f"재무데이터 추출 완료: fs_div={base['fs_div']}, {matched}개 항목 매칭")
+
     # 4-B. 전용 감가상각 추출기 적용
     # 감가상각비·무형자산상각비는 본문 AI 비교보다 이 전용 추출기가 최종 기준이 되도록
     # 항상 마지막에 실행한다. 그래야 합산/분리 규칙을 일관되게 적용할 수 있다.
+    log("DEPR", "감가상각 추출 시작")
     try:
         from dart_api.notes_parser import extract_depreciation
         depr_result = extract_depreciation(
@@ -276,22 +310,34 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         if depr_result.get("combined"):
             base["items"]["무형자산상각비"] = None
             base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
-    except Exception:
-        pass  # 주석 fallback 실패는 무시
+        log("DEPR", (
+            f"감가상각 추출 완료: source={depr_result.get('source')}, "
+            f"감가상각비={format_amount(depr_items.get('감가상각비'))}, "
+            f"무형자산상각비={format_amount(depr_items.get('무형자산상각비'))}, "
+            f"combined={depr_result.get('combined')}"
+        ))
+    except Exception as e:
+        log("DEPR", f"감가상각 추출 실패: {e}")
 
     # 5. 검증 (회계 항등식)
+    log("VALIDATE", "검증 시작")
     try:
         validation = validate(base["items"])
     except Exception as e:
         validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
 
     base["validation"] = validation
+    if validation.get("is_valid") is not None:
+        log("VALIDATE", f"검증 완료: is_valid={validation['is_valid']}")
+    else:
+        log("VALIDATE", f"검증 완료: 검증정보 없음")
 
     # 7. 캐시 저장
     if use_cache:
         set_cache(cache_key, base, ttl_hours=48)
+        log("CACHE", "캐시 저장 완료")
 
-    return base
+    return _finish(base)
 
 
 # ── 결과 → DataFrame ──────────────────────────────────────────────────────────
@@ -628,6 +674,7 @@ with st.sidebar:
     if st.button("캐시 초기화", use_container_width=True):
         clear_all_cache()
         st.session_state.results = []
+        st.session_state.analysis_logs = []
         st.success("캐시 초기화 완료")
 
 
@@ -651,15 +698,19 @@ if analyze_btn:
         status_text  = st.empty()
 
         results: list[dict] = []
+        all_logs: list[str] = []
         for i, (corp_name, year) in enumerate(tasks):
             status_text.markdown(f"**처리 중** ({i + 1}/{total}): `{corp_name}` {year}년")
             result = _analyze_one(corp_name, year, use_cache)
+            all_logs.extend(result.get("analysis_log", []))
+            all_logs.append("")  # 기업/연도 사이 빈 줄 구분
             results.append(result)
             progress_bar.progress((i + 1) / total, text=f"{i + 1}/{total} 완료")
 
         progress_bar.empty()
         status_text.empty()
         st.session_state.results = results
+        st.session_state.analysis_logs = all_logs
         st.success(f"✓ {total}건 분석 완료 (성공: {sum(1 for r in results if r['status'] == 'ok')}건)")
 
 # ── 결과 표시 ─────────────────────────────────────────────────────────────────
@@ -705,14 +756,28 @@ if st.session_state.results:
 
     # ── 다운로드 ──────────────────────────────────────────────────────────────
     st.divider()
-    xlsx = _to_excel_bytes(results)
-    st.download_button(
-        label="📥 엑셀 다운로드 (요약 + 원본)",
-        data=xlsx,
-        file_name="dart_재무데이터.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
+    col_dl1, col_dl2 = st.columns(2)
+    with col_dl1:
+        xlsx = _to_excel_bytes(results)
+        st.download_button(
+            label="📥 엑셀 다운로드 (요약 + 원본)",
+            data=xlsx,
+            file_name="dart_재무데이터.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with col_dl2:
+        if st.session_state.get("analysis_logs"):
+            from datetime import datetime
+            log_text = "\n".join(st.session_state.analysis_logs)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            st.download_button(
+                label="📋 분석 로그 다운로드 (.txt)",
+                data=log_text,
+                file_name=f"{ts}_dart_분석로그.txt",
+                mime="text/plain",
+                use_container_width=True,
+            )
 
 else:
     st.info("사이드바에서 기업명과 연도를 입력하고 '분석 시작'을 눌러주세요.")

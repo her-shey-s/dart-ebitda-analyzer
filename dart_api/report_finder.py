@@ -46,7 +46,11 @@ _SEARCH_ORDER = [
 ]
 
 
-def find_report(corp_code: str, year: int) -> Optional[dict]:
+def find_report(
+    corp_code: str,
+    year: int,
+    log_fn=None,
+) -> Optional[dict]:
     """
     특정 기업·사업연도의 보고서를 탐색하여 데이터 수집 경로를 결정한다.
 
@@ -60,6 +64,7 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
     Args:
         corp_code: DART 기업 고유코드 (8자리)
         year:      사업연도 (예: 2023)
+        log_fn:    로그 콜백 (tag, message) → None (선택)
 
     Returns:
         보고서가 발견되면:
@@ -76,26 +81,39 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
     Raises:
         requests.HTTPError: API 호출 자체가 실패한 경우
     """
+    _log = log_fn or (lambda tag, msg: None)
+
     bgn_de = f"{year}0101"
     # 일부 감사보고서는 사업연도 종료 후 2년 이상 뒤에 제출되는 경우가 있음
     # (예: 광천김 2023 연결감사보고서 → 2025.04.18 제출)
     # _extract_year_from_report_nm()이 사업연도를 검증하므로 넓게 잡아도 안전
     end_de = f"{year + 2}0630"
 
+    _TYPE_LABELS = {"annual": "사업보고서", "audit_consol": "연결감사보고서", "audit_separate": "감사보고서"}
+
     for spec in _SEARCH_ORDER:
+        label = _TYPE_LABELS.get(spec["report_type"], spec["report_type"])
+        _log("REPORT", f"  {label}({spec['pblntf_detail_ty']}) 조회 중...")
+
+        import time as _time
+        t0 = _time.perf_counter()
         items = _fetch_disclosures(
             corp_code=corp_code,
             bgn_de=bgn_de,
             end_de=end_de,
             pblntf_detail_ty=spec["pblntf_detail_ty"],
         )
+        elapsed = _time.perf_counter() - t0
+        _log("REPORT", f"  {label} API 응답: {len(items)}건 ({elapsed:.2f}초)")
 
         # 접수일 내림차순으로 순회하며 요청 연도와 일치하는 보고서 선택
         for item in items:
             report_year = _extract_year_from_report_nm(item["report_nm"])
             if report_year is not None and report_year != year:
+                _log("REPORT", f"  스킵: {item['report_nm']} (연도 불일치: {report_year})")
                 continue
 
+            _log("REPORT", f"  선택: {item['report_nm']} (rcept_no={item['rcept_no']}, path={spec['path']})")
             return {
                 "path":        spec["path"],
                 "rcept_no":    item["rcept_no"],
@@ -105,6 +123,7 @@ def find_report(corp_code: str, year: int) -> Optional[dict]:
                 "reprt_code":  spec["reprt_code"],
             }
 
+    _log("REPORT", "  보고서를 찾지 못함")
     return None
 
 

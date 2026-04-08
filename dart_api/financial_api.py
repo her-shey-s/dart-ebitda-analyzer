@@ -270,6 +270,7 @@ def get_financial_data_path_a(
     corp_code: str,
     year: int,
     reprt_code: str,
+    log_fn=None,
 ) -> dict:
     """
     경로A 메인 함수: 전체 재무제표를 조회하고 AI 독립 추출로 교차검증한다.
@@ -292,6 +293,9 @@ def get_financial_data_path_a(
             "ai_comparison":  AI 비교 결과 딕셔너리 | None,
         }
     """
+    import time as _time
+    _log = log_fn or (lambda tag, msg: None)
+
     bsns_year = str(year)
     empty = {"items": {}, "fs_div": None, "error": None, "ai_comparison": None}
 
@@ -300,13 +304,18 @@ def get_financial_data_path_a(
 
     # 1. 어떤 재무제표 구분이 실제로 존재하는지 확인
     for requested_div in (FS_DIV["consolidated"], FS_DIV["separate"]):
+        _log("DATA_A", f"  {requested_div} 재무제표 API 호출 중...")
+        t0 = _time.perf_counter()
         try:
             raw = fetch_full_financial_statement(corp_code, bsns_year, reprt_code, requested_div)
         except (ValueError, requests.RequestException) as e:
+            elapsed = _time.perf_counter() - t0
             last_error = str(e)
+            _log("DATA_A", f"  {requested_div} 실패 ({elapsed:.2f}초): {e}")
             continue
-
+        elapsed = _time.perf_counter() - t0
         actual_div = _infer_fs_div(raw, requested_div)
+        _log("DATA_A", f"  {requested_div} 성공 ({elapsed:.2f}초): {len(raw)}행, actual_div={actual_div}")
         available_statements[actual_div] = {
             "raw": raw,
             "requested_div": requested_div,
@@ -321,10 +330,14 @@ def get_financial_data_path_a(
 
     if selected_div is None:
         empty["error"] = last_error or "재무제표 데이터를 가져올 수 없습니다."
+        _log("DATA_A", f"  사용 가능한 재무제표 없음: {last_error}")
         return empty
 
+    _log("DATA_A", f"  선택된 재무제표: {selected_div}")
     selected = available_statements[selected_div]
     items = extract_target_items(selected["raw"])
+    matched = sum(1 for v in items.values() if v is not None)
+    _log("DATA_A", f"  Python 추출: {len(items)}개 항목 중 {matched}개 매칭")
 
     # 3. AI 독립 추출 + Python 결과 비교 (GEMINI_API_KEY가 있을 때만)
     ai_comparison = None
@@ -333,11 +346,15 @@ def get_financial_data_path_a(
         if GEMINI_API_KEY:
             table_text = format_raw_for_ai(selected["raw"])
             if table_text.strip():
+                _log("AI", "  AI 비교 추출 시작...")
+                t0 = _time.perf_counter()
                 from gemini_parser import extract_with_ai_comparison
-                ai_comparison = extract_with_ai_comparison(table_text, items)
+                ai_comparison = extract_with_ai_comparison(table_text, items, log_fn=log_fn)
+                elapsed = _time.perf_counter() - t0
+                _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")
                 items = ai_comparison["items"]  # 최종 결과 사용
-    except Exception:
-        pass  # AI 실패 시 Python 결과 유지
+    except Exception as e:
+        _log("AI", f"  AI 비교 실패: {e}")
 
     return {
         "items":          items,

@@ -464,6 +464,7 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
 def get_financial_data_path_b(
     rcept_no: str,
     report_type: Optional[str] = None,
+    log_fn=None,
 ) -> dict:
     """
     경로B 메인 함수: 감사보고서 rcept_no로 재무 데이터를 추출한다.
@@ -476,7 +477,9 @@ def get_financial_data_path_b(
       5. AI 독립 추출 + Python 결과 비교 + 불일치 시 AI 판정
 
     Args:
-        rcept_no: 공시 접수번호 (report_finder.find_report()의 반환값)
+        rcept_no:    공시 접수번호 (report_finder.find_report()의 반환값)
+        report_type: 보고서 유형 (선택)
+        log_fn:      로그 콜백 (tag, message) → None (선택)
 
     Returns:
         {
@@ -486,30 +489,47 @@ def get_financial_data_path_b(
             "ai_comparison":  AI 비교 결과 딕셔너리 | None,
         }
     """
+    import time as _time
+    _log = log_fn or (lambda tag, msg: None)
+
     empty_items = {item["name"]: None for item in FINANCIAL_ITEMS}
 
     # 1. 다운로드
+    _log("DATA_B", f"  document.xml ZIP 다운로드 중 (rcept_no={rcept_no})...")
+    t0 = _time.perf_counter()
     xml_bytes = _download_dart_document(rcept_no)
+    elapsed = _time.perf_counter() - t0
     if xml_bytes is None:
+        _log("DATA_B", f"  다운로드 실패 ({elapsed:.2f}초)")
         return {
             "items": empty_items,
             "fs_div": None, "error": f"document.xml 다운로드 실패 (rcept_no={rcept_no})",
             "ai_comparison": None,
         }
+    _log("DATA_B", f"  다운로드 완료 ({elapsed:.2f}초, {len(xml_bytes) / 1024:.0f}KB)")
 
     # 2. 파싱
+    t0 = _time.perf_counter()
     soup = _parse_dart_xml(xml_bytes)
+    elapsed = _time.perf_counter() - t0
     if soup is None:
+        _log("DATA_B", f"  XML 파싱 실패 ({elapsed:.2f}초)")
         return {
             "items": empty_items,
             "fs_div": None, "error": "DART XML 파싱 실패",
             "ai_comparison": None,
         }
+    _log("DATA_B", f"  XML 파싱 완료 ({elapsed:.2f}초)")
 
     fs_div = _infer_path_b_fs_div(soup, report_type=report_type)
+    _log("DATA_B", f"  재무제표 기준: {fs_div} (report_type={report_type})")
 
     # 3. Python 항목 추출
+    t0 = _time.perf_counter()
     items = _extract_all_items(soup)
+    elapsed = _time.perf_counter() - t0
+    matched = sum(1 for v in items.values() if v is not None)
+    _log("DATA_B", f"  Python 추출 완료 ({elapsed:.2f}초): {len(items)}개 항목 중 {matched}개 매칭")
 
     # 4. AI 추출 + 비교 (GEMINI_API_KEY가 있을 때만)
     ai_comparison = None
@@ -518,11 +538,15 @@ def get_financial_data_path_b(
         if GEMINI_API_KEY:
             table_text = _extract_table_text_for_ai(soup)
             if table_text.strip():
+                _log("AI", "  AI 비교 추출 시작...")
+                t0 = _time.perf_counter()
                 from gemini_parser import extract_with_ai_comparison
-                ai_comparison = extract_with_ai_comparison(table_text, items)
+                ai_comparison = extract_with_ai_comparison(table_text, items, log_fn=log_fn)
+                elapsed = _time.perf_counter() - t0
+                _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")
                 items = ai_comparison["items"]  # 최종 결과 사용
-    except Exception:
-        pass  # AI 실패 시 Python 결과 유지
+    except Exception as e:
+        _log("AI", f"  AI 비교 실패: {e}")
 
     return {
         "items":         items,

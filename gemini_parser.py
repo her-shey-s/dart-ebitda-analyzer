@@ -41,7 +41,7 @@ def _get_client():
         return None
 
 
-def _wait_if_rate_limited() -> None:
+def _wait_if_rate_limited(log_fn=None) -> None:
     """분당 _RATE_LIMIT_RPM회에 도달하면 _RATE_LIMIT_WAIT초 대기한다."""
     global _call_count, _window_start
 
@@ -52,6 +52,8 @@ def _wait_if_rate_limited() -> None:
         _window_start = now
 
     if _call_count >= _RATE_LIMIT_RPM:
+        if log_fn:
+            log_fn("AI", f"    Rate limit 도달 ({_RATE_LIMIT_RPM}RPM) → {_RATE_LIMIT_WAIT}초 대기...")
         time.sleep(_RATE_LIMIT_WAIT)
         _call_count = 0
         _window_start = time.time()
@@ -297,6 +299,7 @@ def ai_adjudicate(
 def extract_with_ai_comparison(
     table_text: str,
     python_items: dict[str, Optional[float]],
+    log_fn=None,
 ) -> dict:
     """
     경로B 오케스트레이터: AI 추출 + Python 비교 + 불일치 시 AI 판정.
@@ -312,6 +315,7 @@ def extract_with_ai_comparison(
     Args:
         table_text:   _extract_table_text_for_ai() 반환값
         python_items: _extract_all_items() 반환값
+        log_fn:       로그 콜백 (tag, message) → None (선택)
 
     Returns:
         {
@@ -323,6 +327,8 @@ def extract_with_ai_comparison(
             "error":         오류 메시지 또는 None,
         }
     """
+    _log = log_fn or (lambda tag, msg: None)
+
     base = {
         "items":         python_items,
         "source":        "python_fallback",
@@ -333,10 +339,16 @@ def extract_with_ai_comparison(
     }
 
     # 1. AI 독립 추출 (1회차)
+    _log("AI", "    AI 1회차: 독립 추출 호출...")
+    t0 = time.perf_counter()
     try:
         ai_items = ai_extract_items(table_text)
     except RuntimeError as e:
+        elapsed = time.perf_counter() - t0
+        _log("AI", f"    AI 1회차 실패 ({elapsed:.2f}초): {e}")
         return {**base, "error": f"AI 추출 실패: {e}"}
+    elapsed = time.perf_counter() - t0
+    _log("AI", f"    AI 1회차 완료 ({elapsed:.2f}초)")
 
     base["ai_calls"] = 1
     base["ai_items"] = ai_items
@@ -347,12 +359,19 @@ def extract_with_ai_comparison(
 
     if not disagreements:
         # 완전 일치 → Python 결과 사용 (AI가 확인해준 셈)
+        _log("AI", "    Python-AI 완전 일치 (agreed)")
         return {**base, "source": "agreed"}
 
+    _log("AI", f"    불일치 {len(disagreements)}건: {', '.join(disagreements.keys())}")
+
     # 3. 불일치 → AI 판정 (2회차)
+    _log("AI", "    AI 2회차: 판정 호출...")
+    t0 = time.perf_counter()
     try:
         final_items = ai_adjudicate(table_text, python_items, ai_items, disagreements)
     except RuntimeError as e:
+        elapsed = time.perf_counter() - t0
+        _log("AI", f"    AI 2회차 실패 ({elapsed:.2f}초): {e}")
         # 2회차 실패 → AI 1회차 결과로 fallback (원문을 본 결과이므로)
         merged = dict(python_items)
         for name, val in ai_items.items():
@@ -364,6 +383,8 @@ def extract_with_ai_comparison(
             "source": "ai_extract_only",
             "error":  f"AI 판정 실패, 1회차 결과 사용: {e}",
         }
+    elapsed = time.perf_counter() - t0
+    _log("AI", f"    AI 2회차 완료 ({elapsed:.2f}초, adjudicated)")
 
     base["ai_calls"] = 2
     return {**base, "items": final_items, "source": "adjudicated"}
