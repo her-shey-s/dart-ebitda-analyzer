@@ -7,6 +7,7 @@ DART 재무 데이터 분석기 - Streamlit 메인 UI
 """
 
 import io
+import re
 from itertools import product
 from typing import Optional
 
@@ -59,6 +60,40 @@ def _fmt_억(val: Optional[float]) -> str:
 def _fmt_억_raw(val: Optional[float]) -> Optional[float]:
     """Excel 출력용: 억 단위 float 반환 (반올림 없이 원본 정밀도 유지)."""
     return val / 1e8 if val is not None else None
+
+
+def _sanitize_filename_part(text: str) -> str:
+    """파일명에 안전한 문자열만 남긴다."""
+    cleaned = re.sub(r'[\\/:*?"<>|]+', "_", (text or "").strip())
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    return cleaned.strip("._") or "trace"
+
+
+def _depreciation_trace_filename(result: dict) -> str:
+    """결과 1건에 대한 감가상각 추적 로그 파일명을 생성한다."""
+    corp = _sanitize_filename_part(result.get("corp_name", "corp"))
+    year = result.get("year", "year")
+    path = result.get("path", "-")
+    report = _sanitize_filename_part(result.get("report_nm", "report"))
+    return f"{corp}_{year}_경로{path}_{report}_감가상각추적.txt"
+
+
+def _depreciation_trace_text(result: dict) -> str:
+    """결과 1건의 감가상각 추적 로그를 TXT 본문으로 직렬화한다."""
+    trace_lines = result.get("depreciation_trace") or []
+    header = [
+        f"기업명: {result.get('corp_name', '-')}",
+        f"연도: {result.get('year', '-')}",
+        f"corp_code: {result.get('corp_code', '-')}",
+        f"경로: {result.get('path', '-')}",
+        f"보고서: {result.get('report_nm', '-')}",
+        f"재무제표기준: {_fs_label(result)}",
+        "",
+        "[감가상각 추적 로그]",
+    ]
+    if trace_lines:
+        return "\n".join(header + trace_lines)
+    return "\n".join(header + ["로그 없음"])
 
 
 def _validation_status_label(result: dict, use_icon: bool = True) -> str:
@@ -194,6 +229,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         "corp_name":     corp_name,
         "year":          year,
         "corp_code":     "-",
+        "rcept_no":      "-",
         "path":          "-",
         "report_nm":     "-",
         "report_type":   "-",
@@ -262,6 +298,7 @@ def _analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         return _finish({**base, "status": "no_report", "error_msg": "보고서 없음"})
 
     base["path"]        = report["path"]
+    base["rcept_no"]    = report["rcept_no"]
     base["report_nm"]   = report["report_nm"]
     base["report_type"] = report.get("report_type", "-")
     log("REPORT", f"보고서 확정: {report['report_nm']} (path={report['path']}, rcept_no={report['rcept_no']})")
@@ -521,7 +558,12 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
             row["비고"] = r.get("remarks", "")
-            row["감가상각추적"] = "\n".join(r.get("depreciation_trace", []))
+            row["감가상각추적라인수"] = len(r.get("depreciation_trace", []) or [])
+            row["감가상각추적TXT"] = (
+                _depreciation_trace_filename(r)
+                if r.get("depreciation_trace")
+                else ""
+            )
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
@@ -642,6 +684,13 @@ def _render_validation_detail(result: dict) -> None:
     trace_lines = result.get("depreciation_trace") or []
     if trace_lines:
         st.markdown("**감가상각 추적 로그:**")
+        st.download_button(
+            label="감가상각 추적 로그 다운로드 (.txt)",
+            data=_depreciation_trace_text(result),
+            file_name=_depreciation_trace_filename(result),
+            mime="text/plain",
+            key=f"depr_trace_{result.get('corp_code', '-')}_{result.get('year', '-')}_{result.get('rcept_no', '-')}",
+        )
         st.code("\n".join(trace_lines), language="text")
 
 
