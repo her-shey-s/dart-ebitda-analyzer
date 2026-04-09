@@ -100,10 +100,12 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             _corp_df = df
             return _corp_df
 
-    # 3. DART API 다운로드 (해외 서버에서 연결 불안정할 수 있어 재시도)
-    _DL_TIMEOUT = 120
-    _DL_MAX_RETRIES = 3
-    _DL_RETRY_WAIT = 5
+    # 3. DART API 다운로드
+    # Streamlit Cloud(해외 서버)에서 한국 DART API 연결이 느릴 수 있으므로
+    # connect/read 타임아웃을 분리하고 충분히 여유를 둔다.
+    _DL_TIMEOUT = (60, 180)   # (connect 60초, read 180초)
+    _DL_MAX_RETRIES = 5
+    _DL_RETRY_WAIT = 10
 
     for attempt in range(_DL_MAX_RETRIES):
         try:
@@ -114,9 +116,9 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             )
             resp.raise_for_status()
             break
-        except (requests.ConnectionError, requests.Timeout):
+        except requests.RequestException:
             if attempt < _DL_MAX_RETRIES - 1:
-                time.sleep(_DL_RETRY_WAIT)
+                time.sleep(_DL_RETRY_WAIT * (attempt + 1))
                 continue
             raise
 
