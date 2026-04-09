@@ -61,6 +61,25 @@ _FS_SCOPE_TITLE_KEYWORDS = (
 )
 
 
+# "당기" 키워드를 포함하지만 기간 헤더가 아닌 재무항목명 패턴
+_DANGGI_FALSE_POSITIVES = ("당기순", "당기손익", "당기법인세", "당기총")
+
+
+def _is_period_header(cell_text: str, period: str = "당기") -> bool:
+    """셀 텍스트가 기간 헤더(당기/전기)인지 판별한다.
+
+    "당기순이익", "당기손익" 등 재무항목명을 제외한다.
+    """
+    opposite = "전기" if period == "당기" else "당기"
+    if period not in cell_text or opposite in cell_text:
+        return False
+    for fp in _DANGGI_FALSE_POSITIVES:
+        mapped = fp if period == "당기" else fp.replace("당기", "전기")
+        if mapped in cell_text:
+            return False
+    return True
+
+
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
 
 def _detect_unit_multiplier(tag: Tag) -> int:
@@ -361,7 +380,7 @@ def _extract_depreciation_from_rows(
             continue
         for ci, cell in enumerate(header):
             label = cell.replace(" ", "").strip()
-            if "당기" in label and "전기" not in label:
+            if _is_period_header(label, "당기"):
                 current_col = ci
                 selected_by_header = True
                 break
@@ -389,7 +408,7 @@ def _extract_depreciation_from_rows(
                 continue
             for ci, cell in enumerate(header):
                 label = cell.replace(" ", "").strip()
-                if "전기" in label:
+                if _is_period_header(label, "전기"):
                     jeongi_col = ci
                     break
             if jeongi_col is not None:
@@ -1060,14 +1079,44 @@ def _extract_from_cf(
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
     combined = False
 
+    # ── 기간 문맥 추적 ──
+    # 두산퓨얼셀 등 일부 기업은 당기/전기 데이터를 별도 테이블로 분리하고,
+    # 앞에 "당기" / "전기" 라벨 테이블을 배치한다.
+    # 라벨 테이블을 감지하여 이후 데이터 테이블의 기간 문맥을 추적한다.
+    # period_context: "당기" | "전기" | None(미판별)
+    period_context: Optional[str] = None
+
     for idx, rows in enumerate(cf_tables, start=1):
-        # 감가상각 키워드가 포함된 CF 테이블만 대상
         full_text = " ".join(" ".join(r) for r in rows)
+        full_text_norm = full_text.replace(" ", "").strip()
+
+        # 라벨 테이블 감지: 행이 적고(≤3) 기간 키워드만 포함된 테이블
+        if len(rows) <= 3:
+            if "전기" in full_text_norm and "당기" not in full_text_norm:
+                period_context = "전기"
+                if debug_trace is not None:
+                    debug_trace.append(f"[CF] 테이블 #{idx}: 기간 라벨 → 전기")
+                continue
+            elif "당기" in full_text_norm and "전기" not in full_text_norm:
+                period_context = "당기"
+                if debug_trace is not None:
+                    debug_trace.append(f"[CF] 테이블 #{idx}: 기간 라벨 → 당기")
+                continue
+
+        # 감가상각 키워드가 포함된 CF 테이블만 대상
         if "감가상각" not in full_text:
             continue
+
+        # 전기 문맥의 테이블은 건너뛴다
+        if period_context == "전기":
+            if debug_trace is not None:
+                labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                debug_trace.append(f"[CF] 테이블 #{idx} 전기 문맥 → 스킵: {labels}")
+            continue
+
         if debug_trace is not None:
             labels = ", ".join(row[0].strip() for row in rows[:5] if row)
-            debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
+            debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx} (문맥={period_context}): {labels}")
 
         # ── 당기 컬럼 인덱스 탐지 ──
         # 헤더 행(첫 2행)에서 "당기"가 포함된 컬럼을 찾는다.
@@ -1078,7 +1127,7 @@ def _extract_from_cf(
         for header in header_rows:
             for ci, cell in enumerate(header):
                 cell_norm = cell.replace(" ", "").strip()
-                if "당기" in cell_norm and "전기" not in cell_norm:
+                if _is_period_header(cell_norm, "당기"):
                     current_col = ci
                     break
             if current_col is not None:
