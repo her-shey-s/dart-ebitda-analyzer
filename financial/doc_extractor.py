@@ -1,5 +1,5 @@
 """
-dart_api/html_parser.py
+financial/doc_extractor.py
 경로B: DART 감사보고서 문서 파싱
 
 DART의 document.xml API로 보고서 ZIP을 다운로드하고
@@ -14,10 +14,8 @@ DART 문서 포맷 특징:
   - 항목명에 전각 공백 혼재 (예: "자      산      총      계")
 """
 
-import io
 import re
 import warnings
-import zipfile
 from typing import Optional
 
 import requests
@@ -26,11 +24,13 @@ from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
-from config import DART_API_KEY, FINANCIAL_ITEMS, MAX_HTML_SIZE_MB, REQUEST_TIMEOUT
-
-
-# ── DART document.xml API ──────────────────────────────────────────────────
-_DOCUMENT_API_URL = "https://opendart.fss.or.kr/api/document.xml"
+from config import FINANCIAL_ITEMS, MAX_HTML_SIZE_MB, REQUEST_TIMEOUT
+from dart_api.xml_utils import (
+    download_dart_document as _download_dart_document,
+    normalize_title as _normalize_title,
+    parse_dart_xml as _parse_dart_xml,
+    xml_table_to_rows as _xml_table_to_rows,
+)
 
 # 재무상태표 판별 키워드
 _BS_KEYWORDS = {"자산총계", "부채총계", "자본총계", "유동자산", "비유동자산"}
@@ -110,100 +110,6 @@ def _is_numeric_cell(val: str) -> bool:
 
 
 # ── DART XML 다운로드 및 파싱 ──────────────────────────────────────────────
-
-def _download_dart_document(rcept_no: str) -> Optional[bytes]:
-    """
-    DART document.xml API로 보고서 ZIP을 다운로드하고 XML bytes를 반환한다.
-
-    ZIP 안에 XML 파일이 여럿일 경우 가장 큰 파일을 선택한다.
-
-    Args:
-        rcept_no: 공시 접수번호
-
-    Returns:
-        XML 파일 bytes 또는 None (다운로드/압축 오류 시)
-    """
-    try:
-        resp = requests.get(
-            _DOCUMENT_API_URL,
-            params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
-            timeout=REQUEST_TIMEOUT * 2,
-            stream=True,
-        )
-        resp.raise_for_status()
-
-        content = b""
-        limit = MAX_HTML_SIZE_MB * 1024 * 1024
-        for chunk in resp.iter_content(chunk_size=65536):
-            content += chunk
-            if len(content) > limit:
-                return None
-
-        with zipfile.ZipFile(io.BytesIO(content)) as zf:
-            # 가장 큰 파일 선택 (보통 하나지만 여럿일 수 있음)
-            names = zf.namelist()
-            target = max(names, key=lambda n: zf.getinfo(n).file_size)
-            return zf.read(target)
-
-    except (requests.RequestException, zipfile.BadZipFile, KeyError):
-        return None
-
-
-def _parse_dart_xml(xml_bytes: bytes) -> Optional[BeautifulSoup]:
-    """
-    DART XML bytes를 BeautifulSoup으로 파싱한다.
-
-    DART XML은 dart4.xsd 커스텀 스키마를 사용하므로 lxml HTML 파서로 처리한다.
-
-    Args:
-        xml_bytes: _download_dart_document() 반환값
-
-    Returns:
-        BeautifulSoup 객체 또는 None
-    """
-    try:
-        return BeautifulSoup(xml_bytes, "lxml")
-    except Exception:
-        return None
-
-
-def _xml_table_to_rows(table_tag) -> list[list[str]]:
-    """
-    BeautifulSoup table 태그를 문자열 행 리스트로 변환한다.
-
-    DART XML의 td / th / tu(금액셀) / te 모두 처리한다.
-
-    Args:
-        table_tag: BeautifulSoup의 <table> 태그
-
-    Returns:
-        [[셀1, 셀2, ...], ...] 형태의 행 리스트
-    """
-    rows = []
-    for tr in table_tag.find_all("tr"):
-        cells = tr.find_all(["td", "th", "tu", "te"])
-        row = [c.get_text(strip=True) for c in cells]
-        if any(row):  # 빈 행 제외
-            rows.append(row)
-    return rows
-
-
-# ── TITLE 태그 기반 섹션 경계 탐지 ─────────────────────────────────────────
-
-# DART XML <TITLE> 태그의 섹션명 → fs_type 매핑
-# 재무상태표 항목: "재무상태표" ~ "손익계산서" TITLE 사이
-# 손익계산서 항목: "손익계산서" ~ "현금흐름표" TITLE 사이
-# 주석은 제외하지 않음 → 추후 감가상각비 등 주석 기반 추출 확장 가능
-_SECTION_ORDER = ["재무상태표", "손익계산서", "자본변동표", "현금흐름표", "주석"]
-
-
-def _normalize_title(text: str) -> str:
-    """TITLE 태그 텍스트에서 공백을 제거하여 섹션명을 정규화한다.
-
-    DART XML의 TITLE 태그는 '재 무 상 태 표' 처럼 전각/반각 공백이 섞여 있다.
-    """
-    return re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
-
 
 def _build_section_table_map(
     soup: BeautifulSoup,
@@ -540,7 +446,7 @@ def get_financial_data_path_b(
             if table_text.strip():
                 _log("AI", "  AI 비교 추출 시작...")
                 t0 = _time.perf_counter()
-                from gemini_parser import extract_with_ai_comparison
+                from ai_module.gemini_parser import extract_with_ai_comparison
                 ai_comparison = extract_with_ai_comparison(table_text, items, log_fn=log_fn)
                 elapsed = _time.perf_counter() - t0
                 _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")

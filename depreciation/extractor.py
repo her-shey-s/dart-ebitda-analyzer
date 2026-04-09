@@ -1,14 +1,14 @@
 """
-dart_api/notes_parser.py
-모듈B: 감가상각비·무형자산상각비 추출 (EBITDA용)
+depreciation/extractor.py
+감가상각비·무형자산상각비 추출 (EBITDA용)
 
 목적:
   EBITDA 계산에 필요한 **전체 비용 기준** 감가상각비·무형자산상각비를 추출한다.
 
 설계 원칙:
-  - 기존 모듈A(재무상태표·손익계산서 추출)와 완전 독립
-  - 본 모듈 실패 시 모듈A 결과에 영향 없음
-  - html_parser.py의 유틸 함수만 재사용 (상태 공유 없음)
+  - 재무항목 추출 모듈(financial/)과 완전 독립
+  - 본 모듈 실패 시 재무항목 추출 결과에 영향 없음
+  - dart_api/xml_utils.py의 유틸 함수만 재사용 (상태 공유 없음)
 
 워크플로우:
   1. DART XML 다운로드 + 파싱
@@ -23,11 +23,11 @@ from typing import Optional
 
 from bs4 import BeautifulSoup, Tag
 
-from dart_api.html_parser import (
-    _download_dart_document,
-    _normalize_title,
-    _parse_dart_xml,
-    _xml_table_to_rows,
+from dart_api.xml_utils import (
+    download_dart_document as _download_dart_document,
+    normalize_title as _normalize_title,
+    parse_dart_xml as _parse_dart_xml,
+    xml_table_to_rows as _xml_table_to_rows,
 )
 
 
@@ -803,7 +803,7 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
         RuntimeError: Gemini API 호출 또는 응답 파싱 실패
     """
     from config import GEMINI_API_KEY
-    from gemini_parser import _get_client, _generate, _parse_json
+    from ai_module.gemini_parser import _get_client, _generate, _parse_json
 
     client = _get_client()
     if client is None:

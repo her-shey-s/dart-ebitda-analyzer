@@ -1,5 +1,5 @@
 """
-dart_api/financial_api.py
+financial/api_extractor.py
 경로A: DART 재무제표 API 직접 호출
 
 사업보고서가 존재하는 기업에 대해
@@ -348,7 +348,7 @@ def get_financial_data_path_a(
             if table_text.strip():
                 _log("AI", "  AI 비교 추출 시작...")
                 t0 = _time.perf_counter()
-                from gemini_parser import extract_with_ai_comparison
+                from ai_module.gemini_parser import extract_with_ai_comparison
                 ai_comparison = extract_with_ai_comparison(table_text, items, log_fn=log_fn)
                 elapsed = _time.perf_counter() - t0
                 _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")
