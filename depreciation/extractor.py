@@ -298,8 +298,43 @@ def _extract_depreciation_from_rows(
                 header_targets["amort"] = ci
 
     if header_targets:
-        for key, ci in header_targets.items():
-            for row in rows[1:]:
+        # 가로형 표: 행이 당기/전기를 나타내므로 당기 행을 찾아야 한다.
+        current_row_idx: Optional[int] = None
+        for ri, row in enumerate(rows[1:], start=1):
+            if not row:
+                continue
+            r_label = row[0].replace(" ", "").strip()
+            if "당기" in r_label and "전기" not in r_label:
+                current_row_idx = ri
+                break
+        # 당기 행을 찾지 못하면 전기 행을 확인하여 나머지 행 선택
+        if current_row_idx is None:
+            for ri, row in enumerate(rows[1:], start=1):
+                if not row:
+                    continue
+                r_label = row[0].replace(" ", "").strip()
+                if "전기" in r_label:
+                    # 전기 행이 아닌 다른 데이터 행을 당기로 사용
+                    for ri2, row2 in enumerate(rows[1:], start=1):
+                        if ri2 != ri and row2 and _parse_number(row2[list(header_targets.values())[0]]) is not None:
+                            current_row_idx = ri2
+                            break
+                    break
+        # 폴백: 첫 번째 숫자가 있는 행
+        if current_row_idx is None:
+            for ri, row in enumerate(rows[1:], start=1):
+                if not row:
+                    continue
+                for ci in header_targets.values():
+                    if ci < len(row) and _parse_number(row[ci]) is not None:
+                        current_row_idx = ri
+                        break
+                if current_row_idx is not None:
+                    break
+
+        if current_row_idx is not None:
+            row = rows[current_row_idx]
+            for key, ci in header_targets.items():
                 if ci >= len(row):
                     continue
                 val = _parse_number(row[ci])
@@ -312,13 +347,13 @@ def _extract_depreciation_from_rows(
                     result["감가상각비"] = val * unit_multiplier
                 elif key == "amort":
                     result["무형자산상각비"] = val * unit_multiplier
-                break
 
     # 우선순위:
-    # 1. 당기 컬럼
+    # 1. 당기 컬럼 (헤더에서 "당기" 검색)
     # 2. 합계 컬럼 (비용의 성격별 분류 표)
-    # 3. 첫 번째 숫자 컬럼
-    current_col = 1
+    # 3. 전기 컬럼 위치로부터 당기 컬럼 추론
+    # 4. 마지막 숫자 컬럼 (최후 폴백)
+    current_col: Optional[int] = None
 
     selected_by_header = False
     for header in header_rows:
@@ -345,6 +380,32 @@ def _extract_depreciation_from_rows(
                     break
             if selected_by_header:
                 break
+
+    # 당기/합계 헤더를 못 찾은 경우: 전기 컬럼 위치로 당기 컬럼 추론
+    if not selected_by_header:
+        jeongi_col: Optional[int] = None
+        for header in header_rows:
+            if len(header) <= 1:
+                continue
+            for ci, cell in enumerate(header):
+                label = cell.replace(" ", "").strip()
+                if "전기" in label:
+                    jeongi_col = ci
+                    break
+            if jeongi_col is not None:
+                break
+        if jeongi_col is not None:
+            # 전기가 col 1이면 당기는 col 2, 전기가 col 2이면 당기는 col 1
+            if jeongi_col == 1 and any(len(r) > 2 for r in rows):
+                current_col = 2
+                selected_by_header = True
+            elif jeongi_col == 2:
+                current_col = 1
+                selected_by_header = True
+
+    # 최후 폴백: 마지막 숫자 컬럼 (DART는 대체로 당기가 뒤에 위치)
+    if current_col is None:
+        current_col = 1
 
     for row in rows:
         if not row:
