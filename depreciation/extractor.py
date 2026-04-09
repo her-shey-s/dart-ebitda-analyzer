@@ -1008,6 +1008,35 @@ def _extract_from_cf(
             labels = ", ".join(row[0].strip() for row in rows[:5] if row)
             debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
 
+        # ── 당기 컬럼 인덱스 탐지 ──
+        # 헤더 행(첫 2행)에서 "당기"가 포함된 컬럼을 찾는다.
+        # DART CF 테이블은 [항목명, 당기, 전기] 또는 [항목명, 전기, 당기] 등
+        # 순서가 보장되지 않으므로 반드시 헤더 기반으로 판별해야 한다.
+        current_col = None
+        header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
+        for header in header_rows:
+            for ci, cell in enumerate(header):
+                cell_norm = cell.replace(" ", "").strip()
+                if "당기" in cell_norm and "전기" not in cell_norm:
+                    current_col = ci
+                    break
+            if current_col is not None:
+                break
+
+        if debug_trace is not None:
+            debug_trace.append(f"[CF] 테이블 #{idx}: 당기 컬럼 인덱스={current_col}")
+
+        def _get_current_val(row: list[str]) -> Optional[float]:
+            """행에서 당기 금액을 추출한다. 당기 컬럼이 판별되면 해당 컬럼만, 아니면 첫 번째 숫자."""
+            if current_col is not None and current_col < len(row):
+                return _parse_number(row[current_col])
+            # 당기 컬럼 미판별 시 폴백: 첫 번째 숫자 (기존 동작)
+            for cell in row[1:]:
+                val = _parse_number(cell)
+                if val is not None:
+                    return val
+            return None
+
         for row in rows:
             if not row:
                 continue
@@ -1015,29 +1044,23 @@ def _extract_from_cf(
 
             # "감가상각비및무형자산상각비" 합산 항목 감지
             if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
-                for cell in row[1:]:
-                    val = _parse_number(cell)
-                    if val is not None:
-                        result["감가상각비"] = val
-                        combined = True
-                        break
+                val = _get_current_val(row)
+                if val is not None:
+                    result["감가상각비"] = val
+                    combined = True
                 continue
 
             # 감가상각비: 정확 매칭 ("감가상각비" == label)
             if label == "감가상각비" or label == "감가상각비용":
-                for cell in row[1:]:
-                    val = _parse_number(cell)
-                    if val is not None:
-                        result["감가상각비"] = val
-                        break
+                val = _get_current_val(row)
+                if val is not None:
+                    result["감가상각비"] = val
 
             # 무형자산상각비
             if label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
-                for cell in row[1:]:
-                    val = _parse_number(cell)
-                    if val is not None:
-                        result["무형자산상각비"] = val
-                        break
+                val = _get_current_val(row)
+                if val is not None:
+                    result["무형자산상각비"] = val
 
     result["combined"] = combined
     if debug_trace is not None:
