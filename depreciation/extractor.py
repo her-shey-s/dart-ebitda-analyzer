@@ -512,6 +512,7 @@ def _collect_depreciation_tables(
     unscoped_tables: list[dict] = []
     all_notes_tables: list[dict] = []
     has_scoped_notes_root = False
+    period_context: Optional[str] = None  # "당기" | "전기" | None
 
     # 주석이 아닌 섹션 키워드 (이들이 나오면 주석 섹션 종료)
     _NON_NOTES_KEYWORDS = ["재무상태표", "손익계산서", "포괄손익계산서", "자본변동표", "현금흐름표"]
@@ -554,11 +555,34 @@ def _collect_depreciation_tables(
                     f"[NOTES] table seen in notes scope={current_notes_scope}: labels={labels}"
                 )
 
+            # ── 기간 라벨 테이블 감지 ──
+            # 현대비앤지스틸 등: 당기/전기 데이터가 별도 테이블로 분리되고
+            # 앞에 "당기" / "전기" 라벨 테이블이 배치되는 구조.
+            # 감가상각 키워드 필터링 전에 먼저 기간 문맥을 추적한다.
+            if len(rows) <= 3:
+                label_text = " ".join(" ".join(r) for r in rows).replace(" ", "").strip()
+                if "전기" in label_text and "당기" not in label_text:
+                    period_context = "전기"
+                    if debug_trace is not None:
+                        debug_trace.append(f"[NOTES] -> 기간 라벨 → 전기")
+                    continue
+                elif "당기" in label_text and "전기" not in label_text:
+                    period_context = "당기"
+                    if debug_trace is not None:
+                        debug_trace.append(f"[NOTES] -> 기간 라벨 → 당기")
+                    continue
+
             # 감가상각 키워드 포함 여부 확인
             full_text = " ".join(" ".join(r) for r in rows)
             if not any(kw in full_text for kw in _DEPRECIATION_KEYWORDS):
                 if debug_trace is not None:
                     debug_trace.append("[NOTES] -> 감가상각 키워드 없음, 스킵")
+                continue
+
+            # 전기 문맥의 테이블은 제외
+            if period_context == "전기":
+                if debug_trace is not None:
+                    debug_trace.append("[NOTES] -> 전기 문맥 → 스킵")
                 continue
 
             # 제외 대상 필터링
