@@ -10,10 +10,13 @@ depreciation/extractor.py
   - 본 모듈 실패 시 재무항목 추출 결과에 영향 없음
   - dart_api/xml_utils.py의 유틸 함수만 재사용 (상태 공유 없음)
 
-워크플로우:
+워크플로우 (AI-선택, Python-검증):
   1. DART XML 다운로드 + 파싱
-  2. [1차] 현금흐름표(CF)에서 Python 키워드 매칭으로 추출 (AI 불필요)
-  3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback (Python + AI 교차검증)
+  2. [Stage 1] 현금흐름표(CF)에서 Python 키워드 매칭으로 추출 (AI 불필요)
+  3. [Stage 2] CF에서 못 찾은 항목 → 주석(NOTES) fallback
+     - Step A: Python이 후보 테이블 수집
+     - Step B: AI가 올바른 테이블/행을 선택 (위치만 반환)
+     - Step C: Python이 AI가 지목한 위치에서 값을 읽고 검증
 """
 
 from functools import lru_cache
@@ -59,25 +62,6 @@ _FS_SCOPE_TITLE_KEYWORDS = (
     "현금흐름표",
     "재무제표주석",
 )
-
-
-# "당기" 키워드를 포함하지만 기간 헤더가 아닌 재무항목명 패턴
-_DANGGI_FALSE_POSITIVES = ("당기순", "당기손익", "당기법인세", "당기총")
-
-
-def _is_period_header(cell_text: str, period: str = "당기") -> bool:
-    """셀 텍스트가 기간 헤더(당기/전기)인지 판별한다.
-
-    "당기순이익", "당기손익" 등 재무항목명을 제외한다.
-    """
-    opposite = "전기" if period == "당기" else "당기"
-    if period not in cell_text or opposite in cell_text:
-        return False
-    for fp in _DANGGI_FALSE_POSITIVES:
-        mapped = fp if period == "당기" else fp.replace("당기", "전기")
-        if mapped in cell_text:
-            return False
-    return True
 
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
@@ -243,25 +227,6 @@ def _resolve_notes_scope(
     return None, False
 
 
-def _is_period_table(rows: list[list[str]]) -> bool:
-    """
-    당기/전기 컬럼 구조인 테이블인지 판별한다.
-
-    당기 비용을 담는 테이블은 보통 "당기"/"전기" 또는 "당기말"/"전기말" 헤더를 갖는다.
-
-    Args:
-        rows: 2D 테이블 행 리스트
-
-    Returns:
-        True이면 당기/전기 구조
-    """
-    if not rows:
-        return False
-    # 첫 2행(헤더)에서 "당기" 포함 여부 확인
-    header_text = " ".join(" ".join(r) for r in rows[:2])
-    return "당기" in header_text
-
-
 def _has_exclude_keywords(rows: list[list[str]]) -> bool:
     """
     제외 키워드가 포함된 테이블인지 확인한다.
@@ -277,191 +242,6 @@ def _has_exclude_keywords(rows: list[list[str]]) -> bool:
     # 첫 3행(헤더)에서 제외 키워드 확인
     header_text = " ".join(" ".join(r) for r in rows[:3])
     return any(kw in header_text for kw in _EXCLUDE_TABLE_KEYWORDS)
-
-
-def _extract_depreciation_from_rows(
-    rows: list[list[str]],
-    unit_multiplier: int = 1,
-) -> dict[str, Optional[float]]:
-    """
-    테이블 행에서 감가상각비·무형자산상각비의 당기 값을 추출한다.
-
-    "감가상각비 및 무형자산상각비" 처럼 합산 항목인 경우:
-      - 감가상각비에 해당 값을 기입
-      - 무형자산상각비는 None
-      - "combined" 플래그를 True로 설정
-
-    Args:
-        rows:            2D 테이블 행 리스트
-        unit_multiplier: 단위 승수 (1000 = 천원)
-
-    Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
-    """
-    result: dict[str, Optional[float]] = {}
-    combined = False
-
-    # 가로형 표 대응:
-    # 첫 행(또는 둘째 행)에 비용 항목이 열 헤더로 나열되고,
-    # 그 아래 행에 당기/전기 금액이 배치되는 경우가 있다.
-    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
-    header_targets: dict[str, int] = {}
-    for header in header_rows:
-        for ci, cell in enumerate(header):
-            label = cell.replace(" ", "").strip()
-            if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
-                header_targets["combined"] = ci
-            elif label in ("감가상각비", "감가상각비용"):
-                header_targets["depr"] = ci
-            elif label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
-                header_targets["amort"] = ci
-
-    if header_targets:
-        # 가로형 표: 행이 당기/전기를 나타내므로 당기 행을 찾아야 한다.
-        current_row_idx: Optional[int] = None
-        for ri, row in enumerate(rows[1:], start=1):
-            if not row:
-                continue
-            r_label = row[0].replace(" ", "").strip()
-            if "당기" in r_label and "전기" not in r_label:
-                current_row_idx = ri
-                break
-        # 당기 행을 찾지 못하면 전기 행을 확인하여 나머지 행 선택
-        if current_row_idx is None:
-            for ri, row in enumerate(rows[1:], start=1):
-                if not row:
-                    continue
-                r_label = row[0].replace(" ", "").strip()
-                if "전기" in r_label:
-                    # 전기 행이 아닌 다른 데이터 행을 당기로 사용
-                    for ri2, row2 in enumerate(rows[1:], start=1):
-                        if ri2 != ri and row2 and _parse_number(row2[list(header_targets.values())[0]]) is not None:
-                            current_row_idx = ri2
-                            break
-                    break
-        # 폴백: 첫 번째 숫자가 있는 행
-        if current_row_idx is None:
-            for ri, row in enumerate(rows[1:], start=1):
-                if not row:
-                    continue
-                for ci in header_targets.values():
-                    if ci < len(row) and _parse_number(row[ci]) is not None:
-                        current_row_idx = ri
-                        break
-                if current_row_idx is not None:
-                    break
-
-        if current_row_idx is not None:
-            row = rows[current_row_idx]
-            for key, ci in header_targets.items():
-                if ci >= len(row):
-                    continue
-                val = _parse_number(row[ci])
-                if val is None:
-                    continue
-                if key == "combined":
-                    result["감가상각비"] = val * unit_multiplier
-                    combined = True
-                elif key == "depr":
-                    result["감가상각비"] = val * unit_multiplier
-                elif key == "amort":
-                    result["무형자산상각비"] = val * unit_multiplier
-
-    # 우선순위:
-    # 1. 당기 컬럼 (헤더에서 "당기" 검색)
-    # 2. 합계 컬럼 (비용의 성격별 분류 표)
-    # 3. 전기 컬럼 위치로부터 당기 컬럼 추론
-    # 4. 마지막 숫자 컬럼 (최후 폴백)
-    current_col: Optional[int] = None
-
-    selected_by_header = False
-    for header in header_rows:
-        if len(header) <= 1:
-            continue
-        for ci, cell in enumerate(header):
-            label = cell.replace(" ", "").strip()
-            if _is_period_header(label, "당기"):
-                current_col = ci
-                selected_by_header = True
-                break
-        if selected_by_header:
-            break
-
-    if not selected_by_header:
-        for header in header_rows:
-            if len(header) <= 1:
-                continue
-            for ci, cell in enumerate(header):
-                label = cell.replace(" ", "").strip()
-                if label in ("합계", "총계"):
-                    current_col = ci
-                    selected_by_header = True
-                    break
-            if selected_by_header:
-                break
-
-    # 당기/합계 헤더를 못 찾은 경우: 전기 컬럼 위치로 당기 컬럼 추론
-    if not selected_by_header:
-        jeongi_col: Optional[int] = None
-        for header in header_rows:
-            if len(header) <= 1:
-                continue
-            for ci, cell in enumerate(header):
-                label = cell.replace(" ", "").strip()
-                if _is_period_header(label, "전기"):
-                    jeongi_col = ci
-                    break
-            if jeongi_col is not None:
-                break
-        if jeongi_col is not None:
-            # 전기가 col 1이면 당기는 col 2, 전기가 col 2이면 당기는 col 1
-            if jeongi_col == 1 and any(len(r) > 2 for r in rows):
-                current_col = 2
-                selected_by_header = True
-            elif jeongi_col == 2:
-                current_col = 1
-                selected_by_header = True
-
-    # 최후 폴백: 마지막 숫자 컬럼 (DART는 대체로 당기가 뒤에 위치)
-    if current_col is None:
-        current_col = 1
-
-    for row in rows:
-        if not row:
-            continue
-        label = row[0].replace(" ", "").strip()
-
-        if current_col >= len(row):
-            for ci in range(1, len(row)):
-                if _parse_number(row[ci]) is not None:
-                    current_col = ci
-                    break
-
-        # "감가상각비및무형자산상각비" 합산 항목 감지
-        if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
-            val = _parse_number(row[current_col]) if current_col < len(row) else None
-            if val is not None:
-                result["감가상각비"] = val * unit_multiplier
-                combined = True
-            continue
-
-        # 감가상각비 매칭 (단, "사용권자산의 감가상각비", "감가상각누계액" 등 제외)
-        if "감가상각비" in label and "누계" not in label:
-            # "감가상각비" 정확 매칭 우선
-            if label in ("감가상각비", "감가상각비용"):
-                val = _parse_number(row[current_col]) if current_col < len(row) else None
-                if val is not None:
-                    result["감가상각비"] = val * unit_multiplier
-
-        # 무형자산상각비 매칭
-        if "무형자산상각비" in label or "무형자산상각" in label:
-            if "누계" not in label and "감가상각" not in label:
-                val = _parse_number(row[current_col]) if current_col < len(row) else None
-                if val is not None:
-                    result["무형자산상각비"] = val * unit_multiplier
-
-    result["combined"] = combined
-    return result
 
 
 # ── 주석 테이블 수집 ──────────────────────────────────────────────────────────
@@ -512,7 +292,6 @@ def _collect_depreciation_tables(
     unscoped_tables: list[dict] = []
     all_notes_tables: list[dict] = []
     has_scoped_notes_root = False
-    period_context: Optional[str] = None  # "당기" | "전기" | None
 
     # 주석이 아닌 섹션 키워드 (이들이 나오면 주석 섹션 종료)
     _NON_NOTES_KEYWORDS = ["재무상태표", "손익계산서", "포괄손익계산서", "자본변동표", "현금흐름표"]
@@ -555,34 +334,11 @@ def _collect_depreciation_tables(
                     f"[NOTES] table seen in notes scope={current_notes_scope}: labels={labels}"
                 )
 
-            # ── 기간 라벨 테이블 감지 ──
-            # 현대비앤지스틸 등: 당기/전기 데이터가 별도 테이블로 분리되고
-            # 앞에 "당기" / "전기" 라벨 테이블이 배치되는 구조.
-            # 감가상각 키워드 필터링 전에 먼저 기간 문맥을 추적한다.
-            if len(rows) <= 3:
-                label_text = " ".join(" ".join(r) for r in rows).replace(" ", "").strip()
-                if "전기" in label_text and "당기" not in label_text:
-                    period_context = "전기"
-                    if debug_trace is not None:
-                        debug_trace.append(f"[NOTES] -> 기간 라벨 → 전기")
-                    continue
-                elif "당기" in label_text and "전기" not in label_text:
-                    period_context = "당기"
-                    if debug_trace is not None:
-                        debug_trace.append(f"[NOTES] -> 기간 라벨 → 당기")
-                    continue
-
             # 감가상각 키워드 포함 여부 확인
             full_text = " ".join(" ".join(r) for r in rows)
             if not any(kw in full_text for kw in _DEPRECIATION_KEYWORDS):
                 if debug_trace is not None:
                     debug_trace.append("[NOTES] -> 감가상각 키워드 없음, 스킵")
-                continue
-
-            # 전기 문맥의 테이블은 제외
-            if period_context == "전기":
-                if debug_trace is not None:
-                    debug_trace.append("[NOTES] -> 전기 문맥 → 스킵")
                 continue
 
             # 제외 대상 필터링
@@ -648,100 +404,14 @@ def _collect_depreciation_tables(
     return []
 
 
-# ── Python 추출 ───────────────────────────────────────────────────────────────
-
-def _python_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
-    """
-    Python으로 감가상각비·무형자산상각비를 추출한다.
-
-    당기/전기 구조 테이블에서 값을 추출하고,
-    여러 테이블에서 발견되면 최대값을 선택한다.
-    (전체 비용 기준 값이 부분 값보다 항상 크거나 같으므로)
-
-    합산/분리 처리 규칙:
-      - 분리된 값(감가상각비, 무형자산상각비 각각)이 존재하면 분리 값 사용
-      - 합산 값만 있으면 합산 값 사용하고 무형자산상각비는 None
-      - 합산 값과 별도 무형자산상각비가 동시에 존재하는 경우 이중계산 방지:
-        분리된 감가상각비가 있으면 분리 값 우선, 없으면 합산 값 사용하되 무형자산상각비는 None
-
-    Args:
-        tables: _collect_depreciation_tables() 반환값
-
-    Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
-    """
-    # 전체 비용 기준 테이블과 부분 테이블(판관비 등)을 분리
-    _PARTIAL_SECTION_KEYWORDS = ["판매비", "판관비", "관리비"]
-
-    # 분리된 항목 (합산이 아닌 개별 감가상각비/무형자산상각비)
-    separate_depr: list[float] = []
-    separate_amort: list[float] = []
-    # 합산 항목 ("감가상각비 및 무형자산상각비")
-    combined_depr: list[float] = []
-    has_combined = False
-
-    for tbl in tables:
-        rows = tbl["rows"]
-        unit = tbl["unit"]
-        title = tbl.get("title", "")
-
-        # 판관비 등 부분 테이블은 제외
-        is_partial = any(kw in title for kw in _PARTIAL_SECTION_KEYWORDS)
-        if is_partial:
-            continue
-
-        extracted = _extract_depreciation_from_rows(rows, unit)
-
-        if extracted.get("combined"):
-            has_combined = True
-            if extracted.get("감가상각비") is not None:
-                combined_depr.append(extracted["감가상각비"])
-        else:
-            if extracted.get("감가상각비") is not None:
-                separate_depr.append(extracted["감가상각비"])
-            if extracted.get("무형자산상각비") is not None:
-                separate_amort.append(extracted["무형자산상각비"])
-
-    # 분리된 감가상각비/무형자산상각비가 모두 있으면 분리 값 우선 사용
-    if separate_depr and separate_amort:
-        return {
-            "감가상각비":    max(separate_depr),
-            "무형자산상각비": max(separate_amort),
-            "combined":     False,
-        }
-
-    # 합산 값이 있으면 합산 우선 사용
-    if combined_depr:
-        return {
-            "감가상각비":    max(combined_depr),
-            "무형자산상각비": None,  # 합산이므로 무형자산상각비 별도 기재 불가
-            "combined":     True,
-        }
-
-    # 분리된 감가상각비만 있는 경우
-    if separate_depr:
-        return {
-            "감가상각비":    max(separate_depr),
-            "무형자산상각비": None,
-            "combined":     False,
-        }
-
-    # 감가상각비 없이 무형자산상각비만 있는 경우
-    return {
-        "감가상각비":    None,
-        "무형자산상각비": max(separate_amort) if separate_amort else None,
-        "combined":     False,
-    }
-
-
-# ── AI 추출 ───────────────────────────────────────────────────────────────────
+# ── AI 테이블/행 선택 ────────────────────────────────────────────────────────
 
 _DEPRECIATION_AI_GUIDE_PATH = Path(__file__).resolve().parent.parent / "prompts" / "depreciation_ai_guide.md"
 
 
 @lru_cache(maxsize=1)
 def _load_depreciation_ai_guide() -> str:
-    """감가상각 AI 추출 규칙 문서를 로드한다."""
+    """감가상각 AI 선택 규칙 문서를 로드한다."""
     try:
         text = _DEPRECIATION_AI_GUIDE_PATH.read_text(encoding="utf-8").strip()
         if text:
@@ -752,11 +422,11 @@ def _load_depreciation_ai_guide() -> str:
         pass
 
     return (
-        "# 감가상각 추출 규칙\n"
-        "- 회사 전체 기준 값을 우선한다.\n"
+        "# 감가상각 선택 규칙\n"
+        "- 회사 전체 기준 값이 있는 테이블/행을 선택한다.\n"
         "- 비용의 성격별 분류 또는 현금흐름표 조정항목을 우선한다.\n"
         "- 판매비와관리비, 기능별 배분, 특정 자산 감가상각, 누계액은 제외한다.\n"
-        "- '감가상각비 및 무형자산상각비' 합산 표기는 감가상각비에만 기록하고 무형자산상각비는 null로 둔다.\n"
+        "- 숫자가 아닌 위치(table_id, row_id)만 반환한다.\n"
     )
 
 
@@ -785,123 +455,51 @@ def _format_tables_for_ai(tables: list[dict]) -> str:
     return "\n\n".join(chunks)
 
 
-def _normalize_ai_source_meta(value) -> dict[str, str]:
-    """AI 응답의 source 메타데이터를 로그용 dict로 정규화한다."""
-    if not isinstance(value, dict):
-        return {}
-
-    normalized: dict[str, str] = {}
-    for key in ("table_id", "section", "row_id", "row_label", "reason"):
-        raw = value.get(key)
-        if raw is None:
-            continue
-        text = str(raw).strip()
-        if text:
-            normalized[key] = text
-    return normalized
-
-
-def _infer_ai_combined(meta: dict[str, str] | None) -> bool:
-    """AI 출처 메타데이터만으로 합산 공시 여부를 추론한다."""
-    if not isinstance(meta, dict):
-        return False
-
-    for key in ("row_label", "reason"):
-        text = str(meta.get(key, "")).replace(" ", "")
-        if "감가상각비" in text and "무형자산상각비" in text:
-            return True
-        if "합산공시" in text:
-            return True
-    return False
-
-
-def _has_separate_notes_pair(result: dict[str, Optional[float]] | None) -> bool:
-    """주석 추출 결과가 감가/무형 분리 기재 쌍인지 판별한다."""
-    if not isinstance(result, dict):
-        return False
-    return (
-        not result.get("combined")
-        and result.get("감가상각비") is not None
-        and result.get("무형자산상각비") is not None
-    )
-
-
-def _format_ai_source_log(item_name: str, meta: dict[str, str]) -> str:
-    """AI가 고른 출처를 한 줄 로그로 포맷한다."""
-    if not meta:
-        return f"[NOTES] AI 출처({item_name}): 미기재"
-
-    parts = []
-    if meta.get("table_id"):
-        parts.append(f"table={meta['table_id']}")
-    if meta.get("section"):
-        parts.append(f"section={meta['section']}")
-    if meta.get("row_id"):
-        parts.append(f"row={meta['row_id']}")
-    if meta.get("row_label"):
-        parts.append(f"label={meta['row_label']}")
-    if meta.get("reason"):
-        parts.append(f"reason={meta['reason']}")
-
-    return f"[NOTES] AI 출처({item_name}): " + ", ".join(parts)
-
-
-def _log_selected_ai_sources(
-    trace: list[str],
-    ai_result: dict[str, Optional[float]],
-    final_result: dict[str, Optional[float]],
-) -> None:
-    """최종 채택된 항목에 대해 AI가 제시한 출처를 로그에 남긴다."""
-    sources = ai_result.get("sources") if isinstance(ai_result, dict) else None
-    if not isinstance(sources, dict):
-        return
-
-    for key in ("감가상각비", "무형자산상각비"):
-        ai_val = ai_result.get(key)
-        final_val = final_result.get(key)
-        if ai_val is None or final_val is None or ai_val != final_val:
-            continue
-        meta = sources.get(key)
-        if isinstance(meta, dict):
-            trace.append(_format_ai_source_log(key, meta))
-
-
 def _build_ai_prompt(tables_text: str, guide_text: str) -> str:
-    """감가상각비 추출용 AI 프롬프트를 생성한다."""
+    """감가상각비 위치 선택용 AI 프롬프트를 생성한다."""
     return (
-        "다음은 이 프로젝트에서 반드시 따라야 하는 감가상각/무형자산상각비 추출 규칙 문서다.\n"
+        "다음은 이 프로젝트에서 반드시 따라야 하는 감가상각/무형자산상각비 선택 규칙 문서다.\n"
         "규칙 문서를 먼저 읽고, 그 기준에 맞게만 판단해라.\n\n"
         f"{guide_text}\n\n"
         "아래는 한국 기업 감사보고서의 주석(Notes)에서 감가상각 관련 테이블을 발췌한 것이다.\n"
-        "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비를 추출해라.\n\n"
+        "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비가 있는\n"
+        "**테이블과 행의 위치**를 선택해라. 숫자를 직접 읽지 마라.\n\n"
         "## 주의사항\n"
         "- '비용의 성격별 분류' 또는 '현금흐름표 조정항목' 기준의 **전체(회사 전체)** 감가상각비를 찾아라.\n"
         "- **'판매비와 관리비' 주석의 감가상각비는 판관비 내 부분값이므로 절대 선택하지 마라.**\n"
         "- 특정 자산(유형자산, 투자부동산, 사용권자산)만의 감가상각은 부분값이므로 선택하지 마라.\n"
         "- 감가상각누계액(누적값)은 당기 비용이 아니므로 선택하지 마라.\n"
         "- 이연법인세 관련 감가상각비는 완전히 다른 맥락이므로 선택하지 마라.\n"
-        "- '감가상각비 및 무형자산상각비'로 합산 표기된 경우: 감가상각비에 해당 값, 무형자산상각비는 null.\n"
-        "- 각 테이블 앞에 표시된 '(단위: XXX)'를 반드시 확인하고, 최종 답은 **원(KRW) 단위**로 변환해라.\n"
-        "- 답을 고를 때 반드시 [TABLE Tn], [ROW Rn] 표기를 그대로 인용해 출처를 남겨라.\n"
-        "- reason에는 왜 그 행이 전체 비용 기준이라고 판단했는지 짧게 적어라.\n"
+        "- 분리 기재(감가상각비, 무형자산상각비 각각 별도 행)가 있으면 분리를 선택해라.\n"
+        "- 합산 기재만 있으면 합산을 선택하고 combined=true로 표시해라.\n"
         "- 찾을 수 없으면 null로 표시해라.\n\n"
         "JSON으로만 응답해라:\n"
-        '{"감가상각비": 숫자또는null, "무형자산상각비": 숫자또는null, "combined": true또는false, '
-        '"sources": {"감가상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}, '
-        '"무형자산상각비": {"table_id": "Tn", "section": "섹션명", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"}}}\n\n'
+        "```json\n"
+        '{\n'
+        '  "depreciation": {"table_id": "Tn", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"},\n'
+        '  "amortization": {"table_id": "Tn", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"},\n'
+        '  "combined": false\n'
+        '}\n'
+        "```\n\n"
         f"주석 테이블:\n---\n{tables_text}\n---"
     )
 
 
-def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
+def _ai_select_depreciation(tables: list[dict]) -> dict:
     """
-    AI(Gemini)로 감가상각비·무형자산상각비를 추출한다.
+    AI(Gemini)에게 감가상각비·무형자산상각비의 올바른 위치를 선택하게 한다.
+
+    AI는 숫자를 반환하지 않고, 테이블/행의 위치만 반환한다.
 
     Args:
         tables: _collect_depreciation_tables() 반환값
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool, "sources": {...}}
+        {
+            "depreciation": {"table_id": "Tn", "row_id": "Rn", "row_label": str, "reason": str} | None,
+            "amortization": {"table_id": "Tn", "row_id": "Rn", "row_label": str, "reason": str} | None,
+            "combined": bool,
+        }
 
     Raises:
         RuntimeError: Gemini API 호출 또는 응답 파싱 실패
@@ -914,85 +512,196 @@ def _ai_extract_depreciation(tables: list[dict]) -> dict[str, Optional[float]]:
         raise RuntimeError("GEMINI_API_KEY 미설정")
 
     # 테이블 텍스트 병합 (토큰 절약: 8000자 제한)
-    combined = _format_tables_for_ai(tables)
-    if len(combined) > 8000:
-        combined = combined[:8000]
+    combined_text = _format_tables_for_ai(tables)
+    if len(combined_text) > 8000:
+        combined_text = combined_text[:8000]
 
     guide_text = _load_depreciation_ai_guide()
-    prompt = _build_ai_prompt(combined, guide_text)
+    prompt = _build_ai_prompt(combined_text, guide_text)
     raw = _generate(client, prompt)
     parsed = _parse_json(raw)
     if parsed is None:
         raise RuntimeError(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
 
-    result: dict[str, Optional[float]] = {}
-    for key in ("감가상각비", "무형자산상각비"):
-        val = parsed.get(key)
-        try:
-            result[key] = float(val) if val is not None else None
-        except (TypeError, ValueError):
-            result[key] = None
+    result: dict = {"depreciation": None, "amortization": None, "combined": False}
 
-    sources = parsed.get("sources")
-    if isinstance(sources, dict):
-        result["sources"] = {
-            "감가상각비": _normalize_ai_source_meta(sources.get("감가상각비")),
-            "무형자산상각비": _normalize_ai_source_meta(sources.get("무형자산상각비")),
-        }
+    for key in ("depreciation", "amortization"):
+        val = parsed.get(key)
+        if isinstance(val, dict) and val.get("table_id") and val.get("row_id"):
+            result[key] = {
+                "table_id": str(val["table_id"]).strip(),
+                "row_id": str(val["row_id"]).strip(),
+                "row_label": str(val.get("row_label", "")).strip(),
+                "reason": str(val.get("reason", "")).strip(),
+            }
 
     combined = parsed.get("combined")
     if isinstance(combined, bool):
         result["combined"] = combined
     else:
-        result["combined"] = _infer_ai_combined((result.get("sources") or {}).get("감가상각비"))
+        # combined 플래그가 없으면 depreciation의 row_label로 추론
+        depr = result.get("depreciation")
+        if isinstance(depr, dict):
+            label = depr.get("row_label", "").replace(" ", "")
+            if "감가상각비" in label and "무형자산상각비" in label:
+                result["combined"] = True
 
-    if result.get("combined"):
-        result["무형자산상각비"] = None
+    if result["combined"]:
+        result["amortization"] = None
 
     return result
 
 
-# ── 교차검증 ──────────────────────────────────────────────────────────────────
+# ── AI 선택 위치에서 Python 값 검증 추출 ─────────────────────────────────────
 
-def _cross_validate(
-    python_result: dict[str, Optional[float]],
-    ai_result: dict[str, Optional[float]],
-    rel_tol: float = 0.05,
-) -> dict[str, Optional[float]]:
+def _extract_value_at_position(
+    tables: list[dict],
+    table_id: str,
+    row_id: str,
+    debug_trace: Optional[list[str]] = None,
+) -> Optional[float]:
     """
-    Python과 AI 결과를 교차검증하여 최종 값을 결정한다.
-
-    규칙:
-      - 둘 다 None → None
-      - 하나만 값 있음 → 있는 쪽 채택
-      - 둘 다 값 있고 일치(5% 이내) → AI 값 채택
-      - 둘 다 값 있고 불일치 → AI 값 채택 (AI가 맥락 판단 가능)
+    AI가 지목한 테이블/행 위치에서 당기 값을 읽는다.
 
     Args:
-        python_result: Python 추출 결과
-        ai_result:     AI 추출 결과
-        rel_tol:       상대 허용 오차
+        tables:   _collect_depreciation_tables() 반환값
+        table_id: "T1", "T2", ... (1-based)
+        row_id:   "R1", "R2", ... (1-based)
 
     Returns:
-        최종 {"감가상각비": float|None, "무형자산상각비": float|None}
+        원(KRW) 단위로 변환된 값, 또는 None
     """
-    final: dict[str, Optional[float]] = {}
+    # table_id에서 인덱스 추출 (T1 -> 0, T2 -> 1, ...)
+    m = re.match(r"T(\d+)", table_id)
+    if not m:
+        if debug_trace is not None:
+            debug_trace.append(f"[VERIFY] 잘못된 table_id: {table_id}")
+        return None
+    table_idx = int(m.group(1)) - 1
 
-    for key in ("감가상각비", "무형자산상각비"):
-        py_val = python_result.get(key)
-        ai_val = ai_result.get(key)
+    if table_idx < 0 or table_idx >= len(tables):
+        if debug_trace is not None:
+            debug_trace.append(f"[VERIFY] table_id {table_id} 범위 초과 (테이블 {len(tables)}개)")
+        return None
 
-        if py_val is None and ai_val is None:
-            final[key] = None
-        elif py_val is None:
-            final[key] = ai_val
-        elif ai_val is None:
-            final[key] = py_val
-        else:
-            # 둘 다 값 있음 → AI 우선 (맥락 판단 능력)
-            final[key] = ai_val
+    tbl = tables[table_idx]
+    rows = tbl["rows"]
+    unit = tbl["unit"]
 
-    return final
+    # row_id에서 인덱스 추출 (R1 -> 0, R2 -> 1, ...)
+    m = re.match(r"R(\d+)", row_id)
+    if not m:
+        if debug_trace is not None:
+            debug_trace.append(f"[VERIFY] 잘못된 row_id: {row_id}")
+        return None
+    row_idx = int(m.group(1)) - 1
+
+    if row_idx < 0 or row_idx >= len(rows):
+        if debug_trace is not None:
+            debug_trace.append(f"[VERIFY] row_id {row_id} 범위 초과 (행 {len(rows)}개)")
+        return None
+
+    target_row = rows[row_idx]
+
+    # 당기 컬럼 인덱스 탐지 (헤더 기반)
+    current_col = None
+    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            cell_norm = cell.replace(" ", "").strip()
+            if "당기" in cell_norm and "전기" not in cell_norm:
+                current_col = ci
+                break
+        if current_col is not None:
+            break
+
+    # 합계 컬럼 fallback
+    if current_col is None:
+        for header in header_rows:
+            for ci, cell in enumerate(header):
+                cell_norm = cell.replace(" ", "").strip()
+                if cell_norm in ("합계", "총계"):
+                    current_col = ci
+                    break
+            if current_col is not None:
+                break
+
+    # 당기 컬럼에서 값 추출
+    if current_col is not None and current_col < len(target_row):
+        val = _parse_number(target_row[current_col])
+        if val is not None:
+            result = val * unit
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[VERIFY] {table_id}/{row_id}: col={current_col}, raw={target_row[current_col]}, "
+                    f"unit={unit}, result={result}"
+                )
+            return result
+
+    # 당기 컬럼 미판별 → 첫 번째 숫자 컬럼 사용
+    for ci in range(1, len(target_row)):
+        val = _parse_number(target_row[ci])
+        if val is not None:
+            result = val * unit
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[VERIFY] {table_id}/{row_id}: fallback col={ci}, raw={target_row[ci]}, "
+                    f"unit={unit}, result={result}"
+                )
+            return result
+
+    if debug_trace is not None:
+        debug_trace.append(f"[VERIFY] {table_id}/{row_id}: 값 추출 실패, row={target_row}")
+    return None
+
+
+def _verify_ai_selection(
+    tables: list[dict],
+    ai_selection: dict,
+    debug_trace: Optional[list[str]] = None,
+) -> dict[str, Optional[float]]:
+    """
+    AI가 선택한 위치에서 Python이 값을 읽어 최종 결과를 만든다.
+
+    Args:
+        tables:       _collect_depreciation_tables() 반환값
+        ai_selection: _ai_select_depreciation() 반환값
+
+    Returns:
+        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
+    """
+    result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
+    combined = ai_selection.get("combined", False)
+
+    # 감가상각비 추출
+    depr_sel = ai_selection.get("depreciation")
+    if isinstance(depr_sel, dict):
+        val = _extract_value_at_position(
+            tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
+        )
+        result["감가상각비"] = val
+        if debug_trace is not None:
+            debug_trace.append(
+                f"[VERIFY] 감가상각비: table={depr_sel['table_id']}, row={depr_sel['row_id']}, "
+                f"label={depr_sel.get('row_label')}, value={val}"
+            )
+
+    # 무형자산상각비 추출 (합산이 아닌 경우만)
+    if not combined:
+        amort_sel = ai_selection.get("amortization")
+        if isinstance(amort_sel, dict):
+            val = _extract_value_at_position(
+                tables, amort_sel["table_id"], amort_sel["row_id"], debug_trace
+            )
+            result["무형자산상각비"] = val
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[VERIFY] 무형자산상각비: table={amort_sel['table_id']}, row={amort_sel['row_id']}, "
+                    f"label={amort_sel.get('row_label')}, value={val}"
+                )
+
+    result["combined"] = combined
+    return result
 
 
 # ── 현금흐름표(CF) 추출 ───────────────────────────────────────────────────────
@@ -1092,7 +801,7 @@ def _extract_from_cf(
         fs_div: "CFS"=연결, "OFS"=별도
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None}
+        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
     """
     cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope, debug_trace=debug_trace)
     if debug_trace is not None:
@@ -1103,55 +812,22 @@ def _extract_from_cf(
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
     combined = False
 
-    # ── 기간 문맥 추적 ──
-    # 두산퓨얼셀 등 일부 기업은 당기/전기 데이터를 별도 테이블로 분리하고,
-    # 앞에 "당기" / "전기" 라벨 테이블을 배치한다.
-    # 라벨 테이블을 감지하여 이후 데이터 테이블의 기간 문맥을 추적한다.
-    # period_context: "당기" | "전기" | None(미판별)
-    period_context: Optional[str] = None
-
     for idx, rows in enumerate(cf_tables, start=1):
-        full_text = " ".join(" ".join(r) for r in rows)
-        full_text_norm = full_text.replace(" ", "").strip()
-
-        # 라벨 테이블 감지: 행이 적고(≤3) 기간 키워드만 포함된 테이블
-        if len(rows) <= 3:
-            if "전기" in full_text_norm and "당기" not in full_text_norm:
-                period_context = "전기"
-                if debug_trace is not None:
-                    debug_trace.append(f"[CF] 테이블 #{idx}: 기간 라벨 → 전기")
-                continue
-            elif "당기" in full_text_norm and "전기" not in full_text_norm:
-                period_context = "당기"
-                if debug_trace is not None:
-                    debug_trace.append(f"[CF] 테이블 #{idx}: 기간 라벨 → 당기")
-                continue
-
         # 감가상각 키워드가 포함된 CF 테이블만 대상
+        full_text = " ".join(" ".join(r) for r in rows)
         if "감가상각" not in full_text:
             continue
-
-        # 전기 문맥의 테이블은 건너뛴다
-        if period_context == "전기":
-            if debug_trace is not None:
-                labels = ", ".join(row[0].strip() for row in rows[:5] if row)
-                debug_trace.append(f"[CF] 테이블 #{idx} 전기 문맥 → 스킵: {labels}")
-            continue
-
         if debug_trace is not None:
             labels = ", ".join(row[0].strip() for row in rows[:5] if row)
-            debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx} (문맥={period_context}): {labels}")
+            debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
 
         # ── 당기 컬럼 인덱스 탐지 ──
-        # 헤더 행(첫 2행)에서 "당기"가 포함된 컬럼을 찾는다.
-        # DART CF 테이블은 [항목명, 당기, 전기] 또는 [항목명, 전기, 당기] 등
-        # 순서가 보장되지 않으므로 반드시 헤더 기반으로 판별해야 한다.
         current_col = None
         header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
         for header in header_rows:
             for ci, cell in enumerate(header):
                 cell_norm = cell.replace(" ", "").strip()
-                if _is_period_header(cell_norm, "당기"):
+                if "당기" in cell_norm and "전기" not in cell_norm:
                     current_col = ci
                     break
             if current_col is not None:
@@ -1161,10 +837,10 @@ def _extract_from_cf(
             debug_trace.append(f"[CF] 테이블 #{idx}: 당기 컬럼 인덱스={current_col}")
 
         def _get_current_val(row: list[str]) -> Optional[float]:
-            """행에서 당기 금액을 추출한다. 당기 컬럼이 판별되면 해당 컬럼만, 아니면 첫 번째 숫자."""
+            """행에서 당기 금액을 추출한다."""
             if current_col is not None and current_col < len(row):
                 return _parse_number(row[current_col])
-            # 당기 컬럼 미판별 시 폴백: 첫 번째 숫자 (기존 동작)
+            # 당기 컬럼 미판별 시 폴백: 첫 번째 숫자
             for cell in row[1:]:
                 val = _parse_number(cell)
                 if val is not None:
@@ -1184,7 +860,7 @@ def _extract_from_cf(
                     combined = True
                 continue
 
-            # 감가상각비: 정확 매칭 ("감가상각비" == label)
+            # 감가상각비: 정확 매칭
             if label == "감가상각비" or label == "감가상각비용":
                 val = _get_current_val(row)
                 if val is not None:
@@ -1215,12 +891,13 @@ def extract_depreciation(
     """
     DART 보고서에서 감가상각비·무형자산상각비를 추출한다.
 
-    모듈A와 완전 독립적으로 동작한다.
-    실패 시 items 값이 None으로 설정되며, 예외를 발생시키지 않는다.
+    워크플로우: AI-선택, Python-검증
+      Stage 1: CF에서 Python 키워드 매칭 (AI 불필요)
+      Stage 2: 주석에서 AI가 위치 선택 → Python이 해당 위치에서 값 검증 추출
 
     Args:
         rcept_no: DART 접수번호
-        fs_div:   "CFS"=연결, "OFS"=별도 (CF 테이블 선택에 사용)
+        fs_div:   "CFS"=연결, "OFS"=별도
         strict_scope:
             True  -> 사업보고서(경로A)처럼 연결/별도 범위를 엄격히 구분
             False -> 감사보고서/연결감사보고서(경로B)처럼 문서 전체를 사용
@@ -1228,11 +905,12 @@ def extract_depreciation(
     Returns:
         {
             "items": {"감가상각비": float|None, "무형자산상각비": float|None},
-            "source": "ai" | "python" | "cross_validated" | "error",
+            "source": "cf" | "cf+notes" | "notes" | "error",
             "error": str|None,
             "tables_found": int,
-            "python_result": dict,
-            "ai_result": dict|None,
+            "ai_selection": dict|None,
+            "combined": bool,
+            "trace": list[str],
         }
     """
     base = {
@@ -1240,9 +918,8 @@ def extract_depreciation(
         "source":        "error",
         "error":         None,
         "tables_found":  0,
-        "python_result": {"감가상각비": None, "무형자산상각비": None},
-        "ai_result":     None,
-        "combined":      False,  # "감가상각비 및 무형자산상각비" 합산 여부
+        "ai_selection":  None,
+        "combined":      False,
         "trace":         [],
     }
     trace: list[str] = [
@@ -1266,29 +943,30 @@ def extract_depreciation(
         trace.append(f"[LOAD] 문서 로드 실패: {e}")
         return {**base, "error": f"문서 로드 실패: {e}", "trace": trace}
 
-    # 2. [1차] 현금흐름표(CF)에서 추출 시도 (AI 불필요, 가장 신뢰도 높음)
+    # 2. [Stage 1] 현금흐름표(CF)에서 추출 (AI 불필요, 가장 신뢰도 높음)
     try:
         cf_result = _extract_from_cf(soup, fs_div=fs_div, strict_scope=strict_scope, debug_trace=trace)
     except Exception as e:
         trace.append(f"[CF] 추출 예외: {e}")
-        cf_result = {"감가상각비": None, "무형자산상각비": None}
+        cf_result = {"감가상각비": None, "무형자산상각비": None, "combined": False}
 
     cf_combined = cf_result.pop("combined", False)
     trace.append(f"[CF] combined={cf_combined}")
 
     if cf_result.get("감가상각비") is not None and (cf_result.get("무형자산상각비") is not None or cf_combined):
-        # CF에서 찾음 → 즉시 반환
+        # CF에서 충분히 찾음 → 즉시 반환
         trace.append("[FINAL] CF 결과만으로 종료")
         return {
             **base,
-            "items":        {k: v for k, v in cf_result.items() if k != "combined"},
-            "source":       "cf",
-            "python_result": cf_result,
-            "combined":     cf_combined,
-            "trace":        trace,
+            "items":    {k: v for k, v in cf_result.items() if k != "combined"},
+            "source":   "cf",
+            "combined": cf_combined,
+            "trace":    trace,
         }
 
-    # 3. [2차] CF에서 못 찾은 항목 → 주석(NOTES) fallback
+    # 3. [Stage 2] CF에서 못 찾은 항목 → 주석(NOTES) fallback
+
+    # Step A: 테이블 수집 (Python)
     try:
         tables = _collect_depreciation_tables(
             soup,
@@ -1308,83 +986,65 @@ def extract_depreciation(
 
     base["tables_found"] = len(tables)
 
-    # 주석 Python 추출
+    if not tables:
+        trace.append("[NOTES] 후보 테이블이 없어 주석 추출 생략")
+        # CF에서 부분적으로 찾은 것이 있으면 반환
+        if cf_result.get("감가상각비") is not None or cf_result.get("무형자산상각비") is not None:
+            trace.append("[FINAL] CF 부분 결과 반환")
+            return {
+                **base,
+                "items":    {k: v for k, v in cf_result.items() if k != "combined"},
+                "source":   "cf",
+                "combined": cf_combined,
+                "trace":    trace,
+            }
+        trace.append("[FINAL] 추출 결과 없음")
+        return {**base, "trace": trace}
+
+    # Step B: AI 테이블/행 선택
+    ai_selection = None
+    notes_result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None, "combined": False}
+
     try:
-        notes_python = _python_extract_depreciation(tables) if tables else {"감가상각비": None, "무형자산상각비": None}
+        ai_selection = _ai_select_depreciation(tables)
+        base["ai_selection"] = ai_selection
         trace.append(
-            f"[NOTES] Python 추출 결과: 감가상각비={notes_python.get('감가상각비')}, "
-            f"무형자산상각비={notes_python.get('무형자산상각비')}, combined={notes_python.get('combined')}"
+            f"[NOTES] AI 선택 결과: depreciation={ai_selection.get('depreciation')}, "
+            f"amortization={ai_selection.get('amortization')}, combined={ai_selection.get('combined')}"
+        )
+
+        # Step C: Python이 AI 지목 위치에서 값 검증 추출
+        notes_result = _verify_ai_selection(tables, ai_selection, debug_trace=trace)
+        trace.append(
+            f"[NOTES] 검증 추출 결과: 감가상각비={notes_result.get('감가상각비')}, "
+            f"무형자산상각비={notes_result.get('무형자산상각비')}, combined={notes_result.get('combined')}"
         )
     except Exception as e:
-        trace.append(f"[NOTES] Python 추출 예외: {e}")
-        notes_python = {"감가상각비": None, "무형자산상각비": None}
+        base["error"] = f"AI 선택 실패: {e}"
+        trace.append(f"[NOTES] AI 선택 실패: {e}")
 
-    # 주석 AI 추출
-    notes_ai = None
-    if tables:
-        try:
-            notes_ai = _ai_extract_depreciation(tables)
-            base["ai_result"] = notes_ai
-            trace.append(
-                f"[NOTES] AI 추출 결과: 감가상각비={notes_ai.get('감가상각비')}, "
-                f"무형자산상각비={notes_ai.get('무형자산상각비')}, combined={notes_ai.get('combined')}"
-            )
-        except Exception as e:
-            base["error"] = f"AI 추출 실패: {e}"
-            trace.append(f"[NOTES] AI 추출 실패: {e}")
-    else:
-        trace.append("[NOTES] 후보 테이블이 없어 AI 추출 생략")
-
-    # 주석 교차검증
-    ai_combined = bool(notes_ai.get("combined")) if isinstance(notes_ai, dict) else False
-    python_has_separate_pair = _has_separate_notes_pair(notes_python)
-
-    if notes_ai:
-        notes_final = _cross_validate(notes_python, notes_ai)
-        if python_has_separate_pair and ai_combined:
-            notes_final = {
-                "감가상각비": notes_python.get("감가상각비"),
-                "무형자산상각비": notes_python.get("무형자산상각비"),
-            }
-            trace.append("[NOTES] Python 분리 기재 우선: AI가 합산 공시를 선택했지만 주석에 분리 기재 쌍이 있어 Python 결과를 유지")
-        trace.append(
-            f"[NOTES] 교차검증 결과: 감가상각비={notes_final.get('감가상각비')}, "
-            f"무형자산상각비={notes_final.get('무형자산상각비')}"
-        )
-        _log_selected_ai_sources(trace, notes_ai, notes_final)
-    else:
-        notes_final = notes_python
-
-    # 합산 표기에서 감가상각비를 사용한 경우, AI가 무형자산상각비만 따로 채워도
-    # 혼합 기재하지 않도록 무형자산상각비를 비운다.
-    if (notes_python.get("combined") or ai_combined) and not python_has_separate_pair:
-        notes_final["무형자산상각비"] = None
-        if notes_python.get("combined") and ai_combined:
-            trace.append("[NOTES] Python/AI 모두 combined=True 이므로 무형자산상각비를 None으로 고정")
-        elif ai_combined:
-            trace.append("[NOTES] AI combined=True 이므로 무형자산상각비를 None으로 고정")
-        else:
-            trace.append("[NOTES] Python combined=True 이므로 무형자산상각비를 None으로 고정")
-
-    # CF 결과와 주석 결과 병합 (CF 우선)
+    # Step D: CF + Notes 병합 (CF 우선)
+    notes_combined = notes_result.get("combined", False)
     final: dict[str, Optional[float]] = {}
     for key in ("감가상각비", "무형자산상각비"):
-        final[key] = cf_result.get(key) or notes_final.get(key)
+        cf_val = cf_result.get(key)
+        notes_val = notes_result.get(key)
+        final[key] = cf_val if cf_val is not None else notes_val
 
-    notes_combined = notes_python.get("combined", False) if isinstance(notes_python, dict) else False
-    if python_has_separate_pair:
-        notes_combined = False
-        ai_combined = False
-    is_combined = cf_combined or notes_combined or ai_combined
+    is_combined = cf_combined or notes_combined
 
-    source = "cf" if all(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
-             "cf+notes" if any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비")) else \
-             "notes"
+    # source 결정
+    cf_found = any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비"))
+    notes_found = any(notes_result.get(k) is not None for k in ("감가상각비", "무형자산상각비"))
+    if cf_found and notes_found:
+        source = "cf+notes"
+    elif cf_found:
+        source = "cf"
+    elif notes_found:
+        source = "notes"
+    else:
+        source = "error"
 
-    base["python_result"] = {
-        "cf": cf_result,
-        "notes": notes_python,
-    }
     trace.append(
         f"[FINAL] source={source}, combined={is_combined}, "
         f"감가상각비={final.get('감가상각비')}, 무형자산상각비={final.get('무형자산상각비')}"
