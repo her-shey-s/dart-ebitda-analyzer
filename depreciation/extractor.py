@@ -63,6 +63,22 @@ _FS_SCOPE_TITLE_KEYWORDS = (
     "재무제표주석",
 )
 
+# 재무제표 본문(statement) 루트 제목 — 주석 안의 동명 소제목과 구분하기 위한 exact-match set
+# 주석 내부 소제목(예: "33.현금흐름표(연결)")은 접두어 제거 후에도 이 set에 포함되지 않는다.
+_FS_STMT_ROOT_CORES = frozenset({
+    "연결재무상태표", "재무상태표", "별도재무상태표",
+    "연결손익계산서", "손익계산서", "별도손익계산서",
+    "연결포괄손익계산서", "포괄손익계산서", "별도포괄손익계산서",
+    "연결자본변동표", "자본변동표", "별도자본변동표",
+    "연결현금흐름표", "현금흐름표", "별도현금흐름표",
+})
+
+# 주석 루트 제목 core
+_NOTES_ROOT_CORES = frozenset({
+    "연결재무제표주석", "별도재무제표주석", "재무제표주석",
+    "연결주석", "별도주석", "주석",
+})
+
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
 
@@ -227,6 +243,59 @@ def _resolve_notes_scope(
     return None, False
 
 
+def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
+    """
+    테이블에서 '당기' 컬럼 인덱스를 탐지한다.
+
+    우선순위:
+      1. 셀에 "당기" 포함 (전기/전전기 제외)
+      2. "제 N 기" 패턴 — 가장 큰 N이 당기
+      3. "20XX" 연도 패턴 — 가장 최신 연도가 당기
+      4. "합계"/"총계" fallback
+      5. 실패 시 None
+
+    머리 5행을 탐색 대상으로 한다 (DART CF는 종종 preamble 행이 있음).
+    """
+    header_rows = rows[:5]
+
+    # 1. "당기" 직접 매칭
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            norm = cell.replace(" ", "").strip()
+            if "당기" in norm and "전기" not in norm and "전전기" not in norm:
+                return ci
+
+    # 2. "제 N 기" 패턴 — 가장 큰 N
+    gi_candidates: list[tuple[int, int]] = []
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            m = re.search(r"제\s*(\d+)\s*기", cell)
+            if m:
+                gi_candidates.append((int(m.group(1)), ci))
+    if gi_candidates:
+        gi_candidates.sort(key=lambda x: (-x[0], x[1]))
+        return gi_candidates[0][1]
+
+    # 3. 20XX 연도 — 가장 최신
+    year_candidates: list[tuple[int, int]] = []
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            for m in re.finditer(r"(20\d{2})", cell):
+                year_candidates.append((int(m.group(1)), ci))
+    if year_candidates:
+        year_candidates.sort(key=lambda x: (-x[0], x[1]))
+        return year_candidates[0][1]
+
+    # 4. 합계/총계 fallback
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            norm = cell.replace(" ", "").strip()
+            if norm in ("합계", "총계"):
+                return ci
+
+    return None
+
+
 def _has_exclude_keywords(rows: list[list[str]]) -> bool:
     """
     제외 키워드가 포함된 테이블인지 확인한다.
@@ -385,13 +454,11 @@ def _collect_depreciation_tables(
     all_notes_tables: list[dict] = []
     has_scoped_notes_root = False
 
-    # 주석이 아닌 섹션 키워드 (이들이 나오면 주석 섹션 종료)
-    _NON_NOTES_KEYWORDS = ["재무상태표", "손익계산서", "포괄손익계산서", "자본변동표", "현금흐름표"]
-
     for tag in soup.descendants:
         if tag.name == "title":
             raw = tag.get_text(strip=True)
             norm = _normalize_title(raw)
+            title_core = _strip_title_prefix(norm)
             notes_scope, is_notes_root = _resolve_notes_scope(
                 norm,
                 document_scope,
@@ -412,7 +479,10 @@ def _collect_depreciation_tables(
                 current_notes_scope = notes_scope
                 if notes_scope is not None:
                     has_scoped_notes_root = True
-            elif any(kw in norm for kw in _NON_NOTES_KEYWORDS):
+            elif title_core in _FS_STMT_ROOT_CORES:
+                # 재무제표 본문 루트(연결/별도 재무상태표·현금흐름표 등) 진입 → 주석 종료
+                # 주석 내부의 "33.현금흐름표(연결)" 같은 소제목은 title_core에 괄호가 남아
+                # 이 set에 포함되지 않으므로 in_notes를 종료하지 않는다.
                 in_notes = False
                 current_notes_scope = None
 
@@ -735,28 +805,8 @@ def _extract_value_at_position(
 
     target_row = rows[row_idx]
 
-    # 당기 컬럼 인덱스 탐지 (헤더 기반)
-    current_col = None
-    header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
-    for header in header_rows:
-        for ci, cell in enumerate(header):
-            cell_norm = cell.replace(" ", "").strip()
-            if "당기" in cell_norm and "전기" not in cell_norm:
-                current_col = ci
-                break
-        if current_col is not None:
-            break
-
-    # 합계 컬럼 fallback
-    if current_col is None:
-        for header in header_rows:
-            for ci, cell in enumerate(header):
-                cell_norm = cell.replace(" ", "").strip()
-                if cell_norm in ("합계", "총계"):
-                    current_col = ci
-                    break
-            if current_col is not None:
-                break
+    # 당기 컬럼 인덱스 탐지 (당기/제N기/연도/합계)
+    current_col = _detect_current_column(rows)
 
     # 당기 컬럼에서 값 추출
     if current_col is not None and current_col < len(target_row):
@@ -864,11 +914,54 @@ def _find_cf_tables_by_fs_type(
 
     current_scope: Optional[bool] = None
     is_cf_section = False
+    in_notes = False
 
     for tag in soup.descendants:
         if tag.name == "title":
             raw = tag.get_text(strip=True)
             norm = _normalize_title(raw)
+            title_core = _strip_title_prefix(norm)
+
+            # 주석 루트 진입 → 이후의 "현금흐름표" 소제목은 CF가 아닌 주석 소제목으로 취급
+            if title_core in _NOTES_ROOT_CORES:
+                in_notes = True
+                is_cf_section = False
+                current_scope = None
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[CF] notes root encountered: raw={raw!r}, in_notes=True"
+                    )
+                continue
+
+            # 재무제표 본문 루트 진입 → 주석 종료
+            if title_core in _FS_STMT_ROOT_CORES:
+                in_notes = False
+                is_cf_section = ("현금흐름표" in title_core)
+                if is_cf_section:
+                    if "연결" in title_core:
+                        current_scope = True
+                    elif "별도" in title_core:
+                        current_scope = False
+                    else:
+                        current_scope = document_scope if document_scope is not None else False
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] title encountered: raw={raw!r}, norm={norm!r}, resolved_scope={current_scope}"
+                        )
+                else:
+                    current_scope = None
+                continue
+
+            # 주석 내부의 "현금흐름표" 소제목은 무시 (두산퓨얼셀 "33. 현금흐름표 (연결)" 케이스)
+            if in_notes:
+                is_cf_section = False
+                if debug_trace is not None and "현금흐름표" in norm:
+                    debug_trace.append(
+                        f"[CF] skipped notes subsection: raw={raw!r} (in_notes=True)"
+                    )
+                continue
+
+            # 그 외 제목: non-root 현금흐름표(예: "2-4. 연결 현금흐름표")
             if "현금흐름표" in norm:
                 is_cf_section = True
                 if "연결" in norm:
@@ -953,56 +1046,81 @@ def _extract_from_cf(
             labels = ", ".join(row[0].strip() for row in rows[:5] if row)
             debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
 
-        # ── 당기 컬럼 인덱스 탐지 ──
-        current_col = None
-        header_rows = rows[:2] if len(rows) >= 2 else rows[:1]
-        for header in header_rows:
-            for ci, cell in enumerate(header):
-                cell_norm = cell.replace(" ", "").strip()
-                if "당기" in cell_norm and "전기" not in cell_norm:
-                    current_col = ci
-                    break
-            if current_col is not None:
-                break
+        # ── 당기 컬럼 인덱스 탐지 (당기/제N기/연도) ──
+        current_col = _detect_current_column(rows)
 
         if debug_trace is not None:
             debug_trace.append(f"[CF] 테이블 #{idx}: 당기 컬럼 인덱스={current_col}")
 
-        def _get_current_val(row: list[str]) -> Optional[float]:
-            """행에서 당기 금액을 추출한다."""
+        def _get_current_val(row: list[str]) -> tuple[Optional[float], Optional[int], Optional[str]]:
+            """행에서 당기 금액과 그 출처 컬럼/원본 셀을 반환한다."""
             if current_col is not None and current_col < len(row):
-                return _parse_number(row[current_col])
+                raw = row[current_col]
+                val = _parse_number(raw)
+                if val is not None:
+                    return val, current_col, raw
             # 당기 컬럼 미판별 시 폴백: 첫 번째 숫자
-            for cell in row[1:]:
+            for ci, cell in enumerate(row[1:], start=1):
                 val = _parse_number(cell)
                 if val is not None:
-                    return val
-            return None
+                    return val, ci, cell
+            return None, None, None
 
-        for row in rows:
+        for row_idx, row in enumerate(rows):
             if not row:
                 continue
             label = row[0].replace(" ", "").strip()
 
             # "감가상각비및무형자산상각비" 합산 항목 감지
             if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
-                val = _get_current_val(row)
+                if result["감가상각비"] is not None:
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} combined '{label}' 발견했으나 이미 값 존재 → 스킵"
+                        )
+                    continue
+                val, col, raw = _get_current_val(row)
                 if val is not None:
                     result["감가상각비"] = val
                     combined = True
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} combined 매칭: label='{label}', col={col}, "
+                            f"raw='{raw}' → {val}"
+                        )
                 continue
 
             # 감가상각비: 정확 매칭
             if label == "감가상각비" or label == "감가상각비용":
-                val = _get_current_val(row)
-                if val is not None:
-                    result["감가상각비"] = val
+                if result["감가상각비"] is not None:
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} '감가상각비' 재발견, 첫 값 유지 → 스킵"
+                        )
+                else:
+                    val, col, raw = _get_current_val(row)
+                    if val is not None:
+                        result["감가상각비"] = val
+                        if debug_trace is not None:
+                            debug_trace.append(
+                                f"[CF] #{idx}/R{row_idx+1} 감가상각비 매칭: col={col}, raw='{raw}' → {val}"
+                            )
 
             # 무형자산상각비
             if label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
-                val = _get_current_val(row)
-                if val is not None:
-                    result["무형자산상각비"] = val
+                if result["무형자산상각비"] is not None:
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} '무형자산상각비' 재발견, 첫 값 유지 → 스킵"
+                        )
+                else:
+                    val, col, raw = _get_current_val(row)
+                    if val is not None:
+                        result["무형자산상각비"] = val
+                        if debug_trace is not None:
+                            debug_trace.append(
+                                f"[CF] #{idx}/R{row_idx+1} 무형자산상각비 매칭: col={col}, raw='{raw}' → {val}"
+                            )
 
     result["combined"] = combined
     if debug_trace is not None:
