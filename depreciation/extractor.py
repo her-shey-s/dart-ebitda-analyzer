@@ -244,6 +244,98 @@ def _has_exclude_keywords(rows: list[list[str]]) -> bool:
     return any(kw in header_text for kw in _EXCLUDE_TABLE_KEYWORDS)
 
 
+# ── 강한 시그널 탐지 ──────────────────────────────────────────────────────────
+
+# 정확 매칭 대상 라벨 (행 첫 셀이 이 값과 정확히 일치해야 함)
+_EXACT_DEPR_LABELS = {"감가상각비", "감가상각비용"}
+_EXACT_AMORT_LABELS = {"무형자산상각비", "무형자산상각비용", "무형자산상각"}
+
+# 섹션 제목 블랙리스트 (부분값 테이블)
+# 타이틀이 감지된 경우에만 보조 필터로 사용
+_PARTIAL_TITLE_KEYWORDS = [
+    "유형자산", "투자부동산", "사용권자산", "리스자산",
+    "판매비", "판관비", "관리비",
+    "기능별",
+]
+
+
+def _row_has_number(row: list[str]) -> bool:
+    """행에 실제 숫자 셀이 하나라도 있는지 확인한다."""
+    for cell in row[1:]:
+        if _parse_number(cell) is not None:
+            return True
+    return False
+
+
+def _normalize_row_label(label: str) -> str:
+    """
+    행 라벨을 정규화한다.
+
+    - 공백/전각공백/특수 공백 제거
+    - 선두 번호 접두어 제거 ("1)", "1.", "(1)", "①" 등)
+    """
+    norm = label.replace(" ", "").replace("\u3000", "").replace("\u00a0", "").strip()
+    # 선두 번호 제거
+    norm = re.sub(r"^[\(\[]?[\d①-⑳]{1,3}[\)\]]?[\.\s]*", "", norm)
+    return norm
+
+
+def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
+    """
+    테이블에서 감가상각비 관련 '강한 시그널'을 탐지한다.
+
+    수작업 워크플로우 기준:
+      - 정확한 '감가상각비' 행 + 숫자 존재 → 회사 전체 기준 테이블일 가능성 높음
+      - 정확한 '무형자산상각비' 행 + 숫자 존재 → 분리 기재 쌍의 일부
+      - '감가상각비 및 무형자산상각비' 합산 행 + 숫자 존재 → 합산 기재 테이블
+
+    Returns:
+        {
+            "has_exact_depr": bool,     # 정확 감가상각비 행 존재
+            "has_exact_amort": bool,    # 정확 무형자산상각비 행 존재
+            "has_combined_row": bool,   # 합산 행 존재
+            "has_separate_pair": bool,  # 분리 기재 쌍 존재 (depr + amort)
+        }
+    """
+    has_exact_depr = False
+    has_exact_amort = False
+    has_combined_row = False
+
+    for row in rows:
+        if not row:
+            continue
+        label = _normalize_row_label(row[0])
+
+        # 누계액 행은 스킵
+        if "누계" in label:
+            continue
+
+        # 합산 행 검사 ("감가상각비및무형자산상각비")
+        if "감가상각비" in label and "무형자산상각비" in label:
+            if _row_has_number(row):
+                has_combined_row = True
+            continue
+
+        # 정확 감가상각비 매칭
+        if label in _EXACT_DEPR_LABELS:
+            if _row_has_number(row):
+                has_exact_depr = True
+            continue
+
+        # 정확 무형자산상각비 매칭
+        if label in _EXACT_AMORT_LABELS:
+            if _row_has_number(row):
+                has_exact_amort = True
+            continue
+
+    return {
+        "has_exact_depr":    has_exact_depr,
+        "has_exact_amort":   has_exact_amort,
+        "has_combined_row":  has_combined_row,
+        "has_separate_pair": has_exact_depr and has_exact_amort,
+    }
+
+
 # ── 주석 테이블 수집 ──────────────────────────────────────────────────────────
 
 def _collect_depreciation_tables(
@@ -334,20 +426,42 @@ def _collect_depreciation_tables(
                     f"[NOTES] table seen in notes scope={current_notes_scope}: labels={labels}"
                 )
 
-            # 감가상각 키워드 포함 여부 확인
+            # 감가상각 키워드 포함 여부 확인 (1차 필터)
             full_text = " ".join(" ".join(r) for r in rows)
             if not any(kw in full_text for kw in _DEPRECIATION_KEYWORDS):
                 if debug_trace is not None:
                     debug_trace.append("[NOTES] -> 감가상각 키워드 없음, 스킵")
                 continue
 
-            # 제외 대상 필터링
+            # 제외 대상 필터링 (누계액/이연법인세 등)
             if _has_exclude_keywords(rows):
                 if debug_trace is not None:
                     debug_trace.append("[NOTES] -> 제외 키워드 포함, 스킵")
                 continue
 
+            # 강한 시그널 탐지 (2차 필터)
+            # 정확한 '감가상각비' 행 또는 합산 행이 숫자와 함께 없으면 스킵
+            # (유형자산 변동/기능별 배분/판관비 부분값 등 걸러냄)
+            signals = _detect_depreciation_signals(rows)
+            if not (signals["has_exact_depr"] or signals["has_combined_row"]):
+                if debug_trace is not None:
+                    preview = ", ".join(row[0].strip() for row in rows[:5] if row)
+                    debug_trace.append(
+                        f"[NOTES] -> 정확 감가상각비/합산 행 없음, 스킵 (labels={preview})"
+                    )
+                continue
+
             title = _get_section_title(tag)
+
+            # 섹션 제목 블랙리스트 (3차 필터, 보조)
+            # 타이틀이 감지된 경우에만 적용. 자산별/기능별 부분값 테이블 제외.
+            if title and any(kw in title for kw in _PARTIAL_TITLE_KEYWORDS):
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[NOTES] -> 섹션 제목 블랙리스트 매칭({title}), 스킵"
+                    )
+                continue
+
             unit = _detect_unit_multiplier(tag)
 
             # AI용 텍스트 생성
@@ -360,11 +474,12 @@ def _collect_depreciation_tables(
                 text_lines.append(" | ".join(row))
 
             entry = {
-                "title":  title,
-                "unit":   unit,
-                "rows":   rows,
-                "text":   "\n".join(text_lines),
-                "tag":    tag,  # 원본 태그 (디버깅용)
+                "title":   title,
+                "unit":    unit,
+                "rows":    rows,
+                "text":    "\n".join(text_lines),
+                "tag":     tag,  # 원본 태그 (디버깅용)
+                "signals": signals,
             }
 
             all_notes_tables.append(entry)
@@ -455,12 +570,13 @@ def _format_tables_for_ai(tables: list[dict]) -> str:
     return "\n\n".join(chunks)
 
 
-def _build_ai_prompt(tables_text: str, guide_text: str) -> str:
+def _build_ai_prompt(tables_text: str, guide_text: str, hint: str = "") -> str:
     """감가상각비 위치 선택용 AI 프롬프트를 생성한다."""
     return (
         "다음은 이 프로젝트에서 반드시 따라야 하는 감가상각/무형자산상각비 선택 규칙 문서다.\n"
         "규칙 문서를 먼저 읽고, 그 기준에 맞게만 판단해라.\n\n"
         f"{guide_text}\n\n"
+        f"{hint}"
         "아래는 한국 기업 감사보고서의 주석(Notes)에서 감가상각 관련 테이블을 발췌한 것이다.\n"
         "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비가 있는\n"
         "**테이블과 행의 위치**를 선택해라. 숫자를 직접 읽지 마라.\n\n"
@@ -516,8 +632,24 @@ def _ai_select_depreciation(tables: list[dict]) -> dict:
     if len(combined_text) > 8000:
         combined_text = combined_text[:8000]
 
+    # 분리 기재 쌍이 있는 테이블을 힌트로 표시
+    separate_pair_tables = [
+        f"T{idx}"
+        for idx, tbl in enumerate(tables, start=1)
+        if tbl.get("signals", {}).get("has_separate_pair")
+    ]
+    hint = ""
+    if separate_pair_tables:
+        hint = (
+            "## 중요 힌트: 분리 기재 쌍 탐지됨\n"
+            f"다음 테이블에는 '감가상각비'와 '무형자산상각비'가 각각 별도 행으로 기재되어 있다: "
+            f"{', '.join(separate_pair_tables)}\n"
+            "분리 기재가 합산 기재보다 우선이므로 이 중 하나를 우선 선택해라. "
+            "단, 이 테이블이 판관비/유형자산/기능별 배분 등 부분값 테이블이면 제외해라.\n\n"
+        )
+
     guide_text = _load_depreciation_ai_guide()
-    prompt = _build_ai_prompt(combined_text, guide_text)
+    prompt = _build_ai_prompt(combined_text, guide_text, hint=hint)
     raw = _generate(client, prompt)
     parsed = _parse_json(raw)
     if parsed is None:
@@ -975,10 +1107,19 @@ def extract_depreciation(
             debug_trace=trace,
         )
         trace.append(f"[NOTES] 후보 테이블 {len(tables)}개")
-        for idx, tbl in enumerate(tables[:5], start=1):
+        for idx, tbl in enumerate(tables, start=1):
             title = tbl.get("title") or "-"
+            signals = tbl.get("signals") or {}
+            marks = []
+            if signals.get("has_separate_pair"):
+                marks.append("SEPARATE_PAIR")
+            elif signals.get("has_exact_depr"):
+                marks.append("depr")
+            if signals.get("has_combined_row"):
+                marks.append("COMBINED")
+            mark_str = f"[{'/'.join(marks)}] " if marks else ""
             labels = ", ".join(row[0].strip() for row in tbl.get("rows", [])[:5] if row)
-            trace.append(f"[NOTES] 테이블 #{idx}: title={title} / labels={labels}")
+            trace.append(f"[NOTES] T{idx} {mark_str}title={title} / labels={labels}")
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
