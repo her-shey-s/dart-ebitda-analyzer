@@ -263,6 +263,19 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
         for ci, cell in enumerate(header):
             norm = cell.replace(" ", "").strip()
             if "당기" in norm and "전기" not in norm and "전전기" not in norm:
+                # 복합 헤더 대응 (비용의 성격별 분류 등):
+                # "당기" 아래 매출원가/판관비/합계 하위 컬럼이 있으면 "합계" 우선
+                end_col = len(header)
+                for cj in range(ci + 1, len(header)):
+                    cnorm = header[cj].replace(" ", "").strip()
+                    if "전기" in cnorm or "전전기" in cnorm:
+                        end_col = cj
+                        break
+                for sub_header in header_rows:
+                    for cj in range(ci + 1, min(end_col, len(sub_header))):
+                        snorm = sub_header[cj].replace(" ", "").strip()
+                        if snorm in ("합계", "총계"):
+                            return cj
                 return ci
 
     # 2. "제 N 기" 패턴 — 가장 큰 N
