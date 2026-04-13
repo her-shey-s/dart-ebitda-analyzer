@@ -15,11 +15,16 @@ dart_api/report_finder.py
 """
 
 import re
+import time
 from typing import Optional
 
 import requests
 
 from config import DART_API_KEY, DART_ENDPOINTS, REQUEST_TIMEOUT
+
+# ── 공시 목록 API 재시도 설정 ─────────────────────────────────────────────────
+_DISCO_MAX_RETRIES = 3
+_DISCO_RETRY_WAIT = 5   # 초 (base), 실제 대기: base × attempt
 
 
 # ── 공시 목록 API용 코드 (list.json) ─────────────────────────────────────
@@ -95,15 +100,14 @@ def find_report(
         label = _TYPE_LABELS.get(spec["report_type"], spec["report_type"])
         _log("REPORT", f"  {label}({spec['pblntf_detail_ty']}) 조회 중...")
 
-        import time as _time
-        t0 = _time.perf_counter()
+        t0 = time.perf_counter()
         items = _fetch_disclosures(
             corp_code=corp_code,
             bgn_de=bgn_de,
             end_de=end_de,
             pblntf_detail_ty=spec["pblntf_detail_ty"],
         )
-        elapsed = _time.perf_counter() - t0
+        elapsed = time.perf_counter() - t0
         _log("REPORT", f"  {label} API 응답: {len(items)}건 ({elapsed:.2f}초)")
 
         # 접수일 내림차순으로 순회하며 요청 연도와 일치하는 보고서 선택
@@ -161,11 +165,19 @@ def _fetch_disclosures(
         "page_count":       10,   # 정정본 포함해서 여유있게 조회
     }
 
-    resp = requests.get(
-        DART_ENDPOINTS["disclosure_list"],
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-    )
+    for _attempt in range(_DISCO_MAX_RETRIES):
+        try:
+            resp = requests.get(
+                DART_ENDPOINTS["disclosure_list"],
+                params=params,
+                timeout=REQUEST_TIMEOUT,
+            )
+            break
+        except requests.RequestException:
+            if _attempt < _DISCO_MAX_RETRIES - 1:
+                time.sleep(_DISCO_RETRY_WAIT * (_attempt + 1))
+                continue
+            raise
     resp.raise_for_status()
     data = resp.json()
 

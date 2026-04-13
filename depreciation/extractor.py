@@ -837,6 +837,28 @@ def _extract_value_at_position(
     return None
 
 
+def _resolve_actual_row_label(
+    tables: list[dict],
+    table_id: str,
+    row_id: str,
+) -> Optional[str]:
+    """AI가 지목한 위치의 실제 행 라벨을 반환한다."""
+    m = re.match(r"T(\d+)", table_id)
+    if not m:
+        return None
+    ti = int(m.group(1)) - 1
+    if ti < 0 or ti >= len(tables):
+        return None
+    rows = tables[ti].get("rows", [])
+    m = re.match(r"R(\d+)", row_id)
+    if not m:
+        return None
+    ri = int(m.group(1)) - 1
+    if ri < 0 or ri >= len(rows) or not rows[ri]:
+        return None
+    return _normalize_row_label(rows[ri][0])
+
+
 def _verify_ai_selection(
     tables: list[dict],
     ai_selection: dict,
@@ -844,6 +866,9 @@ def _verify_ai_selection(
 ) -> dict[str, Optional[float]]:
     """
     AI가 선택한 위치에서 Python이 값을 읽어 최종 결과를 만든다.
+
+    AI가 지목한 행의 실제 라벨이 허용 키워드와 일치하는지 검증하여
+    사용권자산상각비 등 오인식을 방지한다.
 
     Args:
         tables:       _collect_depreciation_tables() 반환값
@@ -855,38 +880,80 @@ def _verify_ai_selection(
     result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
     combined = ai_selection.get("combined", False)
 
-    # 감가상각비 추출
+    # 감가상각비 추출 (라벨 검증 포함)
     depr_sel = ai_selection.get("depreciation")
     if isinstance(depr_sel, dict):
-        val = _extract_value_at_position(
-            tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
+        actual_label = _resolve_actual_row_label(
+            tables, depr_sel["table_id"], depr_sel["row_id"]
         )
-        result["감가상각비"] = val
-        if debug_trace is not None:
-            debug_trace.append(
-                f"[VERIFY] 감가상각비: table={depr_sel['table_id']}, row={depr_sel['row_id']}, "
-                f"label={depr_sel.get('row_label')}, value={val}"
+        # 합산 행이면 라벨에 감가상각비+무형자산상각비 둘 다 포함
+        is_combined_label = (
+            actual_label is not None
+            and "감가상각비" in actual_label
+            and "무형자산상각비" in actual_label
+        )
+        if actual_label is not None and (actual_label in _EXACT_DEPR_LABELS or is_combined_label):
+            val = _extract_value_at_position(
+                tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
             )
+            result["감가상각비"] = val
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[VERIFY] 감가상각비: table={depr_sel['table_id']}, row={depr_sel['row_id']}, "
+                    f"actual_label='{actual_label}', value={val}"
+                )
+        else:
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[VERIFY] 감가상각비 라벨 불일치: AI선택={depr_sel.get('row_label')!r}, "
+                    f"actual='{actual_label}', 허용={_EXACT_DEPR_LABELS} → null 처리"
+                )
 
-    # 무형자산상각비 추출 (합산이 아닌 경우만)
+    # 무형자산상각비 추출 (합산이 아닌 경우만, 라벨 검증 포함)
     if not combined:
         amort_sel = ai_selection.get("amortization")
         if isinstance(amort_sel, dict):
-            val = _extract_value_at_position(
-                tables, amort_sel["table_id"], amort_sel["row_id"], debug_trace
+            actual_label = _resolve_actual_row_label(
+                tables, amort_sel["table_id"], amort_sel["row_id"]
             )
-            result["무형자산상각비"] = val
-            if debug_trace is not None:
-                debug_trace.append(
-                    f"[VERIFY] 무형자산상각비: table={amort_sel['table_id']}, row={amort_sel['row_id']}, "
-                    f"label={amort_sel.get('row_label')}, value={val}"
+            if actual_label is not None and actual_label in _EXACT_AMORT_LABELS:
+                val = _extract_value_at_position(
+                    tables, amort_sel["table_id"], amort_sel["row_id"], debug_trace
                 )
+                result["무형자산상각비"] = val
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[VERIFY] 무형자산상각비: table={amort_sel['table_id']}, row={amort_sel['row_id']}, "
+                        f"actual_label='{actual_label}', value={val}"
+                    )
+            else:
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[VERIFY] 무형자산상각비 라벨 불일치: AI선택={amort_sel.get('row_label')!r}, "
+                        f"actual='{actual_label}', 허용={_EXACT_AMORT_LABELS} → null 처리"
+                    )
 
     result["combined"] = combined
     return result
 
 
 # ── 현금흐름표(CF) 추출 ───────────────────────────────────────────────────────
+
+# 감사보고서 등에서 개별 재무제표 <title> 없이 테이블만 나열된 경우
+# 내용 기반으로 CF 테이블을 판별하기 위한 마커 (첫 10행 라벨 검사)
+_CF_CONTENT_MARKERS = ("영업활동으로인한현금흐름", "영업활동현금흐름")
+
+
+def _table_looks_like_cf(rows: list[list[str]]) -> bool:
+    """테이블 내용이 현금흐름표인지 판별한다 (title 없이 content 기반)."""
+    for row in rows[:10]:
+        if not row:
+            continue
+        label = row[0].replace(" ", "").strip()
+        if any(marker in label for marker in _CF_CONTENT_MARKERS):
+            return True
+    return False
+
 
 def _find_cf_tables_by_fs_type(
     soup: BeautifulSoup,
@@ -978,20 +1045,27 @@ def _find_cf_tables_by_fs_type(
                 is_cf_section = False
                 current_scope = None
 
-        elif tag.name == "table" and is_cf_section:
+        elif tag.name == "table" and (is_cf_section or not in_notes):
             rows = _xml_table_to_rows(tag)
             if not rows:
                 continue
 
-            all_cf_tables.append(rows)
-            if debug_trace is not None:
-                labels = ", ".join(row[0].strip() for row in rows[:5] if row)
-                debug_trace.append(
-                    f"[CF] table seen scope={current_scope}: labels={labels}"
-                )
+            # title 기반 CF 섹션 확인, 또는 content 기반 fallback
+            if is_cf_section or _table_looks_like_cf(rows):
+                if not is_cf_section and debug_trace is not None:
+                    labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                    debug_trace.append(
+                        f"[CF] content-based CF 감지 (title 없음): labels={labels}"
+                    )
+                all_cf_tables.append(rows)
+                if debug_trace is not None:
+                    labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                    debug_trace.append(
+                        f"[CF] table seen scope={current_scope}: labels={labels}"
+                    )
 
-            if current_scope is None or want_consol == current_scope:
-                matched_tables.append(rows)
+                if current_scope is None or want_consol == current_scope:
+                    matched_tables.append(rows)
 
     if not strict_scope:
         if debug_trace is not None:
