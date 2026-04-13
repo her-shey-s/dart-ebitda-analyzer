@@ -54,7 +54,15 @@ def analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
 
     # 1. corp_code 조회 (동일 기업명 다수 시 추출 중단)
     log("CORP", "기업코드 조회 시작")
-    all_corps = search_corp(corp_name)
+    try:
+        all_corps = search_corp(corp_name)
+    except Exception as e:
+        log("CORP", f"기업코드 조회 실패: {e}")
+        return _finish({
+            **base,
+            "status": "error",
+            "error_msg": f"DART API 연결 실패 — 잠시 후 다시 시도해 주세요. ({type(e).__name__})",
+        })
     exact_corps = all_corps[all_corps["corp_name"] == corp_name]
 
     if exact_corps.empty:

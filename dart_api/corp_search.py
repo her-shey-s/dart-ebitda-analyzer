@@ -101,11 +101,14 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             return _corp_df
 
     # 3. DART API 다운로드
-    # Streamlit Cloud(해외 서버)에서 한국 DART API 연결이 느릴 수 있으므로
-    # connect/read 타임아웃을 분리하고 충분히 여유를 둔다.
-    _DL_TIMEOUT = (60, 180)   # (connect 60초, read 180초)
+    # Streamlit Cloud(해외 서버) 콜드스타트 시 첫 연결이 실패할 수 있음.
+    # connect timeout을 짧게 잡고 빠르게 재시도하는 전략이 효과적:
+    #   - DART 접속 가능 시 연결 자체는 수 초면 충분
+    #   - 콜드스타트 DNS/TLS 지연은 재시도로 해소
+    #   - 5회 × 15s connect = 최대 ~75s (기존 5회 × 60s = ~300s)
+    _DL_TIMEOUT = (15, 180)   # (connect 15초, read 180초)
     _DL_MAX_RETRIES = 5
-    _DL_RETRY_WAIT = 10
+    _DL_RETRY_WAIT = 3        # 초 (base), 실제: 3, 6, 9, 12초
 
     for attempt in range(_DL_MAX_RETRIES):
         try:
