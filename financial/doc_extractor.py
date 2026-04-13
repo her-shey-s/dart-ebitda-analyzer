@@ -215,6 +215,52 @@ def _classify_table(rows: list[list[str]]) -> str:
     return "unknown"
 
 
+# ── 당기 컬럼 탐지 ────────────────────────────────────────────────────────
+
+def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
+    """
+    테이블 헤더에서 당기(현재 기간) 컬럼 인덱스를 탐지한다.
+
+    우선순위:
+      1. "당기" 포함 (전기/전전기 제외)
+      2. "제 N 기" 패턴 — 가장 큰 N이 당기
+      3. "20XX" 연도 패턴 — 가장 최신 연도가 당기
+
+    머리 5행을 탐색 대상으로 한다.
+    """
+    header_rows = rows[:5]
+
+    # 1. "당기" 직접 매칭
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            norm = cell.replace(" ", "").strip()
+            if "당기" in norm and "전기" not in norm and "전전기" not in norm:
+                return ci
+
+    # 2. "제 N 기" 패턴 — 가장 큰 N
+    gi_candidates: list[tuple[int, int]] = []
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            m = re.search(r"제\s*(\d+)\s*기", cell)
+            if m:
+                gi_candidates.append((int(m.group(1)), ci))
+    if gi_candidates:
+        gi_candidates.sort(key=lambda x: (-x[0], x[1]))
+        return gi_candidates[0][1]
+
+    # 3. 20XX 연도 — 가장 최신
+    year_candidates: list[tuple[int, int]] = []
+    for header in header_rows:
+        for ci, cell in enumerate(header):
+            for m in re.finditer(r"(20\d{2})", cell):
+                year_candidates.append((int(m.group(1)), ci))
+    if year_candidates:
+        year_candidates.sort(key=lambda x: (-x[0], x[1]))
+        return year_candidates[0][1]
+
+    return None
+
+
 # ── 항목 추출 ──────────────────────────────────────────────────────────────
 
 def find_item_in_table(
@@ -225,7 +271,9 @@ def find_item_in_table(
     """
     행 리스트에서 keywords와 일치하는 항목명을 찾아 당기 금액을 반환한다.
 
-    - 첫 번째 컬럼이 항목명, 이후 컬럼 중 첫 번째 숫자 컬럼이 당기 금액
+    - 첫 번째 컬럼이 항목명, 이후 컬럼 중 당기 컬럼의 값을 반환
+    - 당기 컬럼을 헤더에서 탐지하고, 탐지 실패 시 첫 번째 숫자 컬럼 폴백
+    - 당기 컬럼의 값이 '-'이면 0.0 반환 (항목이 존재하지만 값이 0인 경우)
     - normalize_label() 적용 후 keywords와 정확히 일치(==)하는지 비교
       → 부분 일치 사용 안 함: "영업외이익" ≠ "영업이익"
     - negate_keywords: 해당 키워드로 매칭되면 양수 값을 음수로 반전
@@ -253,15 +301,26 @@ def find_item_in_table(
         if "주석" in re.sub(r"\s+", "", cell)
     }
 
-    # 매칭된 행마다 동적으로 첫 번째 숫자 컬럼을 탐색한다.
-    # → 고정 amount_col을 사용하지 않음:
-    #   소계 행(자산총계 등)은 col 3에, 상세 행(결손금 등)은 col 2에 값이 있는
-    #   이중 컬럼 구조 테이블에서도 각 행이 올바른 값을 찾을 수 있다.
+    # 당기 컬럼 탐지
+    current_col = _detect_current_column(rows)
+
     for row in rows:
         if not row:
             continue
         norm = normalize_label(row[0])
         if norm in keyword_set:
+            # 당기 컬럼이 탐지된 경우: 해당 컬럼만 참조
+            if current_col is not None and current_col < len(row):
+                val = _to_float(row[current_col])
+                if val is None:
+                    # '-' 등 비숫자 → 항목 행이 존재하므로 0 처리
+                    val = 0.0
+                if norm in negate_set and val > 0:
+                    val = -val
+                return val
+
+            # 당기 컬럼 미탐지 시 폴백: 첫 번째 숫자 컬럼
+            # → 이중 컬럼 구조(소계/상세 행이 다른 col에 값)에서도 동작
             for ci in range(1, len(row)):
                 if ci in skip_cols:
                     continue
