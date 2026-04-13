@@ -30,11 +30,6 @@ DATA_DIR = "data"
 CACHE_FILE = os.path.join(DATA_DIR, "corp_codes.pkl")
 CACHE_TTL_SEC = 24 * 3600  # 24시간
 
-# Git에 포함되는 번들 파일 — DART 연결 불가 시 최후 폴백
-# 로컬에서 성공적으로 다운로드 시 자동 갱신 → 커밋하면 Streamlit Cloud에서도 사용 가능
-_BUNDLED_DIR = "bundled"
-_BUNDLED_CACHE_FILE = os.path.join(_BUNDLED_DIR, "corp_codes.pkl")
-
 # 메모리 캐시
 _corp_df: Optional[pd.DataFrame] = None
 
@@ -64,28 +59,10 @@ def _load_file_cache() -> Optional[pd.DataFrame]:
 
 
 def _save_file_cache(df: pd.DataFrame) -> None:
-    """DataFrame을 로컬 pkl 파일에 저장한다. 번들 파일도 갱신."""
+    """DataFrame을 로컬 pkl 파일에 저장한다."""
     _ensure_data_dir()
     with open(CACHE_FILE, "wb") as f:
         pickle.dump(df, f)
-    # 번들 파일도 갱신 (git commit 하면 Streamlit Cloud에서 폴백으로 사용)
-    try:
-        os.makedirs(_BUNDLED_DIR, exist_ok=True)
-        with open(_BUNDLED_CACHE_FILE, "wb") as f:
-            pickle.dump(df, f)
-    except OSError:
-        pass  # 쓰기 실패 무시 (읽기전용 환경 등)
-
-
-def _load_bundled_cache() -> Optional[pd.DataFrame]:
-    """Git에 포함된 번들 캐시를 로드한다 (DART 연결 불가 시 폴백)."""
-    if not os.path.exists(_BUNDLED_CACHE_FILE):
-        return None
-    try:
-        with open(_BUNDLED_CACHE_FILE, "rb") as f:
-            return pickle.load(f)
-    except Exception:
-        return None
 
 
 # ── 공개 함수 ──────────────────────────────────────────────────────────────
@@ -146,15 +123,6 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
             if attempt < _DL_MAX_RETRIES - 1:
                 time.sleep(_DL_RETRY_WAIT * (attempt + 1))
                 continue
-            # 모든 재시도 실패 → 만료된 파일 캐시 또는 번들 폴백
-            stale = _load_file_cache()
-            if stale is not None:
-                _corp_df = stale
-                return stale
-            bundled = _load_bundled_cache()
-            if bundled is not None:
-                _corp_df = bundled
-                return bundled
             raise
 
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
