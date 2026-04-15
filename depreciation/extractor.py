@@ -27,6 +27,7 @@ from typing import Optional
 from bs4 import BeautifulSoup, Tag
 
 from dart_api.xml_utils import (
+    download_all_dart_documents as _download_all_dart_documents,
     download_dart_document as _download_dart_document,
     normalize_title as _normalize_title,
     parse_dart_xml as _parse_dart_xml,
@@ -1296,17 +1297,20 @@ def extract_depreciation(
     ]
 
     # 1. XML 다운로드 및 파싱
+    #    사업보고서 ZIP은 섹션별 XML이 분리되어 있을 수 있으므로,
+    #    가장 큰 파일에서 못 찾으면 나머지 파일도 병합하여 재시도한다.
     try:
-        xml_bytes = _download_dart_document(rcept_no)
-        if xml_bytes is None:
+        all_docs = _download_all_dart_documents(rcept_no)
+        if not all_docs:
             trace.append("[LOAD] XML 다운로드 실패")
             return {**base, "error": "XML 다운로드 실패", "trace": trace}
-        soup = _parse_dart_xml(xml_bytes)
+        soup = _parse_dart_xml(all_docs[0])  # 가장 큰 파일 먼저
         if soup is None:
             trace.append("[LOAD] XML 파싱 실패")
             return {**base, "error": "XML 파싱 실패", "trace": trace}
         trace.append(
-            f"[LOAD] XML 파싱 성공, document_scope={_infer_document_scope(soup)}"
+            f"[LOAD] XML 파싱 성공 (파일 {len(all_docs)}개 중 최대), "
+            f"document_scope={_infer_document_scope(soup)}"
         )
     except Exception as e:
         trace.append(f"[LOAD] 문서 로드 실패: {e}")
@@ -1376,8 +1380,42 @@ def extract_depreciation(
                 "combined": cf_combined,
                 "trace":    trace,
             }
-        trace.append("[FINAL] 추출 결과 없음")
-        return {**base, "trace": trace}
+
+        # 사업보고서 ZIP에 섹션별 XML이 분리되어 있을 수 있으므로
+        # 나머지 파일도 병합하여 재시도
+        if len(all_docs) > 1:
+            trace.append(f"[RETRY] 최대 파일에서 결과 없음 — 나머지 {len(all_docs)-1}개 파일 병합 재시도")
+            combined = b"<html><body>" + b"".join(all_docs) + b"</body></html>"
+            soup_all = _parse_dart_xml(combined)
+            if soup_all is not None:
+                try:
+                    cf_result2 = _extract_from_cf(soup_all, fs_div=fs_div, strict_scope=strict_scope, debug_trace=trace)
+                except Exception:
+                    cf_result2 = {"감가상각비": None, "무형자산상각비": None, "combined": False}
+                cf_combined2 = cf_result2.pop("combined", False)
+                if cf_result2.get("감가상각비") is not None and (cf_result2.get("무형자산상각비") is not None or cf_combined2):
+                    trace.append("[FINAL] 병합 파일 CF에서 추출 완료")
+                    return {
+                        **base,
+                        "items":    {k: v for k, v in cf_result2.items() if k != "combined"},
+                        "source":   "cf",
+                        "combined": cf_combined2,
+                        "trace":    trace,
+                    }
+                try:
+                    tables = _collect_depreciation_tables(
+                        soup_all, fs_div=fs_div, strict_scope=strict_scope, debug_trace=trace,
+                    )
+                    trace.append(f"[RETRY] 병합 파일에서 후보 테이블 {len(tables)}개")
+                    base["tables_found"] = len(tables)
+                except Exception as e:
+                    tables = []
+                    trace.append(f"[RETRY] 병합 파일 테이블 수집 실패: {e}")
+                # tables가 채워졌으면 아래 AI 선택 단계로 계속 진행
+
+        if not tables:
+            trace.append("[FINAL] 추출 결과 없음")
+            return {**base, "trace": trace}
 
     # Step B: AI 테이블/행 선택
     ai_selection = None

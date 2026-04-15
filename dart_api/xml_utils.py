@@ -57,6 +57,47 @@ def download_dart_document(rcept_no: str) -> Optional[bytes]:
         return None
 
 
+def download_all_dart_documents(rcept_no: str) -> list[bytes]:
+    """
+    DART document.xml API로 보고서 ZIP 내 모든 XML 파일을 반환한다.
+
+    사업보고서는 섹션별로 별도 XML 파일이 포함되어 있어,
+    가장 큰 파일만으로는 현금흐름표·주석 등이 누락될 수 있다.
+
+    Args:
+        rcept_no: 공시 접수번호
+
+    Returns:
+        XML bytes 리스트 (크기 내림차순). 실패 시 빈 리스트.
+    """
+    try:
+        resp = requests.get(
+            _DOCUMENT_API_URL,
+            params={"crtfc_key": get_dart_api_key(), "rcept_no": rcept_no},
+            timeout=REQUEST_TIMEOUT * 2,
+            stream=True,
+        )
+        resp.raise_for_status()
+
+        content = b""
+        limit = MAX_HTML_SIZE_MB * 1024 * 1024
+        for chunk in resp.iter_content(chunk_size=65536):
+            content += chunk
+            if len(content) > limit:
+                return []
+
+        with zipfile.ZipFile(io.BytesIO(content)) as zf:
+            names = sorted(
+                zf.namelist(),
+                key=lambda n: zf.getinfo(n).file_size,
+                reverse=True,
+            )
+            return [zf.read(n) for n in names]
+
+    except (requests.RequestException, zipfile.BadZipFile, KeyError):
+        return []
+
+
 def parse_dart_xml(xml_bytes: bytes) -> Optional[BeautifulSoup]:
     """
     DART XML bytes를 BeautifulSoup으로 파싱한다.
