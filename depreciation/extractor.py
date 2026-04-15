@@ -84,10 +84,11 @@ _NOTES_ROOT_CORES = frozenset({
 
 def _detect_unit_multiplier(tag: Tag) -> int:
     """
-    테이블 태그 앞의 '(단위 : XXX)' 패턴에서 단위 승수를 감지한다.
+    테이블의 단위 승수를 감지한다.
 
-    테이블 바로 앞 형제 태그들(최대 5개)을 역순으로 탐색하여
-    가장 가까운 단위 표시를 찾는다.
+    탐색 순서:
+      1. 테이블 앞 형제 태그 (최대 5개)
+      2. 테이블 내부 첫 5행의 셀 텍스트 (인라인 단위 표기 대응)
 
     Args:
         tag: BeautifulSoup Table 태그
@@ -95,16 +96,29 @@ def _detect_unit_multiplier(tag: Tag) -> int:
     Returns:
         단위 승수 (기본값: 1 = 원)
     """
-    # 앞쪽 형제 태그 5개까지 탐색
+    _UNIT_PATTERN = re.compile(r"단위\s*[:：]\s*(천원|백만원|억원|원)")
+
+    # 1. 앞쪽 형제 태그 5개까지 탐색
     node = tag
     for _ in range(5):
         node = node.find_previous_sibling()
         if node is None:
             break
         text = node.get_text(strip=True) if hasattr(node, "get_text") else str(node)
-        m = re.search(r"단위\s*[:：]\s*(천원|백만원|억원|원)", text)
+        m = _UNIT_PATTERN.search(text)
         if m:
             return _UNIT_MULTIPLIERS.get(m.group(1), 1)
+
+    # 2. 테이블 내부 첫 5행에서 인라인 단위 표기 탐색
+    for i, tr in enumerate(tag.find_all("tr")):
+        if i >= 5:
+            break
+        for cell in tr.find_all(["td", "th", "tu", "te"]):
+            cell_text = cell.get_text(strip=True)
+            m = _UNIT_PATTERN.search(cell_text)
+            if m:
+                return _UNIT_MULTIPLIERS.get(m.group(1), 1)
+
     return 1  # 기본값: 원
 
 
@@ -843,6 +857,13 @@ def _extract_value_at_position(
                     f"unit={unit}, result={result}"
                 )
             return result
+        # 당기 컬럼이 '-' 등 비숫자이면 해당 항목은 당기에 없는 것 (0 또는 미계상)
+        # 전기 값을 가져오면 안 되므로 None 반환
+        if debug_trace is not None:
+            debug_trace.append(
+                f"[VERIFY] {table_id}/{row_id}: col={current_col}, raw='{target_row[current_col]}' → 당기 값 없음 (None)"
+            )
+        return None
 
     # 당기 컬럼 미판별 → 첫 번째 숫자 컬럼 사용
     for ci in range(1, len(target_row)):
