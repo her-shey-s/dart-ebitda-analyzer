@@ -272,7 +272,13 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                         end_col = cj
                         break
                 for sub_header in header_rows:
-                    for cj in range(ci + 1, min(end_col, len(sub_header))):
+                    # 서브 헤더가 당기 헤더보다 넓으면 colspan 병합 상태
+                    # → end_col 제한을 풀고 첫 번째 "합계"를 찾는다
+                    if len(sub_header) > len(header):
+                        search_end = len(sub_header)
+                    else:
+                        search_end = end_col
+                    for cj in range(ci + 1, min(search_end, len(sub_header))):
                         snorm = sub_header[cj].replace(" ", "").strip()
                         if snorm in ("합계", "총계"):
                             return cj
