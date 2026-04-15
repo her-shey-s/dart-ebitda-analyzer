@@ -9,14 +9,30 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API 키 ──────────────────────────────────────────────────────────────
-# Streamlit Community Cloud secrets 우선, 로컬 환경변수 fallback
-try:
-    import streamlit as st
-    DART_API_KEY = st.secrets.get("DART_API_KEY", "") or os.getenv("DART_API_KEY", "")
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
-except Exception:
-    DART_API_KEY = os.getenv("DART_API_KEY", "")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+# 우선순위: st.session_state (UI 입력) > 환경변수 (.env)
+
+def get_dart_api_key() -> str:
+    """DART API 키를 반환한다. UI 입력값 우선, 없으면 환경변수 fallback."""
+    try:
+        import streamlit as st
+        val = st.session_state.get("dart_api_key", "")
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.getenv("DART_API_KEY", "")
+
+
+def get_gemini_api_key() -> str:
+    """Gemini API 키를 반환한다. UI 입력값 우선, 없으면 환경변수 fallback."""
+    try:
+        import streamlit as st
+        val = st.session_state.get("gemini_api_key", "")
+        if val:
+            return val
+    except Exception:
+        pass
+    return os.getenv("GEMINI_API_KEY", "")
 
 # ── DART API 엔드포인트 ──────────────────────────────────────────────────
 DART_BASE_URL = "https://opendart.fss.or.kr/api"

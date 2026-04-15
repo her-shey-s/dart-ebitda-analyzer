@@ -14,7 +14,7 @@ import re
 import time
 from typing import Optional
 
-from config import FINANCIAL_ITEMS, GEMINI_API_KEY, GEMINI_MODEL
+from config import FINANCIAL_ITEMS, get_gemini_api_key, GEMINI_MODEL
 
 # ── Rate limit 설정 ──────────────────────────────────────────────────────
 _RATE_LIMIT_RPM = 15          # 분당 최대 호출 횟수
@@ -32,11 +32,11 @@ def _get_client():
     Returns:
         google.genai.Client 또는 None
     """
-    if not GEMINI_API_KEY:
+    if not get_gemini_api_key():
         return None
     try:
         from google import genai
-        return genai.Client(api_key=GEMINI_API_KEY)
+        return genai.Client(api_key=get_gemini_api_key())
     except Exception:
         return None
 
@@ -181,7 +181,7 @@ def ai_extract_items(table_text: str) -> dict[str, Optional[float]]:
     """
     client = _get_client()
     if client is None:
-        raise RuntimeError("GEMINI_API_KEY 미설정")
+        raise RuntimeError("Gemini API 키가 설정되지 않았습니다.")
 
     prompt = _build_extraction_prompt(table_text)
     raw = _generate(client, prompt)
@@ -273,7 +273,7 @@ def ai_adjudicate(
     """
     client = _get_client()
     if client is None:
-        raise RuntimeError("GEMINI_API_KEY 미설정")
+        raise RuntimeError("Gemini API 키가 설정되지 않았습니다.")
 
     # 편향 방지: A/B를 랜덤하게 배정하지 않고 고정 (Python=A, AI=B)
     # → 프롬프트에는 어느 쪽이 Python/AI인지 명시하지 않음

@@ -11,7 +11,7 @@ import sys
 
 import requests
 
-from config import DART_API_KEY, DART_BASE_URL, REQUEST_TIMEOUT
+from config import get_dart_api_key, DART_BASE_URL, REQUEST_TIMEOUT
 from dart_api.corp_search import get_corp_code, search_corp
 from dart_api.report_finder import find_report
 
@@ -43,7 +43,7 @@ def main():
     # 3) document.xml API로 ZIP 다운로드
     resp = requests.get(
         f"{DART_BASE_URL}/document.xml",
-        params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
+        params={"crtfc_key": get_dart_api_key(), "rcept_no": rcept_no},
         timeout=30,
     )
     resp.raise_for_status()

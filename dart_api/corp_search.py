@@ -22,7 +22,7 @@ from typing import Optional
 import requests
 import pandas as pd
 
-from config import DART_API_KEY, DART_ENDPOINTS, REQUEST_TIMEOUT
+from config import get_dart_api_key, DART_ENDPOINTS, REQUEST_TIMEOUT
 
 
 # ── 상수 ──────────────────────────────────────────────────────────────────
@@ -86,8 +86,8 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
     """
     global _corp_df
 
-    if not DART_API_KEY:
-        raise RuntimeError("DART_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.")
+    if not get_dart_api_key():
+        raise RuntimeError("DART API 키가 설정되지 않았습니다. 사이드바에서 API 키를 입력하세요.")
 
     # 1. 메모리 캐시
     if _corp_df is not None and not force:
@@ -114,7 +114,7 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
         try:
             resp = requests.get(
                 DART_ENDPOINTS["corp_code"],
-                params={"crtfc_key": DART_API_KEY},
+                params={"crtfc_key": get_dart_api_key()},
                 timeout=_DL_TIMEOUT,
             )
             resp.raise_for_status()
@@ -201,7 +201,7 @@ def get_company_info(corp_code: str) -> dict:
     """
     resp = requests.get(
         DART_ENDPOINTS["company_info"],
-        params={"crtfc_key": DART_API_KEY, "corp_code": corp_code},
+        params={"crtfc_key": get_dart_api_key(), "corp_code": corp_code},
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()

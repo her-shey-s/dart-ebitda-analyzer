@@ -14,7 +14,7 @@ from typing import Optional
 import pandas as pd
 import streamlit as st
 
-from config import FINANCIAL_ITEMS, GEMINI_API_KEY
+from config import FINANCIAL_ITEMS, get_gemini_api_key
 from pipeline import analyze_one as _analyze_one
 from utils.analysis_logger import format_amount
 from utils.cache import clear_all_cache, purge_expired
@@ -532,6 +532,22 @@ with st.sidebar:
     st.caption("외감기업(비상장 포함) 재무제표 자동 추출 · 검증")
     st.divider()
 
+    # ── API 키 입력 ──────────────────────────────────────────────────────
+    with st.expander("🔑 API 키 설정", expanded=not st.session_state.get("dart_api_key")):
+        st.text_input(
+            "DART API Key",
+            type="password",
+            key="dart_api_key",
+            help="[DART Open API](https://opendart.fss.or.kr)에서 발급받은 인증키",
+        )
+        st.text_input(
+            "Gemini API Key (선택)",
+            type="password",
+            key="gemini_api_key",
+            help="AI 교차검증용. 없으면 Python 추출만 수행",
+        )
+    st.divider()
+
     corp_input = st.text_area(
         "기업명 입력",
         placeholder="삼성전자\n한국맥도날드\n카카오\n(줄바꿈으로 여러 기업 입력, 최대 100개)",
@@ -565,7 +581,9 @@ st.header("DART 재무 데이터 분석기")
 # ── 분석 실행 ─────────────────────────────────────────────────────────────────
 if analyze_btn:
     corps = [c.strip() for c in corp_input.splitlines() if c.strip()][:100]
-    if not corps:
+    if not st.session_state.get("dart_api_key"):
+        st.warning("사이드바에서 DART API 키를 입력하세요.")
+    elif not corps:
         st.warning("기업명을 입력하세요.")
     elif not years_selected:
         st.warning("분석 연도를 선택하세요.")

@@ -703,7 +703,7 @@ def _ai_select_depreciation(tables: list[dict]) -> dict:
     Raises:
         RuntimeError: Gemini API 호출 또는 응답 파싱 실패
     """
-    from config import GEMINI_API_KEY
+    from config import get_gemini_api_key
     from ai_module.gemini_parser import _get_client, _generate, _parse_json
 
     client = _get_client()

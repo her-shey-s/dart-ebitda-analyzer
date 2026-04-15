@@ -13,7 +13,7 @@ from typing import Optional
 import requests
 from bs4 import BeautifulSoup
 
-from config import DART_API_KEY, MAX_HTML_SIZE_MB, REQUEST_TIMEOUT
+from config import get_dart_api_key, MAX_HTML_SIZE_MB, REQUEST_TIMEOUT
 
 # ── DART document.xml API ──────────────────────────────────────────────────
 _DOCUMENT_API_URL = "https://opendart.fss.or.kr/api/document.xml"
@@ -34,7 +34,7 @@ def download_dart_document(rcept_no: str) -> Optional[bytes]:
     try:
         resp = requests.get(
             _DOCUMENT_API_URL,
-            params={"crtfc_key": DART_API_KEY, "rcept_no": rcept_no},
+            params={"crtfc_key": get_dart_api_key(), "rcept_no": rcept_no},
             timeout=REQUEST_TIMEOUT * 2,
             stream=True,
         )

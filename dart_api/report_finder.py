@@ -20,7 +20,7 @@ from typing import Optional
 
 import requests
 
-from config import DART_API_KEY, DART_ENDPOINTS, REQUEST_TIMEOUT
+from config import get_dart_api_key, DART_ENDPOINTS, REQUEST_TIMEOUT
 
 # ── 공시 목록 API 재시도 설정 ─────────────────────────────────────────────────
 _DISCO_MAX_RETRIES = 3
@@ -157,7 +157,7 @@ def _fetch_disclosures(
         requests.HTTPError: HTTP 레벨 오류 시
     """
     params = {
-        "crtfc_key":        DART_API_KEY,
+        "crtfc_key":        get_dart_api_key(),
         "corp_code":        corp_code,
         "bgn_de":           bgn_de,
         "end_de":           end_de,
@@ -230,7 +230,7 @@ def get_document_index(rcept_no: str) -> list[dict]:
     Raises:
         requests.HTTPError: HTTP 레벨 오류 시
     """
-    params = {"crtfc_key": DART_API_KEY, "rcept_no": rcept_no}
+    params = {"crtfc_key": get_dart_api_key(), "rcept_no": rcept_no}
     resp = requests.get(DART_ENDPOINTS["doc_index"], params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()
     data = resp.json()

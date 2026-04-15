@@ -512,8 +512,8 @@ def get_financial_data_path_b(
     # 4. AI 추출 + 비교 (GEMINI_API_KEY가 있을 때만)
     ai_comparison = None
     try:
-        from config import GEMINI_API_KEY
-        if GEMINI_API_KEY:
+        from config import get_gemini_api_key
+        if get_gemini_api_key():
             table_text = _extract_table_text_for_ai(soup)
             if table_text.strip():
                 _log("AI", "  AI 비교 추출 시작...")

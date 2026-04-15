@@ -16,7 +16,7 @@ from typing import Optional
 import requests
 
 from config import (
-    DART_API_KEY,
+    get_dart_api_key,
     DART_ENDPOINTS,
     FINANCIAL_ITEMS,
     FS_DIV,
@@ -159,7 +159,7 @@ def fetch_full_financial_statement(
         ValueError: API 상태 코드가 000이 아닐 때 (데이터 없음 포함)
     """
     params = {
-        "crtfc_key":  DART_API_KEY,
+        "crtfc_key":  get_dart_api_key(),
         "corp_code":  corp_code,
         "bsns_year":  bsns_year,
         "reprt_code": reprt_code,
@@ -342,8 +342,8 @@ def get_financial_data_path_a(
     # 3. AI 독립 추출 + Python 결과 비교 (GEMINI_API_KEY가 있을 때만)
     ai_comparison = None
     try:
-        from config import GEMINI_API_KEY
-        if GEMINI_API_KEY:
+        from config import get_gemini_api_key
+        if get_gemini_api_key():
             table_text = format_raw_for_ai(selected["raw"])
             if table_text.strip():
                 _log("AI", "  AI 비교 추출 시작...")
