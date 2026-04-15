@@ -7,12 +7,14 @@ DART 재무 데이터 분석기 - Streamlit 메인 UI
 """
 
 import io
+import json
 import re
 from itertools import product
 from typing import Optional
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from config import FINANCIAL_ITEMS, get_gemini_api_key
 from pipeline import analyze_one as _analyze_one
@@ -25,6 +27,33 @@ st.set_page_config(
     page_icon="📊",
     layout="wide",
 )
+
+# ── localStorage → session_state 복원 ────────────────────────────────────────
+# 첫 로드 시 브라우저 localStorage에 저장된 API 키를 query_params 경유로 복원한다.
+_LS_KEYS = ("_dk", "_gk")
+
+if any(k in st.query_params for k in _LS_KEYS):
+    if "_dk" in st.query_params:
+        st.session_state.dart_api_key = st.query_params["_dk"]
+    if "_gk" in st.query_params:
+        st.session_state.gemini_api_key = st.query_params["_gk"]
+    for k in _LS_KEYS:
+        st.query_params.pop(k, None)
+    st.rerun()
+
+if "dart_api_key" not in st.session_state:
+    components.html("""
+    <script>
+    const dk = localStorage.getItem('dart_api_key') || '';
+    const gk = localStorage.getItem('gemini_api_key') || '';
+    if (dk || gk) {
+        const url = new URL(window.parent.location);
+        if (dk) url.searchParams.set('_dk', dk);
+        if (gk) url.searchParams.set('_gk', gk);
+        window.parent.location.replace(url.toString());
+    }
+    </script>
+    """, height=0)
 
 # ── 세션 상태 초기화 ──────────────────────────────────────────────────────────
 if "results" not in st.session_state:
@@ -536,16 +565,25 @@ with st.sidebar:
     with st.expander("🔑 API 키 설정", expanded=not st.session_state.get("dart_api_key")):
         st.text_input(
             "DART API Key",
-            type="password",
             key="dart_api_key",
             help="[DART Open API](https://opendart.fss.or.kr)에서 발급받은 인증키",
         )
         st.text_input(
             "Gemini API Key (선택)",
-            type="password",
             key="gemini_api_key",
             help="AI 교차검증용. 없으면 Python 추출만 수행",
         )
+
+    # 입력값을 브라우저 localStorage에 저장 (다음 방문 시 자동 복원)
+    _dk = json.dumps(st.session_state.get("dart_api_key", ""))
+    _gk = json.dumps(st.session_state.get("gemini_api_key", ""))
+    components.html(f"""
+    <script>
+    localStorage.setItem('dart_api_key', {_dk});
+    localStorage.setItem('gemini_api_key', {_gk});
+    </script>
+    """, height=0)
+
     st.divider()
 
     corp_input = st.text_area(
