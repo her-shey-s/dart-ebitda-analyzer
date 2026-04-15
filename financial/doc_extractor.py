@@ -229,6 +229,7 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
     머리 5행을 탐색 대상으로 한다.
     """
     header_rows = rows[:5]
+    max_cols = max((len(r) for r in rows), default=0)
 
     # 1. "당기" 직접 매칭
     for header in header_rows:
@@ -251,7 +252,8 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                     for cj in range(ci + 1, min(search_end, len(sub_header))):
                         snorm = sub_header[cj].replace(" ", "").strip()
                         if snorm in ("합계", "총계"):
-                            return cj
+                            offset = max_cols - len(sub_header)
+                            return cj + max(offset, 0)
                 return ci
 
     # 2. "제 N 기" 패턴 — 가장 큰 N

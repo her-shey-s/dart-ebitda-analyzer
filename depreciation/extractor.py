@@ -257,6 +257,9 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
     머리 5행을 탐색 대상으로 한다 (DART CF는 종종 preamble 행이 있음).
     """
     header_rows = rows[:5]
+    # rowspan으로 인해 헤더 행이 데이터 행보다 짧을 수 있으므로
+    # 최대 컬럼 수를 기준으로 offset을 보정한다.
+    max_cols = max((len(r) for r in rows), default=0)
 
     # 1. "당기" 직접 매칭
     for header in header_rows:
@@ -281,7 +284,9 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                     for cj in range(ci + 1, min(search_end, len(sub_header))):
                         snorm = sub_header[cj].replace(" ", "").strip()
                         if snorm in ("합계", "총계"):
-                            return cj
+                            # rowspan으로 빠진 셀 수만큼 보정
+                            offset = max_cols - len(sub_header)
+                            return cj + max(offset, 0)
                 return ci
 
     # 2. "제 N 기" 패턴 — 가장 큰 N
