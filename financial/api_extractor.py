@@ -158,6 +158,8 @@ def fetch_full_financial_statement(
         requests.HTTPError: HTTP 오류
         ValueError: API 상태 코드가 000이 아닐 때 (데이터 없음 포함)
     """
+    if not get_dart_api_key():
+        raise RuntimeError("DART API 키가 설정되지 않았습니다.")
     params = {
         "crtfc_key":  get_dart_api_key(),
         "corp_code":  corp_code,

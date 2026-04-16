@@ -156,6 +156,9 @@ def _fetch_disclosures(
     Raises:
         requests.HTTPError: HTTP 레벨 오류 시
     """
+    if not get_dart_api_key():
+        raise RuntimeError("DART API 키가 설정되지 않았습니다.")
+
     params = {
         "crtfc_key":        get_dart_api_key(),
         "corp_code":        corp_code,
@@ -230,6 +233,8 @@ def get_document_index(rcept_no: str) -> list[dict]:
     Raises:
         requests.HTTPError: HTTP 레벨 오류 시
     """
+    if not get_dart_api_key():
+        raise RuntimeError("DART API 키가 설정되지 않았습니다.")
     params = {"crtfc_key": get_dart_api_key(), "rcept_no": rcept_no}
     resp = requests.get(DART_ENDPOINTS["doc_index"], params=params, timeout=REQUEST_TIMEOUT)
     resp.raise_for_status()

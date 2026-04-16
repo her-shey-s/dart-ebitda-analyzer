@@ -31,6 +31,8 @@ def download_dart_document(rcept_no: str) -> Optional[bytes]:
     Returns:
         XML 파일 bytes 또는 None (다운로드/압축 오류 시)
     """
+    if not get_dart_api_key():
+        return None
     try:
         resp = requests.get(
             _DOCUMENT_API_URL,
@@ -70,6 +72,8 @@ def download_all_dart_documents(rcept_no: str) -> list[bytes]:
     Returns:
         XML bytes 리스트 (크기 내림차순). 실패 시 빈 리스트.
     """
+    if not get_dart_api_key():
+        return []
     try:
         resp = requests.get(
             _DOCUMENT_API_URL,

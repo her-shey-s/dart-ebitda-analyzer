@@ -199,6 +199,8 @@ def get_company_info(corp_code: str) -> dict:
         requests.HTTPError: API 오류 시
         ValueError: API가 오류 상태 코드를 반환할 때
     """
+    if not get_dart_api_key():
+        raise RuntimeError("DART API 키가 설정되지 않았습니다.")
     resp = requests.get(
         DART_ENDPOINTS["company_info"],
         params={"crtfc_key": get_dart_api_key(), "corp_code": corp_code},
