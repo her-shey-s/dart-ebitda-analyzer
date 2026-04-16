@@ -23,8 +23,8 @@ import requests
 from config import get_dart_api_key, DART_ENDPOINTS, REQUEST_TIMEOUT
 
 # ── 공시 목록 API 재시도 설정 ─────────────────────────────────────────────────
-_DISCO_MAX_RETRIES = 3
-_DISCO_RETRY_WAIT = 5   # 초 (base), 실제 대기: base × attempt
+_DISCO_MAX_RETRIES = 2
+_DISCO_RETRY_WAIT = 3   # 초 (base), 실제 대기: base × attempt
 
 
 # ── 공시 목록 API용 코드 (list.json) ─────────────────────────────────────

@@ -106,9 +106,9 @@ def download_corp_codes(force: bool = False) -> pd.DataFrame:
     #   - DART 접속 가능 시 연결 자체는 수 초면 충분
     #   - 콜드스타트 DNS/TLS 지연은 재시도로 해소
     #   - 5회 × 15s connect = 최대 ~75s (기존 5회 × 60s = ~300s)
-    _DL_TIMEOUT = (15, 180)   # (connect 15초, read 180초)
-    _DL_MAX_RETRIES = 5
-    _DL_RETRY_WAIT = 3        # 초 (base), 실제: 3, 6, 9, 12초
+    _DL_TIMEOUT = (10, 60)    # (connect 10초, read 60초)
+    _DL_MAX_RETRIES = 3
+    _DL_RETRY_WAIT = 2        # 초 (base), 실제: 2, 4초
 
     for attempt in range(_DL_MAX_RETRIES):
         try:
