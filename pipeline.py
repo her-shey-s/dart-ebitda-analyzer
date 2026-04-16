@@ -168,6 +168,14 @@ def analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
     except Exception as e:
         log("DEPR", f"감가상각 추출 실패: {e}")
 
+    # 4-C. 비용 항목 절댓값 보정
+    # 일부 보고서는 비용을 음수로 표기하므로 항상 양수로 통일한다.
+    for cost_key in ("매출원가", "감가상각비", "무형자산상각비"):
+        v = base["items"].get(cost_key)
+        if v is not None and v < 0:
+            base["items"][cost_key] = abs(v)
+            log("NORMALIZE", f"{cost_key}: 음수→양수 보정 ({v} → {abs(v)})")
+
     # 5. 검증 (회계 항등식)
     log("VALIDATE", "검증 시작")
     try:
