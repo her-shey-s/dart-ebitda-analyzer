@@ -61,19 +61,22 @@ def _wait_if_rate_limited(log_fn=None) -> None:
     _call_count += 1
 
 
-def _generate(client, prompt: str) -> Optional[str]:
+def _generate(client, prompt: str, log_fn=None) -> Optional[str]:
     """
     Gemini로 텍스트를 생성하고 응답 문자열을 반환한다.
 
     분당 _RATE_LIMIT_RPM회 호출 후 _RATE_LIMIT_WAIT초 대기한다.
+    503 UNAVAILABLE 시 GEMINI_FALLBACK_MODEL로 자동 재시도.
 
     Args:
         client: _get_client() 반환값
         prompt: 프롬프트 문자열
+        log_fn: 로그 콜백 (tag, message) → None (선택)
 
     Returns:
         응답 텍스트 또는 None (오류 시)
     """
+    _log = log_fn or (lambda tag, msg: None)
     _wait_if_rate_limited()
     for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
         try:
@@ -81,10 +84,12 @@ def _generate(client, prompt: str) -> Optional[str]:
                 model=model,
                 contents=prompt,
             )
+            _log("AI", f"    모델 사용: {model}")
             return response.text.strip()
         except Exception as e:
             err_str = str(e)
             if ("503" in err_str or "UNAVAILABLE" in err_str) and model != GEMINI_FALLBACK_MODEL:
+                _log("AI", f"    {model} → 503 UNAVAILABLE, fallback → {GEMINI_FALLBACK_MODEL}")
                 continue
             raise RuntimeError(f"Gemini API 호출 실패 ({model}): {e}") from e
 
@@ -168,7 +173,7 @@ def _build_adjudication_prompt(
     )
 
 
-def ai_extract_items(table_text: str) -> dict[str, Optional[float]]:
+def ai_extract_items(table_text: str, log_fn=None) -> dict[str, Optional[float]]:
     """
     재무제표 원문 테이블 텍스트에서 AI로 9개 항목을 독립 추출한다.
 
@@ -176,6 +181,7 @@ def ai_extract_items(table_text: str) -> dict[str, Optional[float]]:
 
     Args:
         table_text: _extract_table_text_for_ai() 반환값
+        log_fn: 로그 콜백 (tag, message) → None (선택)
 
     Returns:
         {항목명: 금액(float) | None, ...}
@@ -188,7 +194,7 @@ def ai_extract_items(table_text: str) -> dict[str, Optional[float]]:
         raise RuntimeError("Gemini API 키가 설정되지 않았습니다.")
 
     prompt = _build_extraction_prompt(table_text)
-    raw = _generate(client, prompt)
+    raw = _generate(client, prompt, log_fn=log_fn)
     parsed = _parse_json(raw)
     if parsed is None:
         raise RuntimeError(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
@@ -256,6 +262,7 @@ def ai_adjudicate(
     python_items: dict[str, Optional[float]],
     ai_items: dict[str, Optional[float]],
     disagreements: dict[str, tuple],
+    log_fn=None,
 ) -> dict[str, Optional[float]]:
     """
     Python vs AI 불일치 항목에 대해 AI가 원문을 보고 올바른 값을 판정한다.
@@ -267,6 +274,7 @@ def ai_adjudicate(
         python_items:  Python 파싱 결과
         ai_items:      AI 1회차 추출 결과
         disagreements: _compare_results() 반환값
+        log_fn: 로그 콜백 (tag, message) → None (선택)
 
     Returns:
         최종 병합 결과 {항목명: 금액(float) | None}
@@ -282,7 +290,7 @@ def ai_adjudicate(
     # 편향 방지: A/B를 랜덤하게 배정하지 않고 고정 (Python=A, AI=B)
     # → 프롬프트에는 어느 쪽이 Python/AI인지 명시하지 않음
     prompt = _build_adjudication_prompt(table_text, disagreements)
-    raw = _generate(client, prompt)
+    raw = _generate(client, prompt, log_fn=log_fn)
     parsed = _parse_json(raw)
     if parsed is None:
         raise RuntimeError(f"AI 판정 응답 JSON 파싱 실패: {raw[:300]}")
@@ -346,7 +354,7 @@ def extract_with_ai_comparison(
     _log("AI", "    AI 1회차: 독립 추출 호출...")
     t0 = time.perf_counter()
     try:
-        ai_items = ai_extract_items(table_text)
+        ai_items = ai_extract_items(table_text, log_fn=log_fn)
     except RuntimeError as e:
         elapsed = time.perf_counter() - t0
         _log("AI", f"    AI 1회차 실패 ({elapsed:.2f}초): {e}")
@@ -372,7 +380,7 @@ def extract_with_ai_comparison(
     _log("AI", "    AI 2회차: 판정 호출...")
     t0 = time.perf_counter()
     try:
-        final_items = ai_adjudicate(table_text, python_items, ai_items, disagreements)
+        final_items = ai_adjudicate(table_text, python_items, ai_items, disagreements, log_fn=log_fn)
     except RuntimeError as e:
         elapsed = time.perf_counter() - t0
         _log("AI", f"    AI 2회차 실패 ({elapsed:.2f}초): {e}")
@@ -397,6 +405,7 @@ def extract_with_ai_comparison(
 def extract_from_raw_text(
     table_text: str,
     missing_items: list[str],
+    log_fn=None,
 ) -> dict[str, Optional[float]]:
     """
     재무제표 테이블 텍스트에서 Gemini Flash로 항목을 재추출한다.
@@ -427,7 +436,7 @@ def extract_from_raw_text(
     )
 
     try:
-        raw = _generate(client, prompt)
+        raw = _generate(client, prompt, log_fn=log_fn)
     except RuntimeError:
         return {}
 

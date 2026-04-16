@@ -710,7 +710,7 @@ def _build_ai_prompt(tables_text: str, guide_text: str, hint: str = "") -> str:
     )
 
 
-def _ai_select_depreciation(tables: list[dict]) -> dict:
+def _ai_select_depreciation(tables: list[dict], log_fn=None) -> dict:
     """
     AI(Gemini)에게 감가상각비·무형자산상각비의 올바른 위치를 선택하게 한다.
 
@@ -759,7 +759,7 @@ def _ai_select_depreciation(tables: list[dict]) -> dict:
 
     guide_text = _load_depreciation_ai_guide()
     prompt = _build_ai_prompt(combined_text, guide_text, hint=hint)
-    raw = _generate(client, prompt)
+    raw = _generate(client, prompt, log_fn=log_fn)
     parsed = _parse_json(raw)
     if parsed is None:
         raise RuntimeError(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
@@ -1257,6 +1257,7 @@ def extract_depreciation(
     rcept_no: str,
     fs_div: str = "CFS",
     strict_scope: bool = True,
+    log_fn=None,
 ) -> dict:
     """
     DART 보고서에서 감가상각비·무형자산상각비를 추출한다.
@@ -1422,7 +1423,7 @@ def extract_depreciation(
     notes_result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None, "combined": False}
 
     try:
-        ai_selection = _ai_select_depreciation(tables)
+        ai_selection = _ai_select_depreciation(tables, log_fn=log_fn)
         base["ai_selection"] = ai_selection
         trace.append(
             f"[NOTES] AI 선택 결과: depreciation={ai_selection.get('depreciation')}, "

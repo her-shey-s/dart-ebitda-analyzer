@@ -148,6 +148,7 @@ def analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
             report["rcept_no"],
             fs_div=base.get("fs_div", "CFS"),
             strict_scope=(report["path"] == "A"),
+            log_fn=log,
         )
         base["depreciation_trace"] = depr_result.get("trace", [])
         depr_items = depr_result.get("items", {})
