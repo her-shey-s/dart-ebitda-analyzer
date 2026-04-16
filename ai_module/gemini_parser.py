@@ -14,7 +14,7 @@ import re
 import time
 from typing import Optional
 
-from config import FINANCIAL_ITEMS, get_gemini_api_key, GEMINI_MODEL
+from config import FINANCIAL_ITEMS, get_gemini_api_key, GEMINI_MODEL, GEMINI_FALLBACK_MODEL
 
 # ── Rate limit 설정 ──────────────────────────────────────────────────────
 _RATE_LIMIT_RPM = 15          # 분당 최대 호출 횟수
@@ -75,14 +75,18 @@ def _generate(client, prompt: str) -> Optional[str]:
         응답 텍스트 또는 None (오류 시)
     """
     _wait_if_rate_limited()
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        return response.text.strip()
-    except Exception as e:
-        raise RuntimeError(f"Gemini API 호출 실패 ({GEMINI_MODEL}): {e}") from e
+    for model in (GEMINI_MODEL, GEMINI_FALLBACK_MODEL):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            return response.text.strip()
+        except Exception as e:
+            err_str = str(e)
+            if ("503" in err_str or "UNAVAILABLE" in err_str) and model != GEMINI_FALLBACK_MODEL:
+                continue
+            raise RuntimeError(f"Gemini API 호출 실패 ({model}): {e}") from e
 
 
 def _parse_json(text: str) -> Optional[dict]:
