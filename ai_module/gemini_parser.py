@@ -140,7 +140,11 @@ def _build_extraction_prompt(table_text: str) -> str:
         "다음 항목들의 '당기' 금액을 원(KRW) 단위 숫자로 추출해라.\n"
         "괄호 표기 (예: (1,234))는 음수를 의미한다.\n"
         "감가상각비·무형자산상각비는 [CF](현금흐름표)의 영업활동 조정항목에서 찾아라.\n"
-        "찾을 수 없는 항목은 null로 표시해라.\n"
+        "**중요**: 매출총이익·영업이익·당기순이익 같은 소계(subtotal) 항목도 손익계산서에 "
+        "별도 행으로 표시되어 있으면 그 표시 금액을 그대로 추출해라. "
+        "다른 항목에서 계산된 derived 값이라는 이유로 건너뛰지 마라. "
+        "매출원가·판관비처럼 차감 항목으로 들여쓰기/괄호로 표시된 항목도 별도 행으로 표시되어 있으면 추출해라.\n"
+        "행 자체가 보고서에 존재하지 않을 때만 null로 표시해라.\n"
         "JSON으로만 응답해라. 다른 텍스트 없이.\n\n"
         f"추출 항목:\n{item_list}\n\n"
         f"응답 형식:\n"
@@ -164,7 +168,13 @@ def _build_adjudication_prompt(
     return (
         "아래 재무제표 원문을 두 가지 방법으로 추출했더니 결과가 다르다.\n"
         "원문을 직접 확인하여 각 항목의 올바른 '당기' 금액을 판정해라.\n"
-        "금액은 원(KRW) 단위 숫자, 괄호는 음수, 찾을 수 없으면 null.\n"
+        "금액은 원(KRW) 단위 숫자, 괄호는 음수로 해석해라.\n"
+        "**판정 원칙**:\n"
+        "- 추출A/추출B 중 하나가 원문의 해당 행과 일치하면 그 값을 채택해라.\n"
+        "- 매출총이익·영업이익·당기순이익 같은 소계 항목과 매출원가·판관비 같은 "
+        "차감 항목도 손익계산서에 별도 행으로 표시되어 있으면 그 표시 금액을 채택해라. "
+        "derived(계산) 항목이라는 이유로 null로 답하지 마라.\n"
+        "- null은 해당 행 자체가 원문에 존재하지 않을 때만 사용해라.\n"
         "JSON으로만 응답해라.\n\n"
         f"불일치 항목:\n{diff_text}\n\n"
         f"응답 형식:\n"
@@ -300,10 +310,19 @@ def ai_adjudicate(
     for name in disagreements:
         val = parsed.get(name)
         try:
-            final[name] = float(val) if val is not None else None
+            adjudicated = float(val) if val is not None else None
         except (TypeError, ValueError):
-            # 판정 실패 시 AI 1회차 결과 사용 (Python보다 원문 기반)
-            final[name] = ai_items.get(name)
+            # 판정 응답 파싱 실패 시 AI 1회차 결과 사용 (Python보다 원문 기반)
+            adjudicated = ai_items.get(name)
+
+        # 방어: AI가 null을 냈지만 Python에는 값이 있을 때는 Python 값 유지.
+        # Python은 라벨 정확 일치로 매칭하므로 false positive가 거의 없는 반면,
+        # 작은 AI 모델은 매출총이익 같은 소계/derived 항목을 "데이터가 아니다"라고
+        # 자주 잘못 분류한다. AI의 hesitation이 Python의 정상 추출을 덮지 않게 한다.
+        if adjudicated is None and python_items.get(name) is not None:
+            adjudicated = python_items[name]
+
+        final[name] = adjudicated
 
     return final
 
