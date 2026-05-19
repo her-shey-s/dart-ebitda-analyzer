@@ -17,6 +17,7 @@ import pickle
 import time
 import zipfile
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import requests
@@ -213,6 +214,26 @@ def get_company_info(corp_code: str) -> dict:
         raise ValueError(f"DART API 오류: {data.get('message', '알 수 없는 오류')}")
 
     return data
+
+
+def get_company_info_batch(corp_codes: list[str]) -> dict[str, dict]:
+    """여러 corp_code의 기업정보를 병렬로 조회한다.
+
+    실패한 코드는 결과에서 누락되므로, 호출자는 .get()으로 안전하게 접근해야 한다.
+    """
+    if not corp_codes:
+        return {}
+
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(get_company_info, code): code for code in corp_codes}
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                results[code] = future.result()
+            except Exception:
+                pass
+    return results
 
 
 # ── 하위 호환 별칭 (app.py에서 사용 중) ────────────────────────────────────

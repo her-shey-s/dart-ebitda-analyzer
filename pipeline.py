@@ -18,9 +18,17 @@ from utils.cache import get_cache, make_cache_key, set_cache
 from validator.rules import validate
 
 
-def analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
+def analyze_one(
+    corp_name: str,
+    year: int,
+    use_cache: bool,
+    corp_code_override: str | None = None,
+) -> dict:
     """
     기업명·연도 1쌍에 대한 전체 파이프라인을 실행하여 결과 딕셔너리를 반환한다.
+
+    corp_code_override가 지정되면 기업명 검색을 건너뛰고 해당 코드를 사용한다
+    (동명 법인 중 사용자가 특정 회사를 선택한 경우).
 
     반환 키:
         corp_name, year, corp_code, path, report_nm, report_type, fs_div,
@@ -52,38 +60,43 @@ def analyze_one(corp_name: str, year: int, use_cache: bool) -> dict:
         result["analysis_log"] = logger.get_lines()
         return result
 
-    # 1. corp_code 조회 (동일 기업명 다수 시 추출 중단)
-    log("CORP", "기업코드 조회 시작")
-    try:
-        all_corps = search_corp(corp_name)
-    except Exception as e:
-        log("CORP", f"기업코드 조회 실패: {e}")
-        return _finish({
-            **base,
-            "status": "error",
-            "error_msg": f"DART API 연결 실패 — 잠시 후 다시 시도해 주세요. ({type(e).__name__})",
-        })
-    exact_corps = all_corps[all_corps["corp_name"] == corp_name]
+    # 1. corp_code 조회 (override가 지정되면 검색 스킵)
+    if corp_code_override:
+        corp_code = corp_code_override
+        base["corp_code"] = corp_code
+        log("CORP", f"corp_code 지정됨: {corp_code} (사용자가 동명 법인 중 선택)")
+    else:
+        log("CORP", "기업코드 조회 시작")
+        try:
+            all_corps = search_corp(corp_name)
+        except Exception as e:
+            log("CORP", f"기업코드 조회 실패: {e}")
+            return _finish({
+                **base,
+                "status": "error",
+                "error_msg": f"DART API 연결 실패 — 잠시 후 다시 시도해 주세요. ({type(e).__name__})",
+            })
+        exact_corps = all_corps[all_corps["corp_name"] == corp_name]
 
-    if exact_corps.empty:
-        hint = ""
-        if not all_corps.empty:
-            names = all_corps["corp_name"].head(3).tolist()
-            hint = f" (유사: {', '.join(names)})"
-        log("CORP", f"기업 미발견{hint}")
-        return _finish({**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"})
+        if exact_corps.empty:
+            hint = ""
+            if not all_corps.empty:
+                names = all_corps["corp_name"].head(3).tolist()
+                hint = f" (유사: {', '.join(names)})"
+            log("CORP", f"기업 미발견{hint}")
+            return _finish({**base, "status": "no_corp", "error_msg": f"기업 미발견{hint}"})
 
-    if len(exact_corps) > 1:
-        log("CORP", f"동일 기업명 {len(exact_corps)}개 존재")
-        return _finish({
-            **base,
-            "status": "ambiguous_corp",
-            "error_msg": f"동일 기업명 {len(exact_corps)}개 존재 — 재무데이터를 특정할 수 없습니다.",
-        })
+        if len(exact_corps) > 1:
+            log("CORP", f"동일 기업명 {len(exact_corps)}개 존재")
+            return _finish({
+                **base,
+                "status": "ambiguous_corp",
+                "error_msg": f"동일 기업명 {len(exact_corps)}개 존재 — 재무데이터를 특정할 수 없습니다.",
+            })
 
-    corp_code = exact_corps.iloc[0]["corp_code"]
-    base["corp_code"] = corp_code
-    log("CORP", f"기업코드 발견: {corp_code}")
+        corp_code = exact_corps.iloc[0]["corp_code"]
+        base["corp_code"] = corp_code
+        log("CORP", f"기업코드 발견: {corp_code}")
 
     # 2. 캐시 확인
     cache_key = make_cache_key(corp_code, str(year))

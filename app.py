@@ -17,6 +17,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from config import FINANCIAL_ITEMS, get_gemini_api_key
+from dart_api.corp_search import get_company_info_batch, search_corp
 from pipeline import analyze_one as _analyze_one
 from utils.analysis_logger import format_amount
 from utils.cache import clear_all_cache, purge_expired
@@ -616,6 +617,102 @@ with st.sidebar:
 
 st.header("DART 재무 데이터 분석기")
 
+# ── 동명 법인 감지 / 분석 실행 헬퍼 ──────────────────────────────────────────
+
+_CORP_CLS_LABEL = {"Y": "유가증권", "K": "코스닥", "N": "코넥스", "E": "기타"}
+
+
+def _detect_ambiguities(corps_list: list[str]) -> dict[str, list[dict]]:
+    """동일 법인명이 2개 이상인 경우 후보 정보를 모아 반환한다.
+
+    반환: {corp_name: [{corp_code, stock_code, corp_cls, ceo_nm, adres, induty_code}, ...]}
+    """
+    info_cache: dict = st.session_state.setdefault("corp_info_cache", {})
+    ambiguities: dict[str, list[dict]] = {}
+    seen: set[str] = set()
+
+    for name in corps_list:
+        if name in seen or name in ambiguities:
+            continue
+        seen.add(name)
+        try:
+            df = search_corp(name)
+        except Exception:
+            continue
+        exact = df[df["corp_name"] == name].reset_index(drop=True)
+        if len(exact) <= 1:
+            continue
+
+        codes = exact["corp_code"].tolist()
+        missing = [c for c in codes if c not in info_cache]
+        if missing:
+            fetched = get_company_info_batch(missing)
+            info_cache.update(fetched)
+
+        rows: list[dict] = []
+        for _, row in exact.iterrows():
+            info = info_cache.get(row["corp_code"], {}) or {}
+            rows.append({
+                "corp_code":   row["corp_code"],
+                "corp_name":   row["corp_name"],
+                "stock_code":  row.get("stock_code") or "",
+                "corp_cls":    info.get("corp_cls", ""),
+                "ceo_nm":      info.get("ceo_nm", ""),
+                "adres":       info.get("adres", ""),
+                "induty_code": info.get("induty_code", ""),
+                "est_dt":      info.get("est_dt", ""),
+            })
+        ambiguities[name] = rows
+
+    return ambiguities
+
+
+def _execute_analysis(
+    corps_list: list[str],
+    years_list: list[int],
+    use_cache_flag: bool,
+    overrides: Optional[dict[str, str]] = None,
+) -> None:
+    """corps × years 곱집합에 대해 분석을 실행한다.
+
+    overrides: {corp_name: corp_code} — 동명 법인 중 사용자가 선택한 corp_code.
+    """
+    overrides = overrides or {}
+    purge_expired()
+    tasks = list(product(corps_list, sorted(years_list)))
+    total = len(tasks)
+
+    progress_bar = st.progress(0, text="분석 준비 중...")
+    status_text = st.empty()
+
+    results: list[dict] = []
+    all_logs: list[str] = []
+    for i, (corp_name, year) in enumerate(tasks):
+        status_text.markdown(f"**처리 중** ({i + 1}/{total}): `{corp_name}` {year}년")
+        result = _analyze_one(
+            corp_name, year, use_cache_flag,
+            corp_code_override=overrides.get(corp_name),
+        )
+        all_logs.extend(result.get("analysis_log", []))
+        all_logs.append("")
+        results.append(result)
+        progress_bar.progress((i + 1) / total, text=f"{i + 1}/{total} 완료")
+
+    progress_bar.empty()
+    status_text.empty()
+    st.session_state.results = results
+    st.session_state.analysis_logs = all_logs
+    st.success(f"✓ {total}건 분석 완료 (성공: {sum(1 for r in results if r['status'] == 'ok')}건)")
+
+
+def _clear_disambig_state() -> None:
+    """동명 법인 선택 관련 세션 상태를 모두 정리한다."""
+    st.session_state.pending_analysis = None
+    for k in list(st.session_state.keys()):
+        if k.startswith("disambig_"):
+            del st.session_state[k]
+
+
 # ── 분석 실행 ─────────────────────────────────────────────────────────────────
 if analyze_btn:
     corps = [c.strip() for c in corp_input.splitlines() if c.strip()][:100]
@@ -626,28 +723,96 @@ if analyze_btn:
     elif not years_selected:
         st.warning("분석 연도를 선택하세요.")
     else:
-        purge_expired()
-        tasks = list(product(corps, sorted(years_selected)))
-        total = len(tasks)
+        with st.spinner("동명 법인 확인 중..."):
+            ambiguities = _detect_ambiguities(corps)
 
-        progress_bar = st.progress(0, text="분석 준비 중...")
-        status_text  = st.empty()
+        if ambiguities:
+            _clear_disambig_state()
+            st.session_state.pending_analysis = {
+                "corps": corps,
+                "years": years_selected,
+                "use_cache": use_cache,
+                "ambiguities": ambiguities,
+            }
+            st.rerun()
+        else:
+            _clear_disambig_state()
+            _execute_analysis(corps, years_selected, use_cache)
 
-        results: list[dict] = []
-        all_logs: list[str] = []
-        for i, (corp_name, year) in enumerate(tasks):
-            status_text.markdown(f"**처리 중** ({i + 1}/{total}): `{corp_name}` {year}년")
-            result = _analyze_one(corp_name, year, use_cache)
-            all_logs.extend(result.get("analysis_log", []))
-            all_logs.append("")  # 기업/연도 사이 빈 줄 구분
-            results.append(result)
-            progress_bar.progress((i + 1) / total, text=f"{i + 1}/{total} 완료")
 
-        progress_bar.empty()
-        status_text.empty()
-        st.session_state.results = results
-        st.session_state.analysis_logs = all_logs
-        st.success(f"✓ {total}건 분석 완료 (성공: {sum(1 for r in results if r['status'] == 'ok')}건)")
+# ── 동명 법인 선택 UI ────────────────────────────────────────────────────────
+if st.session_state.get("pending_analysis"):
+    pending = st.session_state.pending_analysis
+    amb_data: dict[str, list[dict]] = pending["ambiguities"]
+
+    st.warning(
+        f"⚠️ 동일 법인명 {len(amb_data)}건이 발견되었습니다. "
+        "각 회사를 정확히 지정해 주세요."
+    )
+
+    for amb_name, candidates in amb_data.items():
+        st.markdown(f"#### 「{amb_name}」 — {len(candidates)}개 후보")
+
+        labels: list[str] = []
+        for c in candidates:
+            stock = c.get("stock_code") or ""
+            stock_disp = f"종목 {stock}" if stock else "비상장"
+            cls = c.get("corp_cls") or ""
+            cls_disp = _CORP_CLS_LABEL.get(cls, cls or "-")
+            ceo = c.get("ceo_nm") or "-"
+            adres = c.get("adres") or "-"
+            labels.append(
+                f"{stock_disp} [{cls_disp}] · 대표 {ceo} · {adres} "
+                f"(corp_code: {c['corp_code']})"
+            )
+
+        st.radio(
+            "회사 선택",
+            options=list(range(len(labels))),
+            format_func=lambda i, _l=labels: _l[i],
+            key=f"disambig_{amb_name}",
+            index=None,
+        )
+
+        with st.expander("상세 정보 표 보기"):
+            st.dataframe(
+                pd.DataFrame(candidates),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.divider()
+
+    selections: dict[str, str] = {}
+    for amb_name, candidates in amb_data.items():
+        sel_idx = st.session_state.get(f"disambig_{amb_name}")
+        if sel_idx is not None:
+            selections[amb_name] = candidates[sel_idx]["corp_code"]
+
+    all_selected = len(selections) == len(amb_data)
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if st.button(
+            "✓ 선택 완료, 분석 진행",
+            type="primary",
+            disabled=not all_selected,
+            use_container_width=True,
+        ):
+            corps_to_run = pending["corps"]
+            years_to_run = pending["years"]
+            use_cache_to_run = pending["use_cache"]
+            chosen = dict(selections)
+            _clear_disambig_state()
+            _execute_analysis(
+                corps_to_run, years_to_run, use_cache_to_run,
+                overrides=chosen,
+            )
+            st.rerun()
+    with col_b:
+        if st.button("취소", use_container_width=True):
+            _clear_disambig_state()
+            st.rerun()
 
 # ── 결과 표시 ─────────────────────────────────────────────────────────────────
 if st.session_state.results:
