@@ -399,49 +399,37 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
         raw_rows = []
         for r in results:
             items = r.get("items", {})
-            ai_comp = r.get("ai_comparison")
 
             row = {
                 "기업명":       r["corp_name"],
                 "연도":         r["year"],
                 "corp_code":   r.get("corp_code", "-"),
-                "재무제표기준": _fs_label(r),
-                "경로":         r["path"],
-                "보고서":       r.get("report_nm", "-"),
-                "처리상태":     r["status"],
-                "처리상세":     _processing_status_detail(r),
                 "검증":         _validation_status_label(r, use_icon=False),
-                "검증상세":     _format_validation_detail(r),
-                "AI비교결과":   (ai_comp or {}).get("source", ""),
-                "AI불일치항목": ", ".join((ai_comp or {}).get("disagreements", {}).keys()),
+                "재무제표기준": _fs_label(r),
             }
             for item in FINANCIAL_ITEMS:
                 row[item["name"]] = items.get(item["name"])
             row["비고"] = r.get("remarks", "")
-            row["감가상각추적라인수"] = len(r.get("depreciation_trace", []) or [])
-            row["감가상각추적TXT"] = (
-                _depreciation_trace_filename(r)
-                if r.get("depreciation_trace")
-                else ""
-            )
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
         ws_raw = writer.sheets["원본(원단위)"]
         _apply_number_format(ws_raw, df_raw)
-        ws_raw.column_dimensions["A"].width = 16
-        ws_raw.column_dimensions["B"].width = 10
-        ws_raw.column_dimensions["C"].width = 12
-        ws_raw.column_dimensions["D"].width = 14
-        ws_raw.column_dimensions["E"].width = 8
-        ws_raw.column_dimensions["F"].width = 24
-        ws_raw.column_dimensions["G"].width = 12
-        ws_raw.column_dimensions["H"].width = 55
-        ws_raw.column_dimensions["I"].width = 22
-        ws_raw.column_dimensions["J"].width = 90
-        ws_raw.column_dimensions["K"].width = 26
-        for row in ws_raw.iter_rows(min_row=2, min_col=6, max_col=10):
-            for cell in row:
+        ws_raw.column_dimensions["A"].width = 16  # 기업명
+        ws_raw.column_dimensions["B"].width = 10  # 연도
+        ws_raw.column_dimensions["C"].width = 12  # corp_code
+        ws_raw.column_dimensions["D"].width = 22  # 검증
+        ws_raw.column_dimensions["E"].width = 14  # 재무제표기준
+        # F~P: 재무 항목 11개 (numeric)
+        from openpyxl.utils import get_column_letter
+        for i in range(len(FINANCIAL_ITEMS)):
+            ws_raw.column_dimensions[get_column_letter(6 + i)].width = 16
+        # 마지막: 비고
+        비고_col = get_column_letter(6 + len(FINANCIAL_ITEMS))
+        ws_raw.column_dimensions[비고_col].width = 60
+        # 검증·비고 컬럼은 줄바꿈 허용
+        for col_letter in ("D", 비고_col):
+            for cell in ws_raw[col_letter]:
                 cell.alignment = Alignment(vertical="top", wrap_text=True)
 
     return buf.getvalue()
