@@ -356,6 +356,10 @@ def _has_exclude_keywords(rows: list[list[str]]) -> bool:
 
 # 정확 매칭 대상 라벨 (행 첫 셀이 이 값과 정확히 일치해야 함)
 _EXACT_DEPR_LABELS = {"감가상각비", "감가상각비용"}
+_EXACT_ROU_AMORT_LABELS = {
+    "사용권자산상각비", "사용권자산상각비용", "사용권자산상각",
+    "사용권자산감가상각비", "사용권자산감가상각비용", "사용권자산감가상각",
+}
 _EXACT_AMORT_LABELS = {"무형자산상각비", "무형자산상각비용", "무형자산상각"}
 
 # 섹션 제목 블랙리스트 (부분값 테이블)
@@ -687,25 +691,30 @@ def _build_ai_prompt(tables_text: str, guide_text: str, hint: str = "") -> str:
         f"{guide_text}\n\n"
         f"{hint}"
         "아래는 한국 기업 감사보고서의 주석(Notes)에서 감가상각 관련 테이블을 발췌한 것이다.\n"
-        "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비와 무형자산상각비가 있는\n"
+        "EBITDA 계산에 필요한 **전체 비용 기준(회사 전체)** 감가상각비·사용권자산상각비·무형자산상각비가 있는\n"
         "**테이블과 행의 위치**를 선택해라. 숫자를 직접 읽지 마라.\n\n"
         "## 주의사항\n"
         "- '비용의 성격별 분류' 또는 '현금흐름표 조정항목' 기준의 **전체(회사 전체)** 감가상각비를 찾아라.\n"
         "- **'판매비와 관리비' 주석의 감가상각비는 판관비 내 부분값이므로 절대 선택하지 마라.**\n"
-        "- 특정 자산(유형자산, 투자부동산, 사용권자산)만의 감가상각은 부분값이므로 선택하지 마라.\n"
+        "- '유형자산', '투자부동산'의 **자산 내역(취득원가/누계액) 테이블** 안에 있는 감가상각은 부분값이므로 선택하지 마라.\n"
+        "- 단, 비용의 성격별 분류·CF 조정항목 테이블에서 회사 전체 비용을 '감가상각비', "
+        "'사용권자산상각비', '무형자산상각비'로 분리 기재한 경우에는 각각을 별도 행으로 선택해라.\n"
         "- 감가상각누계액(누적값)은 당기 비용이 아니므로 선택하지 마라.\n"
         "- 이연법인세 관련 감가상각비는 완전히 다른 맥락이므로 선택하지 마라.\n"
-        "- 분리 기재(감가상각비, 무형자산상각비 각각 별도 행)가 있으면 분리를 선택해라.\n"
-        "- 합산 기재만 있으면 합산을 선택하고 combined=true로 표시해라.\n"
-        "- 찾을 수 없으면 null로 표시해라.\n\n"
+        "- 분리 기재(감가상각비/사용권자산상각비/무형자산상각비 각각 별도 행)가 있으면 분리를 선택해라.\n"
+        "- 사용권자산상각비는 분리 기재된 경우에만 선택. 회사가 감가상각비에 통합 기재한 경우 null.\n"
+        "- 합산 기재('감가상각비 및 무형자산상각비')만 있으면 combined=true로 표시.\n"
+        "- 찾을 수 없으면 해당 항목을 null로 표시.\n\n"
         "JSON으로만 응답해라:\n"
         "```json\n"
         '{\n'
         '  "depreciation": {"table_id": "Tn", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"},\n'
+        '  "rou_amortization": {"table_id": "Tn", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"},\n'
         '  "amortization": {"table_id": "Tn", "row_id": "Rn", "row_label": "행 라벨", "reason": "선택 이유"},\n'
         '  "combined": false\n'
         '}\n'
-        "```\n\n"
+        "```\n"
+        "값이 없으면 해당 키를 null로 둬라 (예: \"rou_amortization\": null).\n\n"
         f"주석 테이블:\n---\n{tables_text}\n---"
     )
 
@@ -721,8 +730,9 @@ def _ai_select_depreciation(tables: list[dict], log_fn=None) -> dict:
 
     Returns:
         {
-            "depreciation": {"table_id": "Tn", "row_id": "Rn", "row_label": str, "reason": str} | None,
-            "amortization": {"table_id": "Tn", "row_id": "Rn", "row_label": str, "reason": str} | None,
+            "depreciation":     {"table_id": ..., "row_id": ..., "row_label": str, "reason": str} | None,
+            "rou_amortization": {"table_id": ..., "row_id": ..., "row_label": str, "reason": str} | None,
+            "amortization":     {"table_id": ..., "row_id": ..., "row_label": str, "reason": str} | None,
             "combined": bool,
         }
 
@@ -754,7 +764,8 @@ def _ai_select_depreciation(tables: list[dict], log_fn=None) -> dict:
             f"다음 테이블에는 '감가상각비'와 '무형자산상각비'가 각각 별도 행으로 기재되어 있다: "
             f"{', '.join(separate_pair_tables)}\n"
             "분리 기재가 합산 기재보다 우선이므로 이 중 하나를 우선 선택해라. "
-            "단, 이 테이블이 판관비/유형자산/기능별 배분 등 부분값 테이블이면 제외해라.\n\n"
+            "단, 이 테이블이 판관비/유형자산/기능별 배분 등 부분값 테이블이면 제외해라. "
+            "같은 테이블에 '사용권자산상각비'가 별도 행으로 있으면 그것도 함께 선택해라.\n\n"
         )
 
     guide_text = _load_depreciation_ai_guide()
@@ -764,9 +775,14 @@ def _ai_select_depreciation(tables: list[dict], log_fn=None) -> dict:
     if parsed is None:
         raise RuntimeError(f"AI 응답 JSON 파싱 실패: {raw[:300]}")
 
-    result: dict = {"depreciation": None, "amortization": None, "combined": False}
+    result: dict = {
+        "depreciation":     None,
+        "rou_amortization": None,
+        "amortization":     None,
+        "combined":         False,
+    }
 
-    for key in ("depreciation", "amortization"):
+    for key in ("depreciation", "rou_amortization", "amortization"):
         val = parsed.get(key)
         if isinstance(val, dict) and val.get("table_id") and val.get("row_id"):
             result[key] = {
@@ -789,6 +805,7 @@ def _ai_select_depreciation(tables: list[dict], log_fn=None) -> dict:
 
     if result["combined"]:
         result["amortization"] = None
+        result["rou_amortization"] = None
 
     return result
 
@@ -921,9 +938,14 @@ def _verify_ai_selection(
         ai_selection: _ai_select_depreciation() 반환값
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
+        {"감가상각비": float|None, "사용권자산상각비": float|None,
+         "무형자산상각비": float|None, "combined": bool}
     """
-    result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
+    result: dict[str, Optional[float]] = {
+        "감가상각비": None,
+        "사용권자산상각비": None,
+        "무형자산상각비": None,
+    }
     combined = ai_selection.get("combined", False)
 
     # 감가상각비 추출 (라벨 검증 포함)
@@ -954,6 +976,30 @@ def _verify_ai_selection(
                     f"[VERIFY] 감가상각비 라벨 불일치: AI선택={depr_sel.get('row_label')!r}, "
                     f"actual='{actual_label}', 허용={_EXACT_DEPR_LABELS} → null 처리"
                 )
+
+    # 사용권자산상각비 추출 (합산이 아닌 경우만, 라벨 검증 포함)
+    if not combined:
+        rou_sel = ai_selection.get("rou_amortization")
+        if isinstance(rou_sel, dict):
+            actual_label = _resolve_actual_row_label(
+                tables, rou_sel["table_id"], rou_sel["row_id"]
+            )
+            if actual_label is not None and actual_label in _EXACT_ROU_AMORT_LABELS:
+                val = _extract_value_at_position(
+                    tables, rou_sel["table_id"], rou_sel["row_id"], debug_trace
+                )
+                result["사용권자산상각비"] = val
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[VERIFY] 사용권자산상각비: table={rou_sel['table_id']}, row={rou_sel['row_id']}, "
+                        f"actual_label='{actual_label}', value={val}"
+                    )
+            else:
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[VERIFY] 사용권자산상각비 라벨 불일치: AI선택={rou_sel.get('row_label')!r}, "
+                        f"actual='{actual_label}', 허용={_EXACT_ROU_AMORT_LABELS} → null 처리"
+                    )
 
     # 무형자산상각비 추출 (합산이 아닌 경우만, 라벨 검증 포함)
     if not combined:
@@ -1146,7 +1192,8 @@ def _extract_from_cf(
         fs_div: "CFS"=연결, "OFS"=별도
 
     Returns:
-        {"감가상각비": float|None, "무형자산상각비": float|None, "combined": bool}
+        {"감가상각비": float|None, "사용권자산상각비": float|None,
+         "무형자산상각비": float|None, "combined": bool}
     """
     cf_tables = _find_cf_tables_by_fs_type(soup, fs_div, strict_scope=strict_scope, debug_trace=debug_trace)
     if debug_trace is not None:
@@ -1154,7 +1201,11 @@ def _extract_from_cf(
             f"[CF] 후보 테이블 {len(cf_tables)}개 (fs_div={fs_div}, strict_scope={strict_scope})"
         )
 
-    result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None}
+    result: dict[str, Optional[float]] = {
+        "감가상각비": None,
+        "사용권자산상각비": None,
+        "무형자산상각비": None,
+    }
     combined = False
 
     for idx, rows in enumerate(cf_tables, start=1):
@@ -1210,6 +1261,23 @@ def _extract_from_cf(
                         )
                 continue
 
+            # 사용권자산상각비: 정확 매칭 (감가상각비보다 먼저 검사 — 라벨이 길어 명확)
+            if label in _EXACT_ROU_AMORT_LABELS:
+                if result["사용권자산상각비"] is not None:
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} '사용권자산상각비' 재발견, 첫 값 유지 → 스킵"
+                        )
+                else:
+                    val, col, raw = _get_current_val(row)
+                    if val is not None:
+                        result["사용권자산상각비"] = val
+                        if debug_trace is not None:
+                            debug_trace.append(
+                                f"[CF] #{idx}/R{row_idx+1} 사용권자산상각비 매칭: col={col}, raw='{raw}' → {val}"
+                            )
+                continue
+
             # 감가상각비: 정확 매칭
             if label == "감가상각비" or label == "감가상각비용":
                 if result["감가상각비"] is not None:
@@ -1246,6 +1314,7 @@ def _extract_from_cf(
     if debug_trace is not None:
         debug_trace.append(
             f"[CF] Python 추출 결과: 감가상각비={result.get('감가상각비')}, "
+            f"사용권자산상각비={result.get('사용권자산상각비')}, "
             f"무형자산상각비={result.get('무형자산상각비')}, combined={combined}"
         )
     return result
@@ -1275,7 +1344,8 @@ def extract_depreciation(
 
     Returns:
         {
-            "items": {"감가상각비": float|None, "무형자산상각비": float|None},
+            "items": {"감가상각비": float|None, "사용권자산상각비": float|None,
+                      "무형자산상각비": float|None},
             "source": "cf" | "cf+notes" | "notes" | "error",
             "error": str|None,
             "tables_found": int,
@@ -1285,7 +1355,7 @@ def extract_depreciation(
         }
     """
     base = {
-        "items":         {"감가상각비": None, "무형자산상각비": None},
+        "items":         {"감가상각비": None, "사용권자산상각비": None, "무형자산상각비": None},
         "source":        "error",
         "error":         None,
         "tables_found":  0,
@@ -1327,8 +1397,9 @@ def extract_depreciation(
     cf_combined = cf_result.pop("combined", False)
     trace.append(f"[CF] combined={cf_combined}")
 
+    # CF에서 감가상각비 + 무형자산상각비(또는 합산)까지 잡혔으면 즉시 반환.
+    # 사용권자산상각비는 분리 기재된 회사에만 있으므로 필수 조건이 아니다 (CF에서 잡혔으면 따라온다).
     if cf_result.get("감가상각비") is not None and (cf_result.get("무형자산상각비") is not None or cf_combined):
-        # CF에서 충분히 찾음 → 즉시 반환
         trace.append("[FINAL] CF 결과만으로 종료")
         return {
             **base,
@@ -1372,7 +1443,7 @@ def extract_depreciation(
     if not tables:
         trace.append("[NOTES] 후보 테이블이 없어 주석 추출 생략")
         # CF에서 부분적으로 찾은 것이 있으면 반환
-        if cf_result.get("감가상각비") is not None or cf_result.get("무형자산상각비") is not None:
+        if any(cf_result.get(k) is not None for k in ("감가상각비", "사용권자산상각비", "무형자산상각비")):
             trace.append("[FINAL] CF 부분 결과 반환")
             return {
                 **base,
@@ -1420,13 +1491,19 @@ def extract_depreciation(
 
     # Step B: AI 테이블/행 선택
     ai_selection = None
-    notes_result: dict[str, Optional[float]] = {"감가상각비": None, "무형자산상각비": None, "combined": False}
+    notes_result: dict[str, Optional[float]] = {
+        "감가상각비": None,
+        "사용권자산상각비": None,
+        "무형자산상각비": None,
+        "combined": False,
+    }
 
     try:
         ai_selection = _ai_select_depreciation(tables, log_fn=log_fn)
         base["ai_selection"] = ai_selection
         trace.append(
             f"[NOTES] AI 선택 결과: depreciation={ai_selection.get('depreciation')}, "
+            f"rou_amortization={ai_selection.get('rou_amortization')}, "
             f"amortization={ai_selection.get('amortization')}, combined={ai_selection.get('combined')}"
         )
 
@@ -1434,6 +1511,7 @@ def extract_depreciation(
         notes_result = _verify_ai_selection(tables, ai_selection, debug_trace=trace)
         trace.append(
             f"[NOTES] 검증 추출 결과: 감가상각비={notes_result.get('감가상각비')}, "
+            f"사용권자산상각비={notes_result.get('사용권자산상각비')}, "
             f"무형자산상각비={notes_result.get('무형자산상각비')}, combined={notes_result.get('combined')}"
         )
     except Exception as e:
@@ -1443,7 +1521,7 @@ def extract_depreciation(
     # Step D: CF + Notes 병합 (CF 우선)
     notes_combined = notes_result.get("combined", False)
     final: dict[str, Optional[float]] = {}
-    for key in ("감가상각비", "무형자산상각비"):
+    for key in ("감가상각비", "사용권자산상각비", "무형자산상각비"):
         cf_val = cf_result.get(key)
         notes_val = notes_result.get(key)
         final[key] = cf_val if cf_val is not None else notes_val
@@ -1451,8 +1529,9 @@ def extract_depreciation(
     is_combined = cf_combined or notes_combined
 
     # source 결정
-    cf_found = any(cf_result.get(k) is not None for k in ("감가상각비", "무형자산상각비"))
-    notes_found = any(notes_result.get(k) is not None for k in ("감가상각비", "무형자산상각비"))
+    _track_keys = ("감가상각비", "사용권자산상각비", "무형자산상각비")
+    cf_found = any(cf_result.get(k) is not None for k in _track_keys)
+    notes_found = any(notes_result.get(k) is not None for k in _track_keys)
     if cf_found and notes_found:
         source = "cf+notes"
     elif cf_found:
@@ -1464,7 +1543,9 @@ def extract_depreciation(
 
     trace.append(
         f"[FINAL] source={source}, combined={is_combined}, "
-        f"감가상각비={final.get('감가상각비')}, 무형자산상각비={final.get('무형자산상각비')}"
+        f"감가상각비={final.get('감가상각비')}, "
+        f"사용권자산상각비={final.get('사용권자산상각비')}, "
+        f"무형자산상각비={final.get('무형자산상각비')}"
     )
 
     return {

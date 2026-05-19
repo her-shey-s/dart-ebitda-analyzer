@@ -183,16 +183,18 @@ def analyze_one(
         )
         base["depreciation_trace"] = depr_result.get("trace", [])
         depr_items = depr_result.get("items", {})
-        for key in ("감가상각비", "무형자산상각비"):
+        for key in ("감가상각비", "사용권자산상각비", "무형자산상각비"):
             if depr_items.get(key) is not None:
                 base["items"][key] = depr_items[key]
         # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
         if depr_result.get("combined"):
             base["items"]["무형자산상각비"] = None
+            base["items"]["사용권자산상각비"] = None
             base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
         log("DEPR", (
             f"감가상각 추출 완료: source={depr_result.get('source')}, "
             f"감가상각비={format_amount(depr_items.get('감가상각비'))}, "
+            f"사용권자산상각비={format_amount(depr_items.get('사용권자산상각비'))}, "
             f"무형자산상각비={format_amount(depr_items.get('무형자산상각비'))}, "
             f"combined={depr_result.get('combined')}"
         ))
@@ -201,7 +203,7 @@ def analyze_one(
 
     # 4-C. 비용 항목 절댓값 보정
     # 일부 보고서는 비용을 음수로 표기하므로 항상 양수로 통일한다.
-    for cost_key in ("매출원가", "감가상각비", "무형자산상각비"):
+    for cost_key in ("매출원가", "감가상각비", "사용권자산상각비", "무형자산상각비"):
         v = base["items"].get(cost_key)
         if v is not None and v < 0:
             base["items"][cost_key] = abs(v)
