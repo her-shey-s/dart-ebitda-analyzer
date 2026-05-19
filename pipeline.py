@@ -3,8 +3,8 @@ pipeline.py
 DART 재무 데이터 분석 파이프라인 오케스트레이션
 
 단일 기업·연도에 대한 전체 파이프라인을 실행한다:
-  1. 기업코드 조회  2. 캐시 확인  3. 보고서 탐색
-  4. 재무 데이터 추출  5. 감가상각 추출  6. 검증  7. 캐시 저장
+  1. 기업코드 조회  2. 보고서 탐색  3. 재무 데이터 추출
+  4. 감가상각 추출  5. 검증
 """
 
 from config import FINANCIAL_ITEMS
@@ -14,14 +14,12 @@ from financial.api_extractor import get_financial_data_path_a
 from financial.doc_extractor import get_financial_data_path_b
 from depreciation.extractor import extract_depreciation
 from utils.analysis_logger import AnalysisLogger, format_amount
-from utils.cache import get_cache, make_cache_key, set_cache
 from validator.rules import validate
 
 
 def analyze_one(
     corp_name: str,
     year: int,
-    use_cache: bool,
     corp_code_override: str | None = None,
 ) -> dict:
     """
@@ -98,19 +96,7 @@ def analyze_one(
         base["corp_code"] = corp_code
         log("CORP", f"기업코드 발견: {corp_code}")
 
-    # 2. 캐시 확인
-    cache_key = make_cache_key(corp_code, str(year))
-    if use_cache:
-        log("CACHE", "캐시 확인 중...")
-        cached = get_cache(cache_key)
-        if cached:
-            log("CACHE", "캐시 히트 → 캐시 결과 반환")
-            return _finish({**cached, "from_cache": True})
-        log("CACHE", "캐시 미스")
-    else:
-        log("CACHE", "캐시 사용 안 함")
-
-    # 3. 보고서 탐색
+    # 2. 보고서 탐색
     log("REPORT", f"보고서 탐색 시작 (corp_code={corp_code}, year={year})")
     try:
         report = find_report(corp_code, year, log_fn=log)
@@ -141,8 +127,40 @@ def analyze_one(
         return _finish({**base, "status": "error", "error_msg": f"재무데이터 추출 오류: {e}"})
 
     if data.get("error"):
-        log("ERROR", f"재무데이터 추출 에러: {data['error']}")
-        return _finish({**base, "status": "error", "error_msg": data["error"]})
+        # 경로A의 XBRL API(전체재무제표)가 데이터 없음(status=013)을 반환하는 경우가 있다.
+        # 사업보고서 본문(document.xml)에는 표가 들어있을 수 있으므로
+        # 같은 rcept_no로 본문 파싱(경로B 메소드)을 한 번 더 시도한다.
+        if report["path"] == "A":
+            original_error = data["error"]
+            log("DATA_A", f"경로A XBRL 없음 → 사업보고서 본문 파싱으로 fallback ({original_error})")
+            try:
+                data = get_financial_data_path_b(
+                    report["rcept_no"],
+                    report_type=report.get("report_type"),
+                    log_fn=log,
+                )
+            except Exception as e:
+                log("ERROR", f"경로A → 본문 fallback 실패: {e}")
+                return _finish({
+                    **base,
+                    "status": "error",
+                    "error_msg": f"재무데이터 추출 오류 (경로A·본문 fallback 모두 실패): {e}",
+                })
+            if data.get("error"):
+                log("ERROR", f"경로A·본문 fallback 모두 실패: {data['error']}")
+                return _finish({
+                    **base,
+                    "status": "error",
+                    "error_msg": f"{original_error} / 본문 fallback: {data['error']}",
+                })
+            base["remarks"] = (
+                (base.get("remarks") or "")
+                + " 사업보고서 본문 파싱으로 추출 (XBRL 미등록)"
+            ).strip()
+            log("DATA_A", "경로A → 본문 fallback 성공")
+        else:
+            log("ERROR", f"재무데이터 추출 에러: {data['error']}")
+            return _finish({**base, "status": "error", "error_msg": data["error"]})
 
     base["items"]  = data["items"]
     base["fs_div"] = data.get("fs_div", "-")
@@ -201,10 +219,5 @@ def analyze_one(
         log("VALIDATE", f"검증 완료: is_valid={validation['is_valid']}")
     else:
         log("VALIDATE", f"검증 완료: 검증정보 없음")
-
-    # 7. 캐시 저장
-    if use_cache:
-        set_cache(cache_key, base, ttl_hours=48)
-        log("CACHE", "캐시 저장 완료")
 
     return _finish(base)

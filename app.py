@@ -20,7 +20,6 @@ from config import FINANCIAL_ITEMS, get_gemini_api_key
 from dart_api.corp_search import download_corp_codes, get_company_info_batch, search_corp
 from pipeline import analyze_one as _analyze_one
 from utils.analysis_logger import format_amount
-from utils.cache import clear_all_cache, purge_expired
 
 # ── 페이지 설정 ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -601,16 +600,7 @@ with st.sidebar:
         year_end = st.selectbox("끝 연도", options=year_options, index=5)      # 기본 2025
     years_selected = list(range(year_start, year_end + 1)) if year_start <= year_end else []
 
-    use_cache = st.checkbox("캐시 사용", value=True)
-
     analyze_btn = st.button("🔍 분석 시작", type="primary", use_container_width=True)
-
-    st.divider()
-    if st.button("캐시 초기화", use_container_width=True):
-        clear_all_cache()
-        st.session_state.results = []
-        st.session_state.analysis_logs = []
-        st.success("캐시 초기화 완료")
 
 
 # ── 메인 영역 ─────────────────────────────────────────────────────────────────
@@ -673,7 +663,6 @@ def _detect_ambiguities(corps_list: list[str]) -> dict[str, list[dict]]:
 def _execute_analysis(
     corps_list: list[str],
     years_list: list[int],
-    use_cache_flag: bool,
     overrides: Optional[dict[str, str]] = None,
 ) -> None:
     """corps × years 곱집합에 대해 분석을 실행한다.
@@ -681,7 +670,6 @@ def _execute_analysis(
     overrides: {corp_name: corp_code} — 동명 법인 중 사용자가 선택한 corp_code.
     """
     overrides = overrides or {}
-    purge_expired()
     tasks = list(product(corps_list, sorted(years_list)))
     total = len(tasks)
 
@@ -693,7 +681,7 @@ def _execute_analysis(
     for i, (corp_name, year) in enumerate(tasks):
         status_text.markdown(f"**처리 중** ({i + 1}/{total}): `{corp_name}` {year}년")
         result = _analyze_one(
-            corp_name, year, use_cache_flag,
+            corp_name, year,
             corp_code_override=overrides.get(corp_name),
         )
         all_logs.extend(result.get("analysis_log", []))
@@ -743,13 +731,12 @@ if analyze_btn:
             st.session_state.pending_analysis = {
                 "corps": corps,
                 "years": years_selected,
-                "use_cache": use_cache,
                 "ambiguities": ambiguities,
             }
             st.rerun()
         else:
             _clear_disambig_state()
-            _execute_analysis(corps, years_selected, use_cache)
+            _execute_analysis(corps, years_selected)
 
 
 # ── 동명 법인 선택 UI ────────────────────────────────────────────────────────
@@ -813,11 +800,10 @@ if st.session_state.get("pending_analysis"):
         ):
             corps_to_run = pending["corps"]
             years_to_run = pending["years"]
-            use_cache_to_run = pending["use_cache"]
             chosen = dict(selections)
             _clear_disambig_state()
             _execute_analysis(
-                corps_to_run, years_to_run, use_cache_to_run,
+                corps_to_run, years_to_run,
                 overrides=chosen,
             )
             st.rerun()
