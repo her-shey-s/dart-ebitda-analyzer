@@ -17,7 +17,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from config import FINANCIAL_ITEMS, get_gemini_api_key
-from dart_api.corp_search import get_company_info_batch, search_corp
+from dart_api.corp_search import download_corp_codes, get_company_info_batch, search_corp
 from pipeline import analyze_one as _analyze_one
 from utils.analysis_logger import format_amount
 from utils.cache import clear_all_cache, purge_expired
@@ -625,8 +625,14 @@ _CORP_CLS_LABEL = {"Y": "유가증권", "K": "코스닥", "N": "코넥스", "E":
 def _detect_ambiguities(corps_list: list[str]) -> dict[str, list[dict]]:
     """동일 법인명이 2개 이상인 경우 후보 정보를 모아 반환한다.
 
+    DART corp_codes 다운로드 실패 시 예외를 그대로 전파한다(호출자가 사용자에게 표시).
+
     반환: {corp_name: [{corp_code, stock_code, corp_cls, ceo_nm, adres, induty_code}, ...]}
     """
+    # 기업코드 캐시를 한 번에 명시적으로 로드한다 (실패 시 곧장 예외 전파).
+    # 이후의 search_corp는 모두 캐시 hit이라 추가 API 호출 없이 빠르게 처리된다.
+    download_corp_codes()
+
     info_cache: dict = st.session_state.setdefault("corp_info_cache", {})
     ambiguities: dict[str, list[dict]] = {}
     seen: set[str] = set()
@@ -635,10 +641,7 @@ def _detect_ambiguities(corps_list: list[str]) -> dict[str, list[dict]]:
         if name in seen or name in ambiguities:
             continue
         seen.add(name)
-        try:
-            df = search_corp(name)
-        except Exception:
-            continue
+        df = search_corp(name)
         exact = df[df["corp_name"] == name].reset_index(drop=True)
         if len(exact) <= 1:
             continue
@@ -723,8 +726,17 @@ if analyze_btn:
     elif not years_selected:
         st.warning("분석 연도를 선택하세요.")
     else:
-        with st.spinner("동명 법인 확인 중..."):
-            ambiguities = _detect_ambiguities(corps)
+        try:
+            with st.spinner("동명 법인 확인 중..."):
+                ambiguities = _detect_ambiguities(corps)
+        except Exception as e:
+            st.error(
+                "DART API에 연결할 수 없어 기업코드 목록을 가져오지 못했습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
+            with st.expander("오류 상세"):
+                st.code(f"{type(e).__name__}: {e}")
+            st.stop()
 
         if ambiguities:
             _clear_disambig_state()
