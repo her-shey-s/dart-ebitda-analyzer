@@ -186,19 +186,49 @@ def fetch_full_financial_statement(
 
 # ── 항목 추출 함수 ────────────────────────────────────────────────────────
 
-def extract_target_items(raw_list: list[dict]) -> dict[str, Optional[float]]:
+def _detect_non_krw_currency(raw_list: list[dict]) -> Optional[str]:
+    """
+    원시 응답에서 KRW가 아닌 통화 코드가 섞여 있으면 그 값을 반환한다.
+
+    DART fnlttSinglAcntAll API는 관행적으로 KRW(원)로 응답하며 원 단위 그대로의
+    수치를 돌려준다. 그러나 일부 보고서는 USD 등 다른 통화로 표시되는 행을
+    포함할 수 있다. 이 경우 단순히 원 단위 가정이 깨지므로 호출자가 알 수 있게
+    탐지값을 돌려준다.
+    """
+    for row in raw_list:
+        cur = (row.get("currency") or "").strip().upper()
+        if cur and cur != "KRW":
+            return cur
+    return None
+
+
+def extract_target_items(
+    raw_list: list[dict],
+    log_fn=None,
+) -> dict[str, Optional[float]]:
     """
     전체 재무제표 원시 리스트에서 FINANCIAL_ITEMS에 정의된 항목을 추출한다.
 
     account_id 정확 일치 → account_nm 키워드 폴백 순서로 매칭한다.
 
+    DART API는 KRW·원 단위가 표준이며 ``thstrm_amount`` 값은 그대로 원이다.
+    행에 ``currency``가 KRW가 아닌 값이 보이면 경고 로그를 남긴다 (예: USD).
+
     Args:
         raw_list: fetch_full_financial_statement() 반환값
+        log_fn:   로그 콜백 (선택)
 
     Returns:
         항목명 → 금액(원, float) 딕셔너리.
         찾지 못한 항목은 None.
     """
+    non_krw = _detect_non_krw_currency(raw_list)
+    if non_krw and log_fn:
+        log_fn(
+            "DATA_A",
+            f"  경고: KRW가 아닌 통화 코드 감지({non_krw}). 단위 가정이 깨질 수 있음.",
+        )
+
     result: dict[str, Optional[float]] = {}
     for item in FINANCIAL_ITEMS:
         result[item["name"]] = _extract_by_id_then_nm(
@@ -337,7 +367,7 @@ def get_financial_data_path_a(
 
     _log("DATA_A", f"  선택된 재무제표: {selected_div}")
     selected = available_statements[selected_div]
-    items = extract_target_items(selected["raw"])
+    items = extract_target_items(selected["raw"], log_fn=log_fn)
     matched = sum(1 for v in items.values() if v is not None)
     _log("DATA_A", f"  Python 추출: {len(items)}개 항목 중 {matched}개 매칭")
 

@@ -33,6 +33,12 @@ from dart_api.xml_utils import (
     parse_dart_xml as _parse_dart_xml,
     xml_table_to_rows as _xml_table_to_rows,
 )
+from utils.units import (
+    UNIT_MULTIPLIERS as _UNIT_MULTIPLIERS,
+    detect_unit_multiplier as _detect_unit_multiplier,
+    detect_unit_from_rows as _detect_unit_from_rows,
+    unit_label as _unit_label,
+)
 
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
@@ -46,14 +52,6 @@ _EXCLUDE_TABLE_KEYWORDS = [
     "취득원가",          # 유형자산 현황 테이블 (감가상각누계액 포함)
     "이연법인세",        # 이연법인세 내역
 ]
-
-# 단위 승수 매핑
-_UNIT_MULTIPLIERS = {
-    "원":    1,
-    "천원":  1_000,
-    "백만원": 1_000_000,
-    "억원":  100_000_000,
-}
 
 _FS_SCOPE_TITLE_KEYWORDS = (
     "재무상태표",
@@ -82,46 +80,6 @@ _NOTES_ROOT_CORES = frozenset({
 
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
-
-def _detect_unit_multiplier(tag: Tag) -> int:
-    """
-    테이블의 단위 승수를 감지한다.
-
-    탐색 순서:
-      1. 테이블 앞 형제 태그 (최대 5개)
-      2. 테이블 내부 첫 5행의 셀 텍스트 (인라인 단위 표기 대응)
-
-    Args:
-        tag: BeautifulSoup Table 태그
-
-    Returns:
-        단위 승수 (기본값: 1 = 원)
-    """
-    _UNIT_PATTERN = re.compile(r"단위\s*[:：]\s*(천원|백만원|억원|원)")
-
-    # 1. 앞쪽 형제 태그 5개까지 탐색
-    node = tag
-    for _ in range(5):
-        node = node.find_previous_sibling()
-        if node is None:
-            break
-        text = node.get_text(strip=True) if hasattr(node, "get_text") else str(node)
-        m = _UNIT_PATTERN.search(text)
-        if m:
-            return _UNIT_MULTIPLIERS.get(m.group(1), 1)
-
-    # 2. 테이블 내부 첫 5행에서 인라인 단위 표기 탐색
-    for i, tr in enumerate(tag.find_all("tr")):
-        if i >= 5:
-            break
-        for cell in tr.find_all(["td", "th", "tu", "te"]):
-            cell_text = cell.get_text(strip=True)
-            m = _UNIT_PATTERN.search(cell_text)
-            if m:
-                return _UNIT_MULTIPLIERS.get(m.group(1), 1)
-
-    return 1  # 기본값: 원
-
 
 def _get_section_title(tag: Tag) -> str:
     """
@@ -387,8 +345,21 @@ def _normalize_row_label(label: str) -> str:
     - 선두 번호 접두어 제거 ("1)", "1.", "(1)", "①" 등)
     """
     norm = label.replace(" ", "").replace("\u3000", "").replace("\u00a0", "").strip()
-    # 선두 번호 제거
-    norm = re.sub(r"^[\(\[]?[\d①-⑳]{1,3}[\)\]]?[\.\s]*", "", norm)
+    # 선두 번호/한글 접두어 반복 제거 ("1.가.감가상각비" 같은 이중 접두어 대응).
+    # 한글 접두어는 정상 라벨 첫 글자("감"·"무"·"사" 등)를 잘라먹지 않도록
+    # 반드시 구분자(., ), (가) 형태)를 동반할 때만 매칭한다.
+    _PREFIX_RE = (
+        r"^(?:"
+        r"[\(\[]?[\d①-⑳]{1,3}[\)\]]?[\.\s]*"      # 숫자 접두어 (1., (1), ① 등)
+        r"|\(\s*[가나다라마바사아자차카타파하]\s*\)[\.\s]*"  # (가) 형태
+        r"|[가나다라마바사아자차카타파하][\.\)][\.\s]*"        # 가. / 가) 형태
+        r")"
+    )
+    while True:
+        new_norm = re.sub(_PREFIX_RE, "", norm)
+        if not new_norm or new_norm == norm:
+            break
+        norm = new_norm
     return norm
 
 
@@ -1052,7 +1023,7 @@ def _find_cf_tables_by_fs_type(
     fs_div: str = "CFS",
     strict_scope: bool = True,
     debug_trace: Optional[list[str]] = None,
-) -> list[list[list[str]]]:
+) -> list[tuple[Tag, list[list[str]]]]:
     """
     사업보고서에서 연결/별도 구분에 맞는 현금흐름표 테이블을 반환한다.
 
@@ -1064,12 +1035,12 @@ def _find_cf_tables_by_fs_type(
         fs_div: "CFS" 또는 "OFS"
 
     Returns:
-        해당 구분에 맞는 CF 테이블의 rows 리스트
+        (table_tag, rows) 튜플 리스트. tag는 단위 감지에 사용된다.
     """
     want_consol = (fs_div == "CFS")
     document_scope = _infer_document_scope(soup)
-    matched_tables: list[list[list[str]]] = []
-    all_cf_tables: list[list[list[str]]] = []
+    matched_tables: list[tuple[Tag, list[list[str]]]] = []
+    all_cf_tables: list[tuple[Tag, list[list[str]]]] = []
 
     current_scope: Optional[bool] = None
     is_cf_section = False
@@ -1149,7 +1120,7 @@ def _find_cf_tables_by_fs_type(
                     debug_trace.append(
                         f"[CF] content-based CF 감지 (title 없음): labels={labels}"
                     )
-                all_cf_tables.append(rows)
+                all_cf_tables.append((tag, rows))
                 if debug_trace is not None:
                     labels = ", ".join(row[0].strip() for row in rows[:5] if row)
                     debug_trace.append(
@@ -1157,7 +1128,7 @@ def _find_cf_tables_by_fs_type(
                     )
 
                 if current_scope is None or want_consol == current_scope:
-                    matched_tables.append(rows)
+                    matched_tables.append((tag, rows))
 
     if not strict_scope:
         if debug_trace is not None:
@@ -1183,7 +1154,9 @@ def _extract_from_cf(
 
     현금흐름표의 "영업활동" 조정 항목에는 전체 비용 기준 감가상각비가
     별도 행으로 기재되므로, 주석보다 신뢰도가 높다.
-    단위는 재무제표와 동일(원)이므로 보정이 불필요하다.
+
+    각 CF 테이블의 단위(원/천원/백만원/억원)를 캡션·헤더에서 감지하여
+    추출 값을 원 단위로 환산한다. 단위 감지 실패 시 원(=1)로 가정한다.
 
     fs_div에 따라 연결/별도 현금흐름표를 구분하여 올바른 테이블에서 추출한다.
 
@@ -1208,7 +1181,7 @@ def _extract_from_cf(
     }
     combined = False
 
-    for idx, rows in enumerate(cf_tables, start=1):
+    for idx, (table_tag, rows) in enumerate(cf_tables, start=1):
         # 감가상각 키워드가 포함된 CF 테이블만 대상
         full_text = " ".join(" ".join(r) for r in rows)
         if "감가상각" not in full_text:
@@ -1217,6 +1190,16 @@ def _extract_from_cf(
             labels = ", ".join(row[0].strip() for row in rows[:5] if row)
             debug_trace.append(f"[CF] 감가상각 키워드 포함 테이블 #{idx}: {labels}")
 
+        # 테이블 단위 감지 (캡션 → 부모 → 인라인 헤더 순) 후 rows 폴백.
+        # 단위를 곱해 모든 결과를 원(KRW) 기준으로 통일한다.
+        unit = _detect_unit_multiplier(table_tag)
+        if unit == 1:
+            unit = _detect_unit_from_rows(rows, fallback=1)
+        if debug_trace is not None:
+            debug_trace.append(
+                f"[CF] 테이블 #{idx}: 단위={_unit_label(unit)} (x{unit})"
+            )
+
         # ── 당기 컬럼 인덱스 탐지 (당기/제N기/연도) ──
         current_col = _detect_current_column(rows)
 
@@ -1224,26 +1207,28 @@ def _extract_from_cf(
             debug_trace.append(f"[CF] 테이블 #{idx}: 당기 컬럼 인덱스={current_col}")
 
         def _get_current_val(row: list[str]) -> tuple[Optional[float], Optional[int], Optional[str]]:
-            """행에서 당기 금액과 그 출처 컬럼/원본 셀을 반환한다."""
+            """행에서 당기 금액과 그 출처 컬럼/원본 셀을 반환한다(단위 보정 포함)."""
             if current_col is not None and current_col < len(row):
                 raw = row[current_col]
                 val = _parse_number(raw)
                 if val is not None:
-                    return val, current_col, raw
+                    return val * unit, current_col, raw
             # 당기 컬럼 미판별 시 폴백: 첫 번째 숫자
             for ci, cell in enumerate(row[1:], start=1):
                 val = _parse_number(cell)
                 if val is not None:
-                    return val, ci, cell
+                    return val * unit, ci, cell
             return None, None, None
 
         for row_idx, row in enumerate(rows):
             if not row:
                 continue
-            label = row[0].replace(" ", "").strip()
+            # 라벨을 정규화하되, CF 본문에서는 substring으로 관대하게 매칭한다
+            # ("가. 감가상각비", "감가상각비용", "감가상각비등" 등 접두/접미 변형 모두 허용).
+            label = _normalize_row_label(row[0])
 
-            # "감가상각비및무형자산상각비" 합산 항목 감지
-            if "감가상각비" in label and "무형자산상각비" in label and "누계" not in label:
+            # 1) 합산 행 ("감가상각...무형자산상각..." 한 줄로 기재) — 가장 먼저 검사
+            if "감가상각" in label and "무형자산상각" in label and "누계" not in label:
                 if result["감가상각비"] is not None:
                     if debug_trace is not None:
                         debug_trace.append(
@@ -1261,54 +1246,61 @@ def _extract_from_cf(
                         )
                 continue
 
-            # 사용권자산상각비: 정확 매칭 (감가상각비보다 먼저 검사 — 라벨이 길어 명확)
-            if label in _EXACT_ROU_AMORT_LABELS:
-                if result["사용권자산상각비"] is not None:
-                    if debug_trace is not None:
-                        debug_trace.append(
-                            f"[CF] #{idx}/R{row_idx+1} '사용권자산상각비' 재발견, 첫 값 유지 → 스킵"
-                        )
-                else:
+            # 2) 사용권자산상각 (감가상각보다 먼저 — "사용권자산감가상각비"와 겹치므로)
+            if "사용권자산상각" in label or "사용권자산감가상각" in label:
+                if "누계" in label:
+                    continue
+                if result["사용권자산상각비"] is None:
                     val, col, raw = _get_current_val(row)
                     if val is not None:
                         result["사용권자산상각비"] = val
                         if debug_trace is not None:
                             debug_trace.append(
-                                f"[CF] #{idx}/R{row_idx+1} 사용권자산상각비 매칭: col={col}, raw='{raw}' → {val}"
+                                f"[CF] #{idx}/R{row_idx+1} 사용권자산상각 매칭: label='{label}', "
+                                f"col={col}, raw='{raw}' → {val}"
                             )
+                elif debug_trace is not None:
+                    debug_trace.append(
+                        f"[CF] #{idx}/R{row_idx+1} '사용권자산상각' 재발견, 첫 값 유지 → 스킵"
+                    )
                 continue
 
-            # 감가상각비: 정확 매칭
-            if label == "감가상각비" or label == "감가상각비용":
-                if result["감가상각비"] is not None:
-                    if debug_trace is not None:
-                        debug_trace.append(
-                            f"[CF] #{idx}/R{row_idx+1} '감가상각비' 재발견, 첫 값 유지 → 스킵"
-                        )
-                else:
-                    val, col, raw = _get_current_val(row)
-                    if val is not None:
-                        result["감가상각비"] = val
-                        if debug_trace is not None:
-                            debug_trace.append(
-                                f"[CF] #{idx}/R{row_idx+1} 감가상각비 매칭: col={col}, raw='{raw}' → {val}"
-                            )
-
-            # 무형자산상각비
-            if label in ("무형자산상각비", "무형자산상각비용", "무형자산상각"):
-                if result["무형자산상각비"] is not None:
-                    if debug_trace is not None:
-                        debug_trace.append(
-                            f"[CF] #{idx}/R{row_idx+1} '무형자산상각비' 재발견, 첫 값 유지 → 스킵"
-                        )
-                else:
+            # 3) 무형자산상각 (감가상각보다 먼저)
+            if "무형자산상각" in label:
+                if "누계" in label:
+                    continue
+                if result["무형자산상각비"] is None:
                     val, col, raw = _get_current_val(row)
                     if val is not None:
                         result["무형자산상각비"] = val
                         if debug_trace is not None:
                             debug_trace.append(
-                                f"[CF] #{idx}/R{row_idx+1} 무형자산상각비 매칭: col={col}, raw='{raw}' → {val}"
+                                f"[CF] #{idx}/R{row_idx+1} 무형자산상각 매칭: label='{label}', "
+                                f"col={col}, raw='{raw}' → {val}"
                             )
+                elif debug_trace is not None:
+                    debug_trace.append(
+                        f"[CF] #{idx}/R{row_idx+1} '무형자산상각' 재발견, 첫 값 유지 → 스킵"
+                    )
+                continue
+
+            # 4) 감가상각 (가장 마지막 — 위 3개와 겹치지 않은 행만)
+            if "감가상각" in label:
+                if "누계" in label:
+                    continue
+                if result["감가상각비"] is None:
+                    val, col, raw = _get_current_val(row)
+                    if val is not None:
+                        result["감가상각비"] = val
+                        if debug_trace is not None:
+                            debug_trace.append(
+                                f"[CF] #{idx}/R{row_idx+1} 감가상각 매칭: label='{label}', "
+                                f"col={col}, raw='{raw}' → {val}"
+                            )
+                elif debug_trace is not None:
+                    debug_trace.append(
+                        f"[CF] #{idx}/R{row_idx+1} '감가상각' 재발견, 첫 값 유지 → 스킵"
+                    )
 
     result["combined"] = combined
     if debug_trace is not None:

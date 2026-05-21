@@ -9,7 +9,9 @@ DART XML 포맷(dart4.xsd)의 재무제표 테이블을 파싱하여
 DART 문서 포맷 특징:
   - ZIP 속 XML 파일 (dart3.xsd / dart4.xsd)
   - TABLE / TR / TD·TU·TE 태그 (HTML 유사)
-  - 금액은 원(KRW) 단위의 숫자 문자열, 음수는 괄호 표기 (예: (20,283,010,877))
+  - 금액은 KRW 기반 숫자 문자열이며, 테이블별 단위(원/천원/백만원/억원)가
+    캡션이나 헤더에 명시된다. 추출 후 ``utils.units``로 원 단위로 환산한다.
+  - 음수는 괄호 표기 (예: (20,283,010,877))
   - 항목명에 주석 참조 포함 (예: "I. 매출액<주석20>")
   - 항목명에 전각 공백 혼재 (예: "자      산      총      계")
 """
@@ -30,6 +32,12 @@ from dart_api.xml_utils import (
     normalize_title as _normalize_title,
     parse_dart_xml as _parse_dart_xml,
     xml_table_to_rows as _xml_table_to_rows,
+)
+from utils.units import (
+    detect_unit_multiplier as _detect_unit_multiplier,
+    detect_unit_from_rows as _detect_unit_from_rows,
+    detect_unit_in_text as _detect_unit_in_text,
+    unit_label as _unit_label,
 )
 
 # 재무상태표 판별 키워드
@@ -113,7 +121,7 @@ def _is_numeric_cell(val: str) -> bool:
 
 def _build_section_table_map(
     soup: BeautifulSoup,
-) -> dict[str, list[list[list[str]]]]:
+) -> dict[str, list[tuple]]:
     """
     TITLE 태그 위치를 기준으로 각 섹션에 속하는 테이블을 분류한다.
 
@@ -127,10 +135,9 @@ def _build_section_table_map(
     각 테이블은 자신 바로 앞에 있는 TITLE의 섹션에 배정된다.
 
     Returns:
-        {"BS": [...], "IS": [...], "CF": [...], "NOTES": [...]}
+        {"BS": [(tag, rows), ...], "IS": [...], "CF": [...], "NOTES": [...]}
+        tag는 단위 감지에 사용된다.
     """
-    # 1. 모든 TITLE 태그의 위치 + 섹션명 수집
-    title_positions: list[tuple[int, str]] = []  # (source_pos, section_key)
     section_key_map = {
         "재무상태표": "BS",
         "손익계산서": "IS",
@@ -140,19 +147,9 @@ def _build_section_table_map(
         "주석": "NOTES",
     }
 
-    for title_tag in soup.find_all("title"):
-        raw = title_tag.get_text(strip=True)
-        norm = _normalize_title(raw)
-        # TITLE 텍스트에 섹션명이 포함되어 있으면 매핑
-        for section_name, key in section_key_map.items():
-            if section_name in norm:
-                # sourcepos 대용: 태그의 문서 내 순서를 유지하기 위해 리스트 순서 사용
-                title_positions.append((id(title_tag), key))
-                break
-
-    # 2. 모든 TABLE 태그를 순회하면서 직전 TITLE의 섹션에 배정
-    #    soup의 descendants 순서 = 문서 순서이므로, TITLE과 TABLE을 함께 순회
-    result: dict[str, list[list[list[str]]]] = {
+    # 모든 TABLE 태그를 순회하면서 직전 TITLE의 섹션에 배정
+    # soup의 descendants 순서 = 문서 순서이므로, TITLE과 TABLE을 함께 순회
+    result: dict[str, list[tuple]] = {
         "BS": [], "IS": [], "CF": [], "EQ": [], "NOTES": [],
     }
 
@@ -168,7 +165,7 @@ def _build_section_table_map(
         elif tag.name == "table" and current_section is not None:
             rows = _xml_table_to_rows(tag)
             if rows:
-                result[current_section].append(rows)
+                result[current_section].append((tag, rows))
 
     return result
 
@@ -286,6 +283,7 @@ def find_item_in_table(
     rows: list[list[str]],
     keywords: list[str],
     negate_keywords: list[str] | None = None,
+    unit_multiplier: int = 1,
 ) -> Optional[float]:
     """
     행 리스트에서 keywords와 일치하는 항목명을 찾아 당기 금액을 반환한다.
@@ -297,14 +295,17 @@ def find_item_in_table(
       → 부분 일치 사용 안 함: "영업외이익" ≠ "영업이익"
     - negate_keywords: 해당 키워드로 매칭되면 양수 값을 음수로 반전
       (예: "영업손실" → 12억 → -12억)
+    - unit_multiplier: 테이블 단위 승수(1=원, 1000=천원, 1_000_000=백만원, ...).
+      반환 값에 곱해 원(KRW) 기준 금액을 돌려준다.
 
     Args:
-        rows:            _xml_table_to_rows() 반환값
-        keywords:        config.FINANCIAL_ITEMS의 keywords (정규화된 형태)
-        negate_keywords: 부호 반전이 필요한 키워드 목록 (선택)
+        rows:             _xml_table_to_rows() 반환값
+        keywords:         config.FINANCIAL_ITEMS의 keywords (정규화된 형태)
+        negate_keywords:  부호 반전이 필요한 키워드 목록 (선택)
+        unit_multiplier:  단위 승수 (기본 1=원)
 
     Returns:
-        금액(float) 또는 None
+        금액(float, 원 단위) 또는 None
     """
     if not rows:
         return None
@@ -333,7 +334,8 @@ def find_item_in_table(
                 val = _to_float(row[current_col])
                 if val is None:
                     # '-' 등 비숫자 → 항목 행이 존재하므로 0 처리
-                    val = 0.0
+                    return 0.0
+                val = val * unit_multiplier
                 if norm in negate_set and val > 0:
                     val = -val
                 return val
@@ -345,6 +347,7 @@ def find_item_in_table(
                     continue
                 val = _to_float(row[ci])
                 if val is not None:
+                    val = val * unit_multiplier
                     if norm in negate_set and val > 0:
                         val = -val
                     return val
@@ -385,18 +388,33 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
                 continue
             fs_type = _classify_table(rows)
             if fs_type == "BS":
-                bs_tables.append(rows)
+                bs_tables.append((table_tag, rows))
             elif fs_type == "IS":
-                is_tables.append(rows)
+                is_tables.append((table_tag, rows))
 
-    # fs_type별 테이블 매핑
-    tables_by_type = {"BS": bs_tables, "IS": is_tables, "CF": cf_tables}
+    # 테이블별 단위 승수를 미리 계산해 캐시
+    def _table_unit(tag, rows) -> int:
+        unit = _detect_unit_multiplier(tag)
+        if unit == 1:
+            unit = _detect_unit_from_rows(rows, fallback=1)
+        return unit
+
+    typed_tables = {
+        "BS": [(tag, rows, _table_unit(tag, rows)) for tag, rows in bs_tables],
+        "IS": [(tag, rows, _table_unit(tag, rows)) for tag, rows in is_tables],
+        "CF": [(tag, rows, _table_unit(tag, rows)) for tag, rows in cf_tables],
+    }
 
     for item in FINANCIAL_ITEMS:
-        search_order = tables_by_type.get(item["fs_type"], is_tables)
+        search_order = typed_tables.get(item["fs_type"], typed_tables["IS"])
 
-        for rows in search_order:
-            val = find_item_in_table(rows, item["keywords"], item.get("negate_keywords"))
+        for _tag, rows, unit in search_order:
+            val = find_item_in_table(
+                rows,
+                item["keywords"],
+                item.get("negate_keywords"),
+                unit_multiplier=unit,
+            )
             if val is not None:
                 result[item["name"]] = val
                 break
@@ -427,10 +445,13 @@ def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
             for table_tag in soup.find_all("table"):
                 rows = _xml_table_to_rows(table_tag)
                 if rows and _classify_table(rows) == fs_type:
-                    tables.append(rows)
+                    tables.append((table_tag, rows))
 
-        for rows in tables:
-            lines.append(f"[{fs_type}]")
+        for tag, rows in tables:
+            unit = _detect_unit_multiplier(tag)
+            if unit == 1:
+                unit = _detect_unit_from_rows(rows, fallback=1)
+            lines.append(f"[{fs_type}] (단위: {_unit_label(unit)})")
             for row in rows:
                 if row and len(row) >= 2:
                     label = normalize_label(row[0])
@@ -606,12 +627,36 @@ def extract_tables_from_html(html: str) -> list[pd.DataFrame]:
 
 
 def parse_financial_data_from_html(html: str) -> dict[str, Optional[float]]:
-    """HTML 재무제표에서 항목을 파싱한다. (레거시 호환 / HTML 전용)"""
-    tables = extract_tables_from_html(html)
+    """HTML 재무제표에서 항목을 파싱한다. (레거시 호환 / HTML 전용)
+
+    각 테이블에 단위(원/천원/백만원/억원) 표기가 있으면 감지하여 원 단위로
+    환산한다. 감지 실패 시 1(원)을 가정한다.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    tables_dfs = extract_tables_from_html(html)
+    table_tags = soup.find_all("table")
+
+    # DataFrame과 table 태그를 zip으로 매칭 (extract_tables_from_html이 같은 순서로 만든다).
+    # 단, pd.read_html이 일부 태그를 스킵할 수 있어 갯수 불일치 시 단위는 모두 1로 fallback.
+    if len(table_tags) == len(tables_dfs):
+        table_units = [_detect_unit_multiplier(t) for t in table_tags]
+        for i, (t, mult) in enumerate(zip(table_tags, table_units)):
+            if mult == 1:
+                # 태그 단위 감지 실패 시 DataFrame 머리 5행으로 폴백
+                df = tables_dfs[i]
+                rows = df.head(5).astype(str).values.tolist()
+                table_units[i] = _detect_unit_from_rows(rows, fallback=1)
+    else:
+        # 매칭 실패 시 각 DF의 머리 5행만 보고 단위 감지
+        table_units = []
+        for df in tables_dfs:
+            rows = df.head(5).astype(str).values.tolist()
+            table_units.append(_detect_unit_from_rows(rows, fallback=1))
+
     result: dict[str, Optional[float]] = {item["name"]: None for item in FINANCIAL_ITEMS}
 
     for item in FINANCIAL_ITEMS:
-        for df in tables:
+        for df, unit in zip(tables_dfs, table_units):
             if df.empty or df.shape[1] < 2:
                 continue
             label_col = df.iloc[:, 0].astype(str)
@@ -629,7 +674,7 @@ def parse_financial_data_from_html(html: str) -> dict[str, Optional[float]]:
                 if normalize_label(label) in keyword_set:
                     val = _to_float(df.iloc[idx, amount_col])
                     if val is not None:
-                        result[item["name"]] = val
+                        result[item["name"]] = val * unit
                         break
             if result[item["name"]] is not None:
                 break
