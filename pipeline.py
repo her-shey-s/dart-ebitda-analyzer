@@ -282,7 +282,13 @@ def analyze_one(
     try:
         validation = validate(base["items"])
     except Exception as e:
-        validation = {"is_valid": None, "checks": [], "flags": [f"검증 오류: {e}"]}
+        validation = {
+            "is_valid": None,
+            "validation_status": "unverified",
+            "checks": [],
+            "flags": [f"검증 오류: {e}"],
+            "skipped": [],
+        }
 
     base["validation"] = validation
     if validation.get("is_valid") is not None:

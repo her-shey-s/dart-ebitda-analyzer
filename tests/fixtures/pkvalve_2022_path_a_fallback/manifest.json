@@ -1,0 +1,12 @@
+{
+  "id": "pkvalve_2022_path_a_fallback",
+  "kind": "real",
+  "description": "피케이밸브앤엔지니어링 2022 사업보고서 본문 fallback · 빈 연결재무제표 + 채워진 별도 재무제표 혼재 · 별도(OFS) 스코프 필터로 총자산을 0이 아닌 실제값으로 추출",
+  "path": "B",
+  "rcept_no": "20230331001846",
+  "report_type": "annual",
+  "fs_div": "OFS",
+  "strict_scope": false,
+  "raw": { "xml": "raw_input.xml" },
+  "run": { "financials": true, "depreciation": false }
+}

@@ -12,7 +12,9 @@ tests/test_fs_div_scope.py
     판정해야 한다.
 """
 
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
 
 from bs4 import BeautifulSoup
 
@@ -86,3 +88,34 @@ def test_real_pkvalve_2022_is_separate():
     # 별도 전용 회사: 연결 재무제표 본문이 데이터와 함께 실재하지 않는다.
     assert _has_populated_consolidated_statements(soup) is False
     assert _infer_path_b_fs_div(soup, report_type="annual") == "OFS"
+
+
+def test_real_pkvalve_2022_scope_filter_reads_separate_bs():
+    """
+    스코프 필터 회귀 락(명세 #4): 빈 연결재무제표 섹션 + 채워진 별도 재무제표가
+    혼재된 사업보고서 본문에서, AI 없이도 별도(OFS) 스코프의 BS를 읽어 총자산이
+    0이 아닌 실제값(≈188.9조)으로 나와야 한다. 스코프 필터 이전에는 첫 매칭
+    표(빈 연결)를 읽어 총자산=0이 되었다.
+    """
+    xml_path = FIXTURES / "pkvalve_2022_path_a_fallback" / "raw_input.xml"
+    if not xml_path.is_file():
+        import pytest
+        pytest.skip("실제 fixture 원본(raw_input.xml)이 없습니다.")
+
+    xml = xml_path.read_bytes()
+    with ExitStack() as stack:
+        # AI 비활성 → 순수 파이썬 추출(결정적). 다운로드 경계만 fixture로 대체.
+        stack.enter_context(mock.patch("config.get_gemini_api_key", lambda: ""))
+        stack.enter_context(
+            mock.patch(
+                "financial.doc_extractor._download_dart_document", lambda rcept_no: xml
+            )
+        )
+        from financial.doc_extractor import get_financial_data_path_b
+
+        result = get_financial_data_path_b("20230331001846", report_type="annual")
+
+    assert result["error"] is None
+    assert result["fs_div"] == "OFS"
+    assert result["ai_comparison"] is None  # AI 비활성 확인 → 값은 파이썬 추출
+    assert result["items"]["총자산"] == 188_922_000_000.0

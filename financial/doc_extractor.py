@@ -141,8 +141,9 @@ def _build_section_table_map(
     각 테이블은 자신 바로 앞에 있는 TITLE의 섹션에 배정된다.
 
     Returns:
-        {"BS": [(tag, rows), ...], "IS": [...], "CF": [...], "NOTES": [...]}
-        tag는 단위 감지에 사용된다.
+        {"BS": [(tag, rows, scope), ...], "IS": [...], "CF": [...], "NOTES": [...]}
+        tag는 단위 감지에 사용되고, scope는 "CFS"/"OFS"/None (직전 재무제표 섹션
+        헤더 기준 연결/별도 구간)이다.
     """
     section_key_map = {
         "재무상태표": "BS",
@@ -160,10 +161,14 @@ def _build_section_table_map(
     }
 
     current_section: str | None = None
+    current_scope: str | None = None
     for tag in soup.descendants:
         if tag.name == "title":
             raw = tag.get_text(strip=True)
             norm = _normalize_title(raw)
+            scope = _title_scope(norm)
+            if scope is not None:
+                current_scope = scope
             for section_name, key in section_key_map.items():
                 if section_name in norm:
                     current_section = key
@@ -171,7 +176,7 @@ def _build_section_table_map(
         elif tag.name == "table" and current_section is not None:
             rows = _xml_table_to_rows(tag)
             if rows:
-                result[current_section].append((tag, rows))
+                result[current_section].append((tag, rows, current_scope))
 
     return result
 
@@ -183,6 +188,64 @@ _SCOPE_TOTAL_LABELS = {
 }
 # 재무제표 본문 타이틀로 인정하는 키워드 (섹션 헤더 "연결재무제표"는 제외)
 _STATEMENT_TITLE_KEYWORDS = ("재무상태표", "손익계산서", "포괄손익계산서", "현금흐름표")
+
+
+def _title_scope(norm_title: str) -> Optional[str]:
+    """
+    TITLE이 재무제표 섹션 경계이면 그 연결/별도 스코프("CFS"/"OFS")를, 아니면 None.
+
+    재무제표 섹션 경계는 본문 타이틀(재무상태표 등) 또는 섹션 헤더("2.연결재무제표",
+    "4.재무제표")처럼 "재무제표"를 포함하는 타이틀이다. 경계가 아닌 타이틀은 스코프
+    구간을 바꾸지 않으므로 None을 돌려준다(_has_populated_consolidated_statements와 동일).
+    """
+    is_fs_section = (
+        any(k in norm_title for k in _STATEMENT_TITLE_KEYWORDS)
+        or ("재무제표" in norm_title)
+    )
+    if not is_fs_section:
+        return None
+    return "CFS" if "연결" in norm_title else "OFS"
+
+
+def _classify_tables_with_scope(soup: BeautifulSoup) -> dict[str, list[tuple]]:
+    """
+    TITLE 기반 섹션 분류가 실패한 문서를 위한 키워드 기반 fallback.
+
+    문서 순서대로 모든 테이블을 키워드로 BS/IS 분류하면서, 직전 재무제표 섹션
+    헤더 기준 연결/별도 스코프를 함께 기록한다.
+
+    Returns:
+        {"BS": [(tag, rows, scope), ...], "IS": [...]}
+    """
+    out: dict[str, list[tuple]] = {"BS": [], "IS": []}
+    current_scope: Optional[str] = None
+    for tag in soup.descendants:
+        if tag.name == "title":
+            scope = _title_scope(_normalize_title(tag.get_text(strip=True)))
+            if scope is not None:
+                current_scope = scope
+        elif tag.name == "table":
+            rows = _xml_table_to_rows(tag)
+            if not rows:
+                continue
+            cls = _classify_table(rows)
+            if cls in ("BS", "IS"):
+                out[cls].append((tag, rows, current_scope))
+    return out
+
+
+def _filter_tables_by_scope(tables: list[tuple], fs_div: Optional[str]) -> list[tuple]:
+    """
+    연결/별도 혼재 문서에서 해결된 fs_div 스코프의 테이블만 남긴다.
+
+    해당 스코프의 테이블이 하나라도 있으면 그 스코프로 제한하고(다른 스코프·스코프
+    미상 테이블 제외), 없으면 원본 그대로 둔다. 단일 스코프/스코프 미상 문서(별도
+    감사보고서 등)를 과도하게 비우지 않기 위함이다.
+    """
+    if not fs_div:
+        return tables
+    matching = [t for t in tables if len(t) > 2 and t[2] == fs_div]
+    return matching if matching else tables
 
 
 def _table_has_meaningful_amount(rows: list[list[str]]) -> bool:
@@ -373,6 +436,7 @@ def _make_doc_detail(
     confidence: str,
     flags: Optional[list[str]] = None,
     value_state: Optional[str] = None,
+    table_scope: Optional[str] = None,
 ) -> dict:
     detail_flags = list(flags or [])
     if unit_confidence == "assumed_won":
@@ -387,6 +451,7 @@ def _make_doc_detail(
         source={
             "source_type": "document_xml",
             "statement": statement,
+            "fs_scope": table_scope,
             "table_id": table_id,
             "row_id": f"R{row_idx + 1}",
             "row_label": row_label,
@@ -411,6 +476,7 @@ def find_item_detail_in_table(
     force_positive: bool = False,
     statement: str = "",
     table_id: str = "",
+    table_scope: Optional[str] = None,
 ) -> Optional[dict]:
     """Find one item in rows and return a rich detail record."""
     if not rows:
@@ -470,6 +536,7 @@ def find_item_detail_in_table(
                 confidence=confidence,
                 flags=flags,
                 value_state=value_state,
+                table_scope=table_scope,
             )
 
         for ci in range(1, len(row)):
@@ -502,6 +569,7 @@ def find_item_detail_in_table(
                 column_label=_column_label(rows, ci),
                 confidence="low_confidence",
                 flags=flags,
+                table_scope=table_scope,
             )
 
     return None
@@ -548,7 +616,10 @@ def find_item_in_table(
     return detail.get("value") if detail else None
 
 
-def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
+def _extract_all_item_details(
+    soup: BeautifulSoup,
+    fs_div: Optional[str] = None,
+) -> dict[str, dict]:
     """
     파싱된 DART XML에서 모든 FINANCIAL_ITEMS를 추출한다.
 
@@ -559,8 +630,13 @@ def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
 
     주석 섹션은 제외하지 않음: 추후 감가상각비 등 주석 기반 추출 확장 가능.
 
+    fs_div가 주어지면 연결/별도 혼재 문서에서 그 스코프의 테이블만 읽는다.
+    사업보고서 본문은 빈 연결재무제표 섹션과 채워진 별도 재무제표 섹션을 함께
+    담을 수 있어, 스코프 필터 없이는 첫 매칭(빈 연결) 표를 읽어 0을 반환한다.
+
     Args:
-        soup: _parse_dart_xml() 반환값
+        soup:   _parse_dart_xml() 반환값
+        fs_div: "CFS"/"OFS" (선택). 혼재 문서에서 읽을 스코프 제한.
 
     Returns:
         항목명 → item_details 딕셔너리
@@ -574,31 +650,31 @@ def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
         for item in FINANCIAL_ITEMS
     }
 
-    # 1차: TITLE 태그 기반 섹션 분류
+    # 1차: TITLE 태그 기반 섹션 분류 (스코프 포함)
     section_map = _build_section_table_map(soup)
     bs_tables = section_map["BS"]
     is_tables = section_map["IS"]
     cf_tables = section_map["CF"]
 
-    # TITLE 기반 분류 실패 시 (BS/IS 모두 비어있으면) 키워드 fallback
+    # TITLE 기반 분류 실패 시 (BS/IS 모두 비어있으면) 키워드 fallback (스코프 포함)
     if not bs_tables and not is_tables:
-        for table_tag in soup.find_all("table"):
-            rows = _xml_table_to_rows(table_tag)
-            if not rows:
-                continue
-            fs_type = _classify_table(rows)
-            if fs_type == "BS":
-                bs_tables.append((table_tag, rows))
-            elif fs_type == "IS":
-                is_tables.append((table_tag, rows))
+        fallback = _classify_tables_with_scope(soup)
+        bs_tables = fallback["BS"]
+        is_tables = fallback["IS"]
+
+    # 연결/별도 혼재 문서면 해결된 스코프의 표만 남긴다.
+    bs_tables = _filter_tables_by_scope(bs_tables, fs_div)
+    is_tables = _filter_tables_by_scope(is_tables, fs_div)
+    cf_tables = _filter_tables_by_scope(cf_tables, fs_div)
 
     def _table_entries(fs_type: str, tables: list[tuple]) -> list[dict]:
         entries: list[dict] = []
-        for idx, (tag, rows) in enumerate(tables, start=1):
+        for idx, (tag, rows, scope) in enumerate(tables, start=1):
             unit, unit_confidence = _detect_table_unit_info(tag, rows)
             entries.append({
                 "tag": tag,
                 "rows": rows,
+                "scope": scope,
                 "unit": unit,
                 "unit_confidence": unit_confidence,
                 "statement": fs_type,
@@ -626,6 +702,7 @@ def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
                 force_positive=item["name"] == "매출원가",
                 statement=entry["statement"],
                 table_id=entry["table_id"],
+                table_scope=entry["scope"],
             )
             if detail is not None and detail.get("value") is not None:
                 result[item["name"]] = detail
@@ -634,41 +711,52 @@ def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
     return result
 
 
-def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
+def _extract_all_items(
+    soup: BeautifulSoup,
+    fs_div: Optional[str] = None,
+) -> dict[str, Optional[float]]:
     """
     Backward-compatible wrapper returning item -> numeric value.
 
     New code should prefer ``_extract_all_item_details``.
     """
-    return details_to_items(_extract_all_item_details(soup))
+    return details_to_items(_extract_all_item_details(soup, fs_div=fs_div))
 
 
-def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
+def _extract_table_text_for_ai(
+    soup: BeautifulSoup,
+    fs_div: Optional[str] = None,
+) -> str:
     """
     BS/IS/CF 테이블의 텍스트를 AI 재추출용으로 압축하여 반환한다.
 
     TITLE 기반 섹션 분류된 테이블만 포함하여 불필요한 텍스트를 줄인다.
-    각 행은 '항목명: 값' 형태로 변환한다.
+    각 행은 '항목명: 값' 형태로 변환한다. fs_div가 주어지면 Python 추출과 같은
+    스코프의 표만 AI에 보여, 연결/별도 혼재 문서에서 AI가 다른 스코프 표를 보고
+    엇갈린 판정을 내리지 않도록 한다.
 
     Args:
-        soup: _parse_dart_xml() 반환값
+        soup:   _parse_dart_xml() 반환값
+        fs_div: "CFS"/"OFS" (선택). 혼재 문서에서 포함할 스코프 제한.
 
     Returns:
         테이블 텍스트 문자열 (최대 8000자)
     """
     section_map = _build_section_table_map(soup)
+    fallback = None
     lines: list[str] = []
 
     for fs_type in ("BS", "IS", "CF"):
         tables = section_map.get(fs_type, [])
         # TITLE 기반이 비어있으면 키워드 fallback (BS/IS만)
         if not tables and fs_type in ("BS", "IS"):
-            for table_tag in soup.find_all("table"):
-                rows = _xml_table_to_rows(table_tag)
-                if rows and _classify_table(rows) == fs_type:
-                    tables.append((table_tag, rows))
+            if fallback is None:
+                fallback = _classify_tables_with_scope(soup)
+            tables = fallback.get(fs_type, [])
 
-        for tag, rows in tables:
+        tables = _filter_tables_by_scope(tables, fs_div)
+
+        for tag, rows, _scope in tables:
             unit = _detect_unit_multiplier(tag)
             if unit == 1:
                 unit = _detect_unit_from_rows(rows, fallback=1)
@@ -760,9 +848,9 @@ def get_financial_data_path_b(
     fs_div = _infer_path_b_fs_div(soup, report_type=report_type)
     _log("DATA_B", f"  재무제표 기준: {fs_div} (report_type={report_type})")
 
-    # 3. Python 항목 추출
+    # 3. Python 항목 추출 (해결된 연결/별도 스코프로 테이블 제한)
     t0 = _time.perf_counter()
-    item_details = _extract_all_item_details(soup)
+    item_details = _extract_all_item_details(soup, fs_div=fs_div)
     items = details_to_items(item_details)
     elapsed = _time.perf_counter() - t0
     matched = sum(1 for v in items.values() if v is not None)
@@ -773,7 +861,7 @@ def get_financial_data_path_b(
     try:
         from config import get_gemini_api_key
         if get_gemini_api_key():
-            table_text = _extract_table_text_for_ai(soup)
+            table_text = _extract_table_text_for_ai(soup, fs_div=fs_div)
             if table_text.strip():
                 _log("AI", "  AI 비교 추출 시작...")
                 t0 = _time.perf_counter()

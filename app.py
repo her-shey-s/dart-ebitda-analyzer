@@ -136,20 +136,36 @@ def _depreciation_trace_text(result: dict) -> str:
     return "\n".join(header + ["로그 없음"])
 
 
+def _result_validation_status(result: dict) -> Optional[str]:
+    """결과의 검증 상태(verified/partial/failed_validation/unverified)를 반환한다.
+
+    구버전 결과(validation_status 없음)는 is_valid로 폴백한다.
+    """
+    val = result.get("validation")
+    if not val:
+        return None
+    status = val.get("validation_status")
+    if status is not None:
+        return status
+    return "verified" if val.get("is_valid") else "failed_validation"
+
+
 def _validation_status_label(result: dict, use_icon: bool = True) -> str:
     """결과 딕셔너리의 검증 상태를 짧은 라벨로 반환한다."""
-    val = result.get("validation")
     if result["status"] != "ok":
         return result["error_msg"]
-    if not val:
+    status = _result_validation_status(result)
+    if status is None:
         return "검증정보 없음"
 
-    if val["is_valid"]:
-        label = "통과"
-        return f"✓ {label}" if use_icon else label
+    label, icon = {
+        "verified":         ("통과", "✓"),
+        "partial":          ("일부검증", "△"),
+        "failed_validation": ("검증실패", "✗"),
+        "unverified":       ("검증불가", "?"),
+    }.get(status, ("검증불가", "?"))
 
-    label = "검증실패"
-    return f"✗ {label}" if use_icon else label
+    return f"{icon} {label}" if use_icon else label
 
 
 def _processing_status_detail(result: dict) -> str:
@@ -207,8 +223,8 @@ def _validation_reason_lines(result: dict, include_ai: bool = True) -> list[str]
         return ["검증 정보가 없습니다."]
 
     lines: list[str] = []
-    failed_checks = [c for c in val.get("checks", []) if not c.get("passed")]
-    skipped_checks = [c for c in val.get("checks", []) if c.get("passed") and c.get("note")]
+    failed_checks = [c for c in val.get("checks", []) if c.get("status") == "failed"]
+    skipped_checks = [c for c in val.get("checks", []) if c.get("status") == "skipped_missing_data"]
 
     if failed_checks:
         severity_map = {"critical": "치명", "warning": "경고", "info": "참고"}
@@ -513,7 +529,11 @@ def _render_validation_detail(result: dict) -> None:
     rows = []
     for c in val["checks"]:
         sev_icon = {"critical": "🔴", "warning": "🟡", "info": "🔵"}.get(c["severity"], "⚪")
-        passed_icon = "✓" if c["passed"] else "✗"
+        passed_icon = {
+            "passed": "✓",
+            "failed": "✗",
+            "skipped_missing_data": "➖",
+        }.get(c.get("status"), "✗" if c.get("passed") is False else "✓")
         exp = c.get("expected")
         act = c.get("actual")
         diff = c.get("diff")
@@ -890,16 +910,28 @@ if st.session_state.results:
         # 집계 요약
         ok_results = [r for r in results if r["status"] == "ok"]
         if ok_results:
+            # 검증 통과(verified)와 추출 성공을 명확히 분리한다.
+            # 스킵(필수 항목 누락)은 통과가 아니라 partial로 집계된다.
+            statuses = [_result_validation_status(r) for r in ok_results]
+            n_verified = statuses.count("verified")
+            n_partial = statuses.count("partial")
+            n_failed = statuses.count("failed_validation")
+
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("총 분석 건수", f"{len(results)}건")
             col2.metric("데이터 추출 성공", f"{len(ok_results)}건")
-            col3.metric("검증 통과",  f"{sum(1 for r in ok_results if r['validation'] and r['validation']['is_valid'])}건")
-            col4.metric("검증 실패",  f"{sum(1 for r in ok_results if r['validation'] and not r['validation']['is_valid'])}건")
+            col3.metric(
+                "검증 통과", f"{n_verified}건",
+                delta=(f"일부검증 {n_partial}건" if n_partial else None),
+                delta_color="off",
+            )
+            col4.metric("검증 실패", f"{n_failed}건")
 
     # ── 탭2: 상세 ─────────────────────────────────────────────────────────────
     with tab_detail:
         for r in results:
-            label_icon = "✓" if r["status"] == "ok" and r["validation"] and r["validation"]["is_valid"] else "✗"
+            vstatus = _result_validation_status(r) if r["status"] == "ok" else None
+            label_icon = {"verified": "✓", "partial": "△", "failed_validation": "✗"}.get(vstatus, "✗")
             label = f"{label_icon} {r['corp_name']} · {r['year']}년 · {r['path']} · {r['report_nm']}"
             with st.expander(label):
                 _render_validation_detail(r)
