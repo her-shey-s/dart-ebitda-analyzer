@@ -90,7 +90,9 @@ def _run_path_b(manifest: dict, raw_dir: Path, stack: ExitStack) -> dict:
     )
 
 
-def _run_depreciation(manifest: dict, raw_dir: Path, stack: ExitStack) -> dict:
+def _run_depreciation(
+    manifest: dict, raw_dir: Path, stack: ExitStack, fs_div: Optional[str]
+) -> dict:
     docs = [(raw_dir / manifest["raw"]["xml"]).read_bytes()]
     stack.enter_context(
         mock.patch(
@@ -101,7 +103,9 @@ def _run_depreciation(manifest: dict, raw_dir: Path, stack: ExitStack) -> dict:
 
     return extract_depreciation(
         manifest["rcept_no"],
-        fs_div=manifest.get("fs_div", "CFS"),
+        # 파이프라인과 동일하게 '재무 추출이 결정한 fs_div'를 넘긴다.
+        # 그래야 fs_div 회귀가 감가상각 스코프를 통해서도 골든 비교에 걸린다.
+        fs_div=fs_div or manifest.get("fs_div", "CFS"),
         strict_scope=manifest.get("strict_scope", manifest["path"] == "A"),
     )
 
@@ -130,7 +134,7 @@ def build_result(manifest: dict, fixture_dir: str | Path) -> dict:
             fs_div = data.get("fs_div")
 
         if run.get("depreciation", False):
-            d = _run_depreciation(manifest, raw_dir, stack)
+            d = _run_depreciation(manifest, raw_dir, stack, fs_div)
             depr_norm = {
                 "items": {k: d.get("items", {}).get(k) for k in _DEPR_KEYS},
                 "combined": bool(d.get("combined")),

@@ -176,6 +176,53 @@ def _build_section_table_map(
     return result
 
 
+# 연결/별도 스코프 판별에 쓰는 합계성 행 라벨 (정규화 후)
+_SCOPE_TOTAL_LABELS = {
+    "자산총계", "부채총계", "자본총계",
+    "매출액", "영업수익", "매출총이익", "영업이익", "당기순이익",
+}
+# 재무제표 본문 타이틀로 인정하는 키워드 (섹션 헤더 "연결재무제표"는 제외)
+_STATEMENT_TITLE_KEYWORDS = ("재무상태표", "손익계산서", "포괄손익계산서", "현금흐름표")
+
+
+def _table_has_meaningful_amount(rows: list[list[str]]) -> bool:
+    """합계성 행(자산총계·매출액 등)에 0이 아닌 실제 금액이 있으면 True."""
+    for row in rows:
+        if not row:
+            continue
+        if normalize_label(row[0]) in _SCOPE_TOTAL_LABELS:
+            for cell in row[1:]:
+                v = _to_float(cell)
+                if v is not None and abs(v) > 0:
+                    return True
+    return False
+
+
+def _has_populated_consolidated_statements(soup: BeautifulSoup) -> bool:
+    """
+    연결 재무제표 섹션에 '실제 데이터가 채워진' 표가 있는지 확인한다.
+
+    사업보고서 본문은 별도 전용 회사도 "2.연결재무제표"·"3.연결재무제표주석" 같은
+    빈 섹션 헤더 타이틀을 포함한다. 따라서 타이틀 문자열만으로 연결을 판정하면
+    별도 전용 회사를 연결로 오판한다. 섹션 헤더로 연결/별도 구간을 구분한 뒤,
+    연결 구간 안에 합계성 금액이 채워진 표가 있을 때만 연결로 본다.
+    """
+    in_consolidated = False
+    for tag in soup.descendants:
+        if tag.name == "title":
+            norm = _normalize_title(tag.get_text(strip=True))
+            has_stmt = any(k in norm for k in _STATEMENT_TITLE_KEYWORDS)
+            is_fs_section = has_stmt or ("재무제표" in norm)
+            if not is_fs_section:
+                continue  # 본문과 무관한 타이틀은 구간을 바꾸지 않음
+            in_consolidated = "연결" in norm
+        elif tag.name == "table" and in_consolidated:
+            rows = _xml_table_to_rows(tag)
+            if rows and _table_has_meaningful_amount(rows):
+                return True
+    return False
+
+
 def _infer_path_b_fs_div(
     soup: BeautifulSoup,
     report_type: Optional[str] = None,
@@ -184,17 +231,16 @@ def _infer_path_b_fs_div(
     경로B 문서의 재무제표 기준(CFS/OFS)을 추론한다.
 
     report_finder가 이미 연결/별도 보고서 유형을 식별했으면 그 값을 우선 사용한다.
+    그 외(사업보고서 본문 등)에는 연결 재무제표가 '데이터와 함께' 실재할 때만
+    CFS로 판정한다. 빈 연결 섹션 헤더만 있는 별도 전용 회사는 OFS로 본다.
     """
     if report_type == "audit_consol":
         return "CFS"
     if report_type == "audit_separate":
         return "OFS"
 
-    for title_tag in soup.find_all("title"):
-        norm = _normalize_title(title_tag.get_text(strip=True))
-        if "연결" in norm and any(kw in norm for kw in ("재무상태표", "손익계산서", "포괄손익계산서", "현금흐름표", "재무제표주석")):
-            return "CFS"
-
+    if _has_populated_consolidated_statements(soup):
+        return "CFS"
     return "OFS"
 
 
