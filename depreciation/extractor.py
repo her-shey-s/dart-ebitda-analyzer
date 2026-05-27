@@ -606,7 +606,11 @@ def _collect_depreciation_tables(
                     )
                 continue
 
+            # 캡션/부모/헤더 태그에서 단위 감지 실패 시, 표 안의 "(단위: 천원)"
+            # 같은 행에서 다시 찾는다(단위 표기가 표 밖이 아니라 표 안에 있는 케이스).
             unit = _detect_unit_multiplier(tag)
+            if unit == 1:
+                unit = _detect_unit_from_rows(rows, fallback=1)
 
             # AI용 텍스트 생성
             text_lines = []

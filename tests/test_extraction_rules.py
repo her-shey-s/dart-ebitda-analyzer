@@ -15,7 +15,9 @@ import pytest
 
 from config import ITEM_MAP
 from depreciation.extractor import (
+    _collect_depreciation_tables,
     _is_general_depreciation_label,
+    _parse_dart_xml,
     _sum_general_depreciation_in_table,
 )
 from financial.doc_extractor import find_item_detail_in_table
@@ -103,3 +105,30 @@ def test_positive_retained_earnings_not_negated():
 def test_retained_earnings_sign_matrix(label, cell, expected):
     rows = [["과목", "당기"], [label, cell]]
     assert _retained_earnings_value(rows) == expected
+
+
+# ── 3) 표 안에 단위 표기가 있는 케이스 (시아스 2023) ──────────────────────────
+# "(단위: 천원)"이 표 밖(캡션/헤더)이 아니라 표 안의 행으로 들어있으면,
+# 수집 단계에서 행 기반 단위 fallback을 적용해 unit=1000으로 잡아야 한다.
+_IN_TABLE_UNIT_XML = """<DOCUMENT>
+<TITLE>주석</TITLE>
+<TITLE>32. 현금흐름</TITLE>
+<TABLE>
+<TR><TD>(단위: 천원)</TD></TR>
+<TR><TD>구분</TD><TD>당기</TD><TD>전기</TD></TR>
+<TR><TD>당기순이익</TD><TD>1,444,939</TD><TD>(11,788,687)</TD></TR>
+<TR><TD>감가상각비</TD><TD>8,701,905</TD><TD>7,556,314</TD></TR>
+<TR><TD>사용권자산상각비</TD><TD>2,198,937</TD><TD>1,131,673</TD></TR>
+<TR><TD>무형자산상각비</TD><TD>194,294</TD><TD>200,360</TD></TR>
+</TABLE>
+</DOCUMENT>""".encode()
+
+
+def test_in_table_unit_marker_detected():
+    soup = _parse_dart_xml(_IN_TABLE_UNIT_XML)
+    tables = _collect_depreciation_tables(soup)
+    assert len(tables) == 1
+    # 표 안의 "(단위: 천원)" → unit=1000
+    assert tables[0]["unit"] == 1000
+    # 합산 결과도 천원 보정되어야 함 (감가상각비만, 사용권/무형 제외)
+    assert _sum_general_depreciation_in_table(tables, "T1") == 8_701_905 * 1000
