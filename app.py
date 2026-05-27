@@ -16,7 +16,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from config import FINANCIAL_ITEMS, get_gemini_api_key
+from config import FINANCIAL_ITEMS, get_dart_api_key, get_gemini_api_key
 from dart_api.corp_search import download_corp_codes, get_company_info_batch, search_corp
 from pipeline import analyze_one as _analyze_one
 from utils.analysis_logger import format_amount
@@ -552,7 +552,7 @@ with st.sidebar:
     st.divider()
 
     # ── API 키 입력 ──────────────────────────────────────────────────────
-    with st.expander("🔑 API 키 설정", expanded=not st.session_state.get("dart_api_key")):
+    with st.expander("🔑 API 키 설정", expanded=not get_dart_api_key()):
         st.text_input(
             "DART API Key",
             key="dart_api_key",
@@ -697,8 +697,8 @@ def _clear_disambig_state() -> None:
 # ── 분석 실행 ─────────────────────────────────────────────────────────────────
 if analyze_btn:
     corps = [c.strip() for c in corp_input.splitlines() if c.strip()][:100]
-    if not st.session_state.get("dart_api_key"):
-        st.warning("사이드바에서 DART API 키를 입력하세요.")
+    if not get_dart_api_key():
+        st.warning("사이드바에서 DART API 키를 입력하거나 Streamlit secrets에 DART_API_KEY를 설정하세요.")
     elif not corps:
         st.warning("기업명을 입력하세요.")
     elif not years_selected:

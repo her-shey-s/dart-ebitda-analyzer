@@ -9,29 +9,38 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── API 키 ──────────────────────────────────────────────────────────────
-# 우선순위: st.session_state (UI 입력) > 환경변수 (.env)
+# 우선순위: st.session_state (UI 입력) > Streamlit secrets > 환경변수 (.env)
 
-def get_dart_api_key() -> str:
-    """DART API 키를 반환한다. UI 입력값 우선, 없으면 환경변수 fallback."""
+def _get_streamlit_value(name: str, session_key: str) -> str:
+    """Streamlit session_state/secrets에서 API 키를 조회한다."""
     try:
         import streamlit as st
-        val = st.session_state.get("dart_api_key", "")
+
+        val = st.session_state.get(session_key, "")
         if val:
             return val
+
+        val = st.secrets.get(name, "")
+        if val:
+            return str(val)
     except Exception:
         pass
+    return ""
+
+
+def get_dart_api_key() -> str:
+    """DART API 키를 반환한다. UI 입력값 우선, 없으면 secrets/env fallback."""
+    val = _get_streamlit_value("DART_API_KEY", "dart_api_key")
+    if val:
+        return val
     return os.getenv("DART_API_KEY", "")
 
 
 def get_gemini_api_key() -> str:
-    """Gemini API 키를 반환한다. UI 입력값 우선, 없으면 환경변수 fallback."""
-    try:
-        import streamlit as st
-        val = st.session_state.get("gemini_api_key", "")
-        if val:
-            return val
-    except Exception:
-        pass
+    """Gemini API 키를 반환한다. UI 입력값 우선, 없으면 secrets/env fallback."""
+    val = _get_streamlit_value("GEMINI_API_KEY", "gemini_api_key")
+    if val:
+        return val
     return os.getenv("GEMINI_API_KEY", "")
 
 # ── DART API 엔드포인트 ──────────────────────────────────────────────────
