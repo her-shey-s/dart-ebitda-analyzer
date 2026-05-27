@@ -39,6 +39,12 @@ from utils.units import (
     detect_unit_in_text as _detect_unit_in_text,
     unit_label as _unit_label,
 )
+from financial.extraction_result import (
+    details_to_items,
+    empty_item_detail,
+    make_item_detail,
+    reconcile_details_with_final_items,
+)
 
 # 재무상태표 판별 키워드
 _BS_KEYWORDS = {"자산총계", "부채총계", "자본총계", "유동자산", "비유동자산"}
@@ -279,6 +285,181 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
 
 # ── 항목 추출 ──────────────────────────────────────────────────────────────
 
+def _detect_table_unit_info(table_tag, rows: list[list[str]]) -> tuple[int, str]:
+    """Return (unit_multiplier, confidence_label) for a parsed table."""
+    unit = _detect_unit_multiplier(table_tag, fallback=0)
+    if unit:
+        return unit, "detected_from_tag"
+    unit = _detect_unit_from_rows(rows, fallback=0)
+    if unit:
+        return unit, "detected_from_rows"
+    return 1, "assumed_won"
+
+
+def _column_label(rows: list[list[str]], col_idx: int) -> Optional[str]:
+    """Build a compact human-readable label for a table column."""
+    parts: list[str] = []
+    for row in rows[:5]:
+        if col_idx >= len(row):
+            continue
+        cell = re.sub(r"\s+", " ", row[col_idx]).strip()
+        if not cell or _to_float(cell) is not None:
+            continue
+        if cell not in parts:
+            parts.append(cell)
+    return " / ".join(parts) if parts else None
+
+
+def _make_doc_detail(
+    item_name: str,
+    *,
+    value: Optional[float],
+    raw_value: str | None,
+    unit_multiplier: int,
+    unit_confidence: str,
+    statement: str,
+    table_id: str,
+    row_idx: int,
+    row_label: str,
+    normalized_label: str,
+    col_idx: Optional[int],
+    column_label: Optional[str],
+    confidence: str,
+    flags: Optional[list[str]] = None,
+    value_state: Optional[str] = None,
+) -> dict:
+    detail_flags = list(flags or [])
+    if unit_confidence == "assumed_won":
+        detail_flags.append("unit_assumed_won")
+        if confidence == "verified":
+            confidence = "low_confidence"
+    return make_item_detail(
+        item_name,
+        value=value,
+        raw_value=raw_value,
+        unit_multiplier=unit_multiplier,
+        source={
+            "source_type": "document_xml",
+            "statement": statement,
+            "table_id": table_id,
+            "row_id": f"R{row_idx + 1}",
+            "row_label": row_label,
+            "normalized_row_label": normalized_label,
+            "column_id": f"C{col_idx + 1}" if col_idx is not None else None,
+            "column_label": column_label,
+            "unit_confidence": unit_confidence,
+        },
+        confidence=confidence,
+        value_state=value_state,
+        flags=detail_flags,
+    )
+
+
+def find_item_detail_in_table(
+    item_name: str,
+    rows: list[list[str]],
+    keywords: list[str],
+    negate_keywords: list[str] | None = None,
+    unit_multiplier: int = 1,
+    unit_confidence: str = "unknown",
+    force_positive: bool = False,
+    statement: str = "",
+    table_id: str = "",
+) -> Optional[dict]:
+    """Find one item in rows and return a rich detail record."""
+    if not rows:
+        return None
+
+    keyword_set = set(keywords)
+    negate_set = set(negate_keywords) if negate_keywords else set()
+
+    header = rows[0] if rows else []
+    skip_cols = {
+        ci for ci, cell in enumerate(header)
+        if "주석" in re.sub(r"\s+", "", cell)
+    }
+
+    current_col = _detect_current_column(rows)
+
+    for row_idx, row in enumerate(rows):
+        if not row:
+            continue
+        norm = normalize_label(row[0])
+        if norm not in keyword_set:
+            continue
+
+        base_flags: list[str] = ["matched_by_normalized_label"]
+
+        if current_col is not None and current_col < len(row):
+            raw = row[current_col]
+            val = _to_float(raw)
+            flags = list(base_flags)
+            confidence = "verified"
+            value_state = "extracted"
+            if val is None:
+                val = 0.0
+                confidence = "low_confidence"
+                value_state = "zero_assumed_from_non_numeric_current_cell"
+                flags.append("non_numeric_current_cell_zero_assumed")
+            val = val * unit_multiplier
+            if force_positive and val < 0:
+                val = abs(val)
+                flags.append("force_positive")
+            if norm in negate_set and val > 0:
+                val = -val
+                flags.append("negated_by_label")
+            return _make_doc_detail(
+                item_name,
+                value=val,
+                raw_value=raw,
+                unit_multiplier=unit_multiplier,
+                unit_confidence=unit_confidence,
+                statement=statement,
+                table_id=table_id,
+                row_idx=row_idx,
+                row_label=row[0],
+                normalized_label=norm,
+                col_idx=current_col,
+                column_label=_column_label(rows, current_col),
+                confidence=confidence,
+                flags=flags,
+                value_state=value_state,
+            )
+
+        for ci in range(1, len(row)):
+            if ci in skip_cols:
+                continue
+            raw = row[ci]
+            val = _to_float(raw)
+            if val is None:
+                continue
+            flags = base_flags + ["current_column_not_detected", "first_numeric_column_used"]
+            val = val * unit_multiplier
+            if force_positive and val < 0:
+                val = abs(val)
+                flags.append("force_positive")
+            if norm in negate_set and val > 0:
+                val = -val
+                flags.append("negated_by_label")
+            return _make_doc_detail(
+                item_name,
+                value=val,
+                raw_value=raw,
+                unit_multiplier=unit_multiplier,
+                unit_confidence=unit_confidence,
+                statement=statement,
+                table_id=table_id,
+                row_idx=row_idx,
+                row_label=row[0],
+                normalized_label=norm,
+                col_idx=ci,
+                column_label=_column_label(rows, ci),
+                confidence="low_confidence",
+                flags=flags,
+            )
+
+    return None
+
 def find_item_in_table(
     rows: list[list[str]],
     keywords: list[str],
@@ -310,59 +491,18 @@ def find_item_in_table(
     Returns:
         금액(float, 원 단위) 또는 None
     """
-    if not rows:
-        return None
-
-    keyword_set = set(keywords)
-    negate_set  = set(negate_keywords) if negate_keywords else set()
-
-    # 주석 컬럼 인덱스 탐지: 헤더 행에 "주석" 포함 → 금액 컬럼 탐색 시 제외
-    # 공백 제거 후 비교: DART XML에서 "주  석", "주   석" 등 변종 대응
-    header = rows[0] if rows else []
-    skip_cols = {
-        ci for ci, cell in enumerate(header)
-        if "주석" in re.sub(r"\s+", "", cell)
-    }
-
-    # 당기 컬럼 탐지
-    current_col = _detect_current_column(rows)
-
-    for row in rows:
-        if not row:
-            continue
-        norm = normalize_label(row[0])
-        if norm in keyword_set:
-            # 당기 컬럼이 탐지된 경우: 해당 컬럼만 참조
-            if current_col is not None and current_col < len(row):
-                val = _to_float(row[current_col])
-                if val is None:
-                    # '-' 등 비숫자 → 항목 행이 존재하므로 0 처리
-                    return 0.0
-                val = val * unit_multiplier
-                if force_positive:
-                    val = abs(val)
-                if norm in negate_set and val > 0:
-                    val = -val
-                return val
-
-            # 당기 컬럼 미탐지 시 폴백: 첫 번째 숫자 컬럼
-            # → 이중 컬럼 구조(소계/상세 행이 다른 col에 값)에서도 동작
-            for ci in range(1, len(row)):
-                if ci in skip_cols:
-                    continue
-                val = _to_float(row[ci])
-                if val is not None:
-                    val = val * unit_multiplier
-                    if force_positive:
-                        val = abs(val)
-                    if norm in negate_set and val > 0:
-                        val = -val
-                    return val
-
-    return None
+    detail = find_item_detail_in_table(
+        "_legacy",
+        rows,
+        keywords,
+        negate_keywords=negate_keywords,
+        unit_multiplier=unit_multiplier,
+        force_positive=force_positive,
+    )
+    return detail.get("value") if detail else None
 
 
-def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
+def _extract_all_item_details(soup: BeautifulSoup) -> dict[str, dict]:
     """
     파싱된 DART XML에서 모든 FINANCIAL_ITEMS를 추출한다.
 
@@ -377,9 +517,16 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
         soup: _parse_dart_xml() 반환값
 
     Returns:
-        항목명 → 금액(float|None) 딕셔너리
+        항목명 → item_details 딕셔너리
     """
-    result: dict[str, Optional[float]] = {item["name"]: None for item in FINANCIAL_ITEMS}
+    result: dict[str, dict] = {
+        item["name"]: empty_item_detail(
+            item["name"],
+            source={"source_type": "document_xml", "statement": item["fs_type"]},
+            flags=["not_found"],
+        )
+        for item in FINANCIAL_ITEMS
+    }
 
     # 1차: TITLE 태그 기반 섹션 분류
     section_map = _build_section_table_map(soup)
@@ -399,35 +546,55 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
             elif fs_type == "IS":
                 is_tables.append((table_tag, rows))
 
-    # 테이블별 단위 승수를 미리 계산해 캐시
-    def _table_unit(tag, rows) -> int:
-        unit = _detect_unit_multiplier(tag)
-        if unit == 1:
-            unit = _detect_unit_from_rows(rows, fallback=1)
-        return unit
+    def _table_entries(fs_type: str, tables: list[tuple]) -> list[dict]:
+        entries: list[dict] = []
+        for idx, (tag, rows) in enumerate(tables, start=1):
+            unit, unit_confidence = _detect_table_unit_info(tag, rows)
+            entries.append({
+                "tag": tag,
+                "rows": rows,
+                "unit": unit,
+                "unit_confidence": unit_confidence,
+                "statement": fs_type,
+                "table_id": f"{fs_type}{idx}",
+            })
+        return entries
 
     typed_tables = {
-        "BS": [(tag, rows, _table_unit(tag, rows)) for tag, rows in bs_tables],
-        "IS": [(tag, rows, _table_unit(tag, rows)) for tag, rows in is_tables],
-        "CF": [(tag, rows, _table_unit(tag, rows)) for tag, rows in cf_tables],
+        "BS": _table_entries("BS", bs_tables),
+        "IS": _table_entries("IS", is_tables),
+        "CF": _table_entries("CF", cf_tables),
     }
 
     for item in FINANCIAL_ITEMS:
         search_order = typed_tables.get(item["fs_type"], typed_tables["IS"])
 
-        for _tag, rows, unit in search_order:
-            val = find_item_in_table(
-                rows,
+        for entry in search_order:
+            detail = find_item_detail_in_table(
+                item["name"],
+                entry["rows"],
                 item["keywords"],
-                item.get("negate_keywords"),
-                unit_multiplier=unit,
+                negate_keywords=item.get("negate_keywords"),
+                unit_multiplier=entry["unit"],
+                unit_confidence=entry["unit_confidence"],
                 force_positive=item["name"] == "매출원가",
+                statement=entry["statement"],
+                table_id=entry["table_id"],
             )
-            if val is not None:
-                result[item["name"]] = val
+            if detail is not None and detail.get("value") is not None:
+                result[item["name"]] = detail
                 break
 
     return result
+
+
+def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
+    """
+    Backward-compatible wrapper returning item -> numeric value.
+
+    New code should prefer ``_extract_all_item_details``.
+    """
+    return details_to_items(_extract_all_item_details(soup))
 
 
 def _extract_table_text_for_ai(soup: BeautifulSoup) -> str:
@@ -506,6 +673,14 @@ def get_financial_data_path_b(
     _log = log_fn or (lambda tag, msg: None)
 
     empty_items = {item["name"]: None for item in FINANCIAL_ITEMS}
+    empty_details = {
+        item["name"]: empty_item_detail(
+            item["name"],
+            source={"source_type": "document_xml", "statement": item["fs_type"]},
+            flags=["not_extracted"],
+        )
+        for item in FINANCIAL_ITEMS
+    }
 
     # 1. 다운로드
     _log("DATA_B", f"  document.xml ZIP 다운로드 중 (rcept_no={rcept_no})...")
@@ -516,6 +691,7 @@ def get_financial_data_path_b(
         _log("DATA_B", f"  다운로드 실패 ({elapsed:.2f}초)")
         return {
             "items": empty_items,
+            "item_details": empty_details,
             "fs_div": None, "error": f"document.xml 다운로드 실패 (rcept_no={rcept_no})",
             "ai_comparison": None,
         }
@@ -529,6 +705,7 @@ def get_financial_data_path_b(
         _log("DATA_B", f"  XML 파싱 실패 ({elapsed:.2f}초)")
         return {
             "items": empty_items,
+            "item_details": empty_details,
             "fs_div": None, "error": "DART XML 파싱 실패",
             "ai_comparison": None,
         }
@@ -539,7 +716,8 @@ def get_financial_data_path_b(
 
     # 3. Python 항목 추출
     t0 = _time.perf_counter()
-    items = _extract_all_items(soup)
+    item_details = _extract_all_item_details(soup)
+    items = details_to_items(item_details)
     elapsed = _time.perf_counter() - t0
     matched = sum(1 for v in items.values() if v is not None)
     _log("DATA_B", f"  Python 추출 완료 ({elapsed:.2f}초): {len(items)}개 항목 중 {matched}개 매칭")
@@ -558,11 +736,17 @@ def get_financial_data_path_b(
                 elapsed = _time.perf_counter() - t0
                 _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")
                 items = ai_comparison["items"]  # 최종 결과 사용
+                item_details = reconcile_details_with_final_items(
+                    item_details,
+                    items,
+                    ai_comparison=ai_comparison,
+                )
     except Exception as e:
         _log("AI", f"  AI 비교 실패: {e}")
 
     return {
         "items":         items,
+        "item_details":  item_details,
         "fs_div":        fs_div,
         "error":         None,
         "ai_comparison": ai_comparison,

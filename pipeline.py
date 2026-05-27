@@ -12,6 +12,12 @@ from dart_api.corp_search import search_corp
 from dart_api.report_finder import find_report
 from financial.api_extractor import get_financial_data_path_a
 from financial.doc_extractor import get_financial_data_path_b
+from financial.extraction_result import (
+    annotate_report_source,
+    details_from_items,
+    empty_item_details,
+    make_item_detail,
+)
 from depreciation.extractor import extract_depreciation
 from utils.analysis_logger import AnalysisLogger, format_amount
 from validator.rules import validate
@@ -45,6 +51,7 @@ def analyze_one(
         "report_type":   "-",
         "fs_div":        "-",
         "items":         {item["name"]: None for item in FINANCIAL_ITEMS},
+        "item_details":  empty_item_details([item["name"] for item in FINANCIAL_ITEMS]),
         "validation":    None,
         "ai_comparison": None,
         "depreciation_trace": [],
@@ -163,6 +170,19 @@ def analyze_one(
             return _finish({**base, "status": "error", "error_msg": data["error"]})
 
     base["items"]  = data["items"]
+    base["item_details"] = data.get("item_details") or details_from_items(
+        data["items"],
+        source={"source_type": "legacy_numeric_extractor"},
+        confidence="unverified_legacy_value",
+        flags=["missing_item_details"],
+    )
+    annotate_report_source(
+        base["item_details"],
+        rcept_no=report["rcept_no"],
+        report_nm=report["report_nm"],
+        path=report["path"],
+        report_type=report.get("report_type", "-"),
+    )
     base["fs_div"] = data.get("fs_div", "-")
     base["ai_comparison"] = data.get("ai_comparison")  # 경로A·B 공통 AI 비교 결과
 
@@ -183,13 +203,50 @@ def analyze_one(
         )
         base["depreciation_trace"] = depr_result.get("trace", [])
         depr_items = depr_result.get("items", {})
+        depr_details = depr_result.get("item_details") or details_from_items(
+            depr_items,
+            source={
+                "source_type": "depreciation_extractor",
+                "rcept_no": report["rcept_no"],
+                "fs_div": base.get("fs_div", "-"),
+                "depreciation_source": depr_result.get("source"),
+            },
+            confidence="unverified_legacy_value",
+            flags=["missing_depreciation_item_details"],
+        )
+        annotate_report_source(
+            depr_details,
+            rcept_no=report["rcept_no"],
+            report_nm=report["report_nm"],
+            path=report["path"],
+            report_type=report.get("report_type", "-"),
+        )
         for key in ("감가상각비", "사용권자산상각비", "무형자산상각비"):
             if depr_items.get(key) is not None:
                 base["items"][key] = depr_items[key]
+                if key in depr_details:
+                    base["item_details"][key] = depr_details[key]
         # "감가상각비 및 무형자산상각비" 합산 항목인 경우 비고 기록
         if depr_result.get("combined"):
             base["items"]["무형자산상각비"] = None
             base["items"]["사용권자산상각비"] = None
+            for combined_key in ("무형자산상각비", "사용권자산상각비"):
+                base["item_details"][combined_key] = make_item_detail(
+                    combined_key,
+                    value=None,
+                    raw_value=None,
+                    unit_multiplier=None,
+                    source={
+                        "source_type": "depreciation_extractor",
+                        "rcept_no": report["rcept_no"],
+                        "report_nm": report["report_nm"],
+                        "fs_div": base.get("fs_div", "-"),
+                        "depreciation_source": depr_result.get("source"),
+                    },
+                    confidence="not_separately_disclosed",
+                    value_state="not_separately_disclosed",
+                    flags=["combined_depreciation_and_amortization"],
+                )
             base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
         log("DEPR", (
             f"감가상각 추출 완료: source={depr_result.get('source')}, "
@@ -207,6 +264,17 @@ def analyze_one(
         v = base["items"].get(cost_key)
         if v is not None and v < 0:
             base["items"][cost_key] = abs(v)
+            detail = base.get("item_details", {}).get(cost_key)
+            if isinstance(detail, dict):
+                detail["value"] = abs(v)
+                flags = detail.setdefault("flags", [])
+                if "negative_cost_normalized_to_positive" not in flags:
+                    flags.append("negative_cost_normalized_to_positive")
+                detail["normalization"] = {
+                    "from": v,
+                    "to": abs(v),
+                    "reason": "cost_item_positive_display",
+                }
             log("NORMALIZE", f"{cost_key}: 음수→양수 보정 ({v} → {abs(v)})")
 
     # 5. 검증 (회계 항등식)

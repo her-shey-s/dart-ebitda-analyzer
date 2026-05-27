@@ -39,6 +39,11 @@ from utils.units import (
     detect_unit_from_rows as _detect_unit_from_rows,
     unit_label as _unit_label,
 )
+from financial.extraction_result import (
+    add_detail_flag,
+    details_from_items,
+    empty_item_details,
+)
 
 
 # ── 상수 ──────────────────────────────────────────────────────────────────────
@@ -77,6 +82,33 @@ _NOTES_ROOT_CORES = frozenset({
     "연결재무제표주석", "별도재무제표주석", "재무제표주석",
     "연결주석", "별도주석", "주석",
 })
+
+_DEPR_ITEM_NAMES = ["감가상각비", "사용권자산상각비", "무형자산상각비"]
+
+
+def _build_depreciation_item_details(
+    items: dict[str, Optional[float]],
+    *,
+    rcept_no: str,
+    fs_div: str,
+    source: str,
+    combined: bool = False,
+) -> dict:
+    """Wrap depreciation values in the shared item_details shape."""
+    details = details_from_items(
+        {name: items.get(name) for name in _DEPR_ITEM_NAMES},
+        source={
+            "source_type": "depreciation_extractor",
+            "rcept_no": rcept_no,
+            "fs_div": fs_div,
+            "depreciation_source": source,
+        },
+        confidence="verified" if source != "error" else "missing",
+        flags=["depreciation_position_in_trace"],
+    )
+    if combined and details.get("감가상각비", {}).get("value") is not None:
+        add_detail_flag(details["감가상각비"], "combined_depreciation_and_amortization")
+    return details
 
 
 # ── 내부 유틸 ─────────────────────────────────────────────────────────────────
@@ -1348,6 +1380,7 @@ def extract_depreciation(
     """
     base = {
         "items":         {"감가상각비": None, "사용권자산상각비": None, "무형자산상각비": None},
+        "item_details":  empty_item_details(_DEPR_ITEM_NAMES),
         "source":        "error",
         "error":         None,
         "tables_found":  0,
@@ -1396,6 +1429,13 @@ def extract_depreciation(
         return {
             **base,
             "items":    {k: v for k, v in cf_result.items() if k != "combined"},
+            "item_details": _build_depreciation_item_details(
+                cf_result,
+                rcept_no=rcept_no,
+                fs_div=fs_div,
+                source="cf",
+                combined=cf_combined,
+            ),
             "source":   "cf",
             "combined": cf_combined,
             "trace":    trace,
@@ -1440,6 +1480,13 @@ def extract_depreciation(
             return {
                 **base,
                 "items":    {k: v for k, v in cf_result.items() if k != "combined"},
+                "item_details": _build_depreciation_item_details(
+                    cf_result,
+                    rcept_no=rcept_no,
+                    fs_div=fs_div,
+                    source="cf",
+                    combined=cf_combined,
+                ),
                 "source":   "cf",
                 "combined": cf_combined,
                 "trace":    trace,
@@ -1462,6 +1509,13 @@ def extract_depreciation(
                     return {
                         **base,
                         "items":    {k: v for k, v in cf_result2.items() if k != "combined"},
+                        "item_details": _build_depreciation_item_details(
+                            cf_result2,
+                            rcept_no=rcept_no,
+                            fs_div=fs_div,
+                            source="cf",
+                            combined=cf_combined2,
+                        ),
                         "source":   "cf",
                         "combined": cf_combined2,
                         "trace":    trace,
@@ -1543,6 +1597,13 @@ def extract_depreciation(
     return {
         **base,
         "items":    final,
+        "item_details": _build_depreciation_item_details(
+            final,
+            rcept_no=rcept_no,
+            fs_div=fs_div,
+            source=source,
+            combined=is_combined,
+        ),
         "source":   source,
         "combined": is_combined,
         "trace":    trace,

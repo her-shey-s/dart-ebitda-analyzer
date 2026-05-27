@@ -22,6 +22,12 @@ from config import (
     FS_DIV,
     REQUEST_TIMEOUT,
 )
+from financial.extraction_result import (
+    details_to_items,
+    empty_item_detail,
+    make_item_detail,
+    reconcile_details_with_final_items,
+)
 
 
 _VALID_FS_DIVS = {"CFS", "OFS"}
@@ -83,13 +89,56 @@ def _infer_fs_div(raw_list: list[dict], requested_div: str) -> str:
     return requested_div
 
 
-def _extract_by_id_then_nm(
+def _make_api_detail(
+    item_name: str,
+    row: dict,
+    value: float,
+    *,
+    method: str,
+    matched_keyword: str | None = None,
+    negated: bool = False,
+) -> dict:
+    """Build item_details metadata for one DART API row."""
+    currency = (row.get("currency") or "KRW").strip().upper()
+    flags = [f"matched_by_{method}"]
+    confidence = "verified" if method == "account_id" else "low_confidence"
+    if matched_keyword:
+        flags.append(f"matched_keyword:{matched_keyword}")
+    if negated:
+        flags.append("negated_by_label")
+    if currency and currency != "KRW":
+        flags.append(f"non_krw_currency:{currency}")
+        confidence = "low_confidence"
+
+    return make_item_detail(
+        item_name,
+        value=value,
+        raw_value=row.get("thstrm_amount"),
+        unit_multiplier=1,
+        source={
+            "source_type": "dart_api",
+            "fs_div": (row.get("fs_div") or "").strip() or None,
+            "statement": (row.get("sj_div") or "").strip() or None,
+            "account_id": (row.get("account_id") or "").strip() or None,
+            "account_nm": (row.get("account_nm") or "").strip() or None,
+            "currency": currency or None,
+            "column_id": "thstrm_amount",
+            "column_label": (row.get("thstrm_nm") or "당기").strip(),
+            "ord": (row.get("ord") or "").strip() or None,
+        },
+        confidence=confidence,
+        flags=flags,
+    )
+
+
+def _extract_detail_by_id_then_nm(
     raw_list: list[dict],
+    item_name: str,
     dart_code: str,
     keywords: list[str],
     exclude_keywords: list[str] | None = None,
     negate_keywords: list[str] | None = None,
-) -> Optional[float]:
+) -> dict:
     """
     단일 항목을 두 단계로 매칭하여 당기 금액을 반환한다.
 
@@ -106,17 +155,24 @@ def _extract_by_id_then_nm(
         negate_keywords:  부호 반전이 필요한 키워드 목록 (선택)
 
     Returns:
-        float 금액 또는 None
+        item_details 딕셔너리
     """
     negate_set = set(negate_keywords) if negate_keywords else set()
     exclude_set = set(exclude_keywords) if exclude_keywords else set()
 
     # 1단계: account_id 매칭 (DART가 부호를 정확히 기록하므로 반전 불필요)
-    for row in raw_list:
-        if (row.get("account_id") or "").strip() == dart_code:
+    if dart_code:
+        for row in raw_list:
+            if (row.get("account_id") or "").strip() != dart_code:
+                continue
             val = _parse_amount(row)
             if val is not None:
-                return val
+                return _make_api_detail(
+                    item_name,
+                    row,
+                    val,
+                    method="account_id",
+                )
 
     # 2단계: account_nm 키워드 매칭 (폴백)
     for row in raw_list:
@@ -127,11 +183,43 @@ def _extract_by_id_then_nm(
             if kw in nm:
                 val = _parse_amount(row)
                 if val is not None:
+                    negated = False
                     if kw in negate_set and val > 0:
                         val = -val
-                    return val
+                        negated = True
+                    return _make_api_detail(
+                        item_name,
+                        row,
+                        val,
+                        method="account_nm",
+                        matched_keyword=kw,
+                        negated=negated,
+                    )
 
-    return None
+    return empty_item_detail(
+        item_name,
+        source={"source_type": "dart_api"},
+        flags=["not_found"],
+    )
+
+
+def _extract_by_id_then_nm(
+    raw_list: list[dict],
+    dart_code: str,
+    keywords: list[str],
+    exclude_keywords: list[str] | None = None,
+    negate_keywords: list[str] | None = None,
+) -> Optional[float]:
+    """Backward-compatible numeric wrapper around detail extraction."""
+    detail = _extract_detail_by_id_then_nm(
+        raw_list,
+        "_legacy",
+        dart_code,
+        keywords,
+        exclude_keywords=exclude_keywords,
+        negate_keywords=negate_keywords,
+    )
+    return detail.get("value")
 
 
 # ── API 호출 함수 ──────────────────────────────────────────────────────────
@@ -202,10 +290,10 @@ def _detect_non_krw_currency(raw_list: list[dict]) -> Optional[str]:
     return None
 
 
-def extract_target_items(
+def extract_target_item_details(
     raw_list: list[dict],
     log_fn=None,
-) -> dict[str, Optional[float]]:
+) -> dict[str, dict]:
     """
     전체 재무제표 원시 리스트에서 FINANCIAL_ITEMS에 정의된 항목을 추출한다.
 
@@ -219,8 +307,7 @@ def extract_target_items(
         log_fn:   로그 콜백 (선택)
 
     Returns:
-        항목명 → 금액(원, float) 딕셔너리.
-        찾지 못한 항목은 None.
+        항목명 → item_details 딕셔너리.
     """
     non_krw = _detect_non_krw_currency(raw_list)
     if non_krw and log_fn:
@@ -229,16 +316,30 @@ def extract_target_items(
             f"  경고: KRW가 아닌 통화 코드 감지({non_krw}). 단위 가정이 깨질 수 있음.",
         )
 
-    result: dict[str, Optional[float]] = {}
+    result: dict[str, dict] = {}
     for item in FINANCIAL_ITEMS:
-        result[item["name"]] = _extract_by_id_then_nm(
+        result[item["name"]] = _extract_detail_by_id_then_nm(
             raw_list,
+            item_name=item["name"],
             dart_code=item["dart_code"],
             keywords=item["keywords"],
             exclude_keywords=item.get("exclude_keywords"),
             negate_keywords=item.get("negate_keywords"),
         )
     return result
+
+
+def extract_target_items(
+    raw_list: list[dict],
+    log_fn=None,
+) -> dict[str, Optional[float]]:
+    """
+    전체 재무제표 원시 리스트에서 FINANCIAL_ITEMS에 정의된 항목을 추출한다.
+
+    Backward-compatible wrapper returning the legacy item -> numeric value map.
+    New code should prefer ``extract_target_item_details``.
+    """
+    return details_to_items(extract_target_item_details(raw_list, log_fn=log_fn))
 
 
 # ── API 원시 데이터 → AI용 텍스트 ─────────────────────────────────────────
@@ -329,7 +430,7 @@ def get_financial_data_path_a(
     _log = log_fn or (lambda tag, msg: None)
 
     bsns_year = str(year)
-    empty = {"items": {}, "fs_div": None, "error": None, "ai_comparison": None}
+    empty = {"items": {}, "item_details": {}, "fs_div": None, "error": None, "ai_comparison": None}
 
     last_error = ""
     available_statements: dict[str, dict] = {}
@@ -367,7 +468,8 @@ def get_financial_data_path_a(
 
     _log("DATA_A", f"  선택된 재무제표: {selected_div}")
     selected = available_statements[selected_div]
-    items = extract_target_items(selected["raw"], log_fn=log_fn)
+    item_details = extract_target_item_details(selected["raw"], log_fn=log_fn)
+    items = details_to_items(item_details)
     matched = sum(1 for v in items.values() if v is not None)
     _log("DATA_A", f"  Python 추출: {len(items)}개 항목 중 {matched}개 매칭")
 
@@ -385,11 +487,17 @@ def get_financial_data_path_a(
                 elapsed = _time.perf_counter() - t0
                 _log("AI", f"  AI 비교 완료 ({elapsed:.2f}초): source={ai_comparison.get('source')}, calls={ai_comparison.get('ai_calls')}")
                 items = ai_comparison["items"]  # 최종 결과 사용
+                item_details = reconcile_details_with_final_items(
+                    item_details,
+                    items,
+                    ai_comparison=ai_comparison,
+                )
     except Exception as e:
         _log("AI", f"  AI 비교 실패: {e}")
 
     return {
         "items":          items,
+        "item_details":   item_details,
         "fs_div":         selected_div,
         "error":          None,
         "ai_comparison":  ai_comparison,
