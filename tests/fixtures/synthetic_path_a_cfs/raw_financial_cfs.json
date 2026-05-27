@@ -1,0 +1,11 @@
+[
+  {"account_id": "ifrs-full_Assets",            "account_nm": "자산총계",   "sj_div": "BS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "1,000,000,000,000", "frmtrm_amount": "900,000,000,000", "currency": "KRW", "ord": "1"},
+  {"account_id": "ifrs-full_Liabilities",       "account_nm": "부채총계",   "sj_div": "BS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "400,000,000,000",   "frmtrm_amount": "380,000,000,000", "currency": "KRW", "ord": "2"},
+  {"account_id": "ifrs-full_Equity",            "account_nm": "자본총계",   "sj_div": "BS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "600,000,000,000",   "frmtrm_amount": "520,000,000,000", "currency": "KRW", "ord": "3"},
+  {"account_id": "ifrs-full_RetainedEarnings",  "account_nm": "이익잉여금", "sj_div": "BS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "200,000,000,000",   "frmtrm_amount": "150,000,000,000", "currency": "KRW", "ord": "4"},
+  {"account_id": "ifrs-full_Revenue",           "account_nm": "매출액",     "sj_div": "IS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "800,000,000,000",   "frmtrm_amount": "700,000,000,000", "currency": "KRW", "ord": "5"},
+  {"account_id": "ifrs-full_CostOfSales",       "account_nm": "매출원가",   "sj_div": "IS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "500,000,000,000",   "frmtrm_amount": "460,000,000,000", "currency": "KRW", "ord": "6"},
+  {"account_id": "ifrs-full_GrossProfit",       "account_nm": "매출총이익", "sj_div": "IS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "300,000,000,000",   "frmtrm_amount": "240,000,000,000", "currency": "KRW", "ord": "7"},
+  {"account_id": "dart_OperatingIncomeLoss",    "account_nm": "영업이익",   "sj_div": "IS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "100,000,000,000",   "frmtrm_amount": "80,000,000,000",  "currency": "KRW", "ord": "8"},
+  {"account_id": "ifrs-full_ProfitLoss",        "account_nm": "당기순이익", "sj_div": "IS",  "fs_div": "CFS", "thstrm_nm": "당기", "thstrm_amount": "70,000,000,000",    "frmtrm_amount": "55,000,000,000",  "currency": "KRW", "ord": "9"}
+]

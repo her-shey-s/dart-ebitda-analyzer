@@ -1,0 +1,13 @@
+{
+  "id": "synthetic_path_a_cfs",
+  "kind": "synthetic",
+  "description": "상장사 사업보고서(경로A) · 연결 XBRL 전체재무제표 · 단위 원",
+  "path": "A",
+  "corp_code": "00000000",
+  "year": 2023,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "raw": { "financial_json": "raw_financial_cfs.json" },
+  "run": { "financials": true, "depreciation": false }
+}

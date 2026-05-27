@@ -12,7 +12,10 @@ import time
 import sys
 
 import requests
-from config import DART_API_KEY, DART_BASE_URL, DART_ENDPOINTS
+from config import get_dart_api_key, DART_BASE_URL, DART_ENDPOINTS
+
+# config는 더 이상 모듈 수준 DART_API_KEY 상수를 노출하지 않는다(get_dart_api_key()로 통일).
+DART_API_KEY = get_dart_api_key()
 
 DART_HOST = "opendart.fss.or.kr"
 DART_PORT = 443

@@ -227,9 +227,16 @@ DART `fnlttSinglAcntAll` 응답에서 `account_id` 또는 `account_nm`을 기준
 - 문서와 실제 동작이 달라져 운영자가 잘못된 전제를 갖게 된다.
 - 네트워크/API 상태에 의존하는 테스트만 있으면 추출 로직의 회귀를 잡기 어렵다.
 
+### 핵심 원칙: fixture를 테스트 자산으로 누적
+
+이 앱은 로직만 잘 짜는 것으로는 부족하다. **"틀렸던 보고서 형식"을 계속 테스트 자산으로 쌓아야** 정확도가 올라간다. 실제 DART 보고서를 fixture로 동결(freeze)하고 golden result로 잠근 뒤, 추출 로직이 회귀하면 즉시 잡히도록 한다.
+
+- **목표 규모: 최소 30~50개 fixture.** 보고서 유형·단위·연결/별도·합산/분리 케이스를 폭넓게 덮는다.
+- **실패 누적 루프(가장 중요):** 운영 중 잘못 추출된 보고서가 발견되면 → 그 보고서를 fixture로 캡처 → 원문 대조해 올바른 golden을 확정 → 커밋. 이렇게 해야 같은 형식이 다시 깨지지 않는다. fixture 수는 단조 증가해야 하며 절대 줄이지 않는다.
+
 ### 수정 방향
 
-- `tests/fixtures/`에 실제 DART XML 또는 익명화된 최소 XML fixture를 둔다.
+- `tests/fixtures/<id>/`에 실제 DART 원본 입력(경로A는 전체재무제표 JSON, 경로B는 document.xml) 또는 익명화된 최소 합성 fixture를 둔다. 각 fixture는 `manifest.json`(메타+원본 포인터) + 원본 입력 + `golden.json`(기대 결과)로 구성한다.
 - 주요 보고서 유형별 golden result를 만든다.
   - 상장사 사업보고서 경로A
   - 연결감사보고서 경로B
@@ -238,15 +245,18 @@ DART `fnlttSinglAcntAll` 응답에서 `account_id` 또는 `account_nm`을 기준
   - 감가상각 합산 공시
   - 감가상각/무형자산상각비 분리 공시
   - 단위 천원/백만원/억원 케이스
-- 네트워크 테스트와 로직 테스트를 분리한다.
+- 캡처 도구(`scripts/capture_fixture.py`)로 기업명·연도만 주면 원본을 한 번 받아 동결하고 golden 초안을 생성한다. golden은 사람이 원문과 대조해 검토한 뒤 커밋한다.
+- 네트워크 테스트와 로직 테스트를 분리한다. (`pytest.ini`의 `testpaths=tests`로 루트의 네트워크 진단 스크립트를 기본 회귀에서 제외.)
 - `SPEC.md`를 실제 구현 기준으로 갱신하거나, 미구현 기능은 명확히 TODO로 표시한다.
 
 ### 완료 조건
 
-- `pytest` 기반 단위/회귀 테스트가 추가된다.
-- 네트워크 없이 핵심 파싱 로직 테스트가 가능하다.
-- `test_dart_connection.py` import 오류가 수정된다.
-- SPEC과 실제 UI/코드 동작이 일치한다.
+- [x] `pytest` 기반 단위/회귀 테스트가 추가된다. (`tests/` — 회귀 하네스 + EBITDA 단위 테스트)
+- [x] 네트워크 없이 핵심 파싱 로직 테스트가 가능하다. (다운로드/AI 경계를 mock으로 대체, 합성 seed fixture 2종)
+- [x] `test_dart_connection.py` import 오류가 수정된다.
+- [x] fixture 캡처→golden 동결 워크플로우가 마련된다. (`scripts/capture_fixture.py`)
+- [ ] 실제 보고서 fixture를 30~50개까지 누적한다. (운영 중 발견되는 오류 보고서를 계속 추가)
+- [ ] SPEC과 실제 UI/코드 동작이 일치한다.
 
 ---
 

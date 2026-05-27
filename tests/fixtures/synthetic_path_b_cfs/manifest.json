@@ -1,0 +1,12 @@
+{
+  "id": "synthetic_path_b_cfs",
+  "kind": "synthetic",
+  "description": "연결감사보고서(경로B) · 감가상각비/무형자산상각비 분리 공시 · 단위 원",
+  "path": "B",
+  "rcept_no": "SYNTH-B-0001",
+  "report_type": "audit_consol",
+  "fs_div": "CFS",
+  "strict_scope": false,
+  "raw": { "xml": "raw_input.xml" },
+  "run": { "financials": true, "depreciation": true }
+}
