@@ -69,10 +69,10 @@ def normalize_label(text: str) -> str:
         "V. 영업이익(손실)"          → "영업이익(손실)"
         "(2)영업이익(손실)"          → "영업이익(손실)"
     """
-    # 1. DART 주석 참조 제거 — 두 가지 형식 모두 처리
-    #    꺾쇠형: <주석3,16>  /  괄호형: (주석15,16,21)
-    text = re.sub(r"<주석[\d,\s]+>", "", text)
-    text = re.sub(r"\(주석[\d,\s]+\)", "", text)
+    # 1. DART 주석 참조 제거 — 여러 표기 형식 처리
+    #    꺾쇠형: <주석3,16> / 괄호형: (주석15,16,21), (주23,31)
+    text = re.sub(r"<주석?\s*[\d,\s]+>", "", text)
+    text = re.sub(r"\(주석?\s*[\d,\s]+\)", "", text)
     # 2. 모든 공백 변종 제거
     text = re.sub(r"[\s\u3000\xa0\u00a0\u200b\u200c\u200d\ufeff]+", "", text)
     # 3. 선두 로마자 번호 + 마침표 (ASCII: I., II. 등 / 전각 유니코드: Ⅰ Ⅱ … Ⅻ)
@@ -284,6 +284,7 @@ def find_item_in_table(
     keywords: list[str],
     negate_keywords: list[str] | None = None,
     unit_multiplier: int = 1,
+    force_positive: bool = False,
 ) -> Optional[float]:
     """
     행 리스트에서 keywords와 일치하는 항목명을 찾아 당기 금액을 반환한다.
@@ -295,6 +296,7 @@ def find_item_in_table(
       → 부분 일치 사용 안 함: "영업외이익" ≠ "영업이익"
     - negate_keywords: 해당 키워드로 매칭되면 양수 값을 음수로 반전
       (예: "영업손실" → 12억 → -12억)
+    - force_positive: 감사보고서에서 비용 항목을 괄호 음수로 표기해도 양수로 반환
     - unit_multiplier: 테이블 단위 승수(1=원, 1000=천원, 1_000_000=백만원, ...).
       반환 값에 곱해 원(KRW) 기준 금액을 돌려준다.
 
@@ -303,6 +305,7 @@ def find_item_in_table(
         keywords:         config.FINANCIAL_ITEMS의 keywords (정규화된 형태)
         negate_keywords:  부호 반전이 필요한 키워드 목록 (선택)
         unit_multiplier:  단위 승수 (기본 1=원)
+        force_positive:   True이면 반환값을 양수로 정규화
 
     Returns:
         금액(float, 원 단위) 또는 None
@@ -336,6 +339,8 @@ def find_item_in_table(
                     # '-' 등 비숫자 → 항목 행이 존재하므로 0 처리
                     return 0.0
                 val = val * unit_multiplier
+                if force_positive:
+                    val = abs(val)
                 if norm in negate_set and val > 0:
                     val = -val
                 return val
@@ -348,6 +353,8 @@ def find_item_in_table(
                 val = _to_float(row[ci])
                 if val is not None:
                     val = val * unit_multiplier
+                    if force_positive:
+                        val = abs(val)
                     if norm in negate_set and val > 0:
                         val = -val
                     return val
@@ -414,6 +421,7 @@ def _extract_all_items(soup: BeautifulSoup) -> dict[str, Optional[float]]:
                 item["keywords"],
                 item.get("negate_keywords"),
                 unit_multiplier=unit,
+                force_positive=item["name"] == "매출원가",
             )
             if val is not None:
                 result[item["name"]] = val
