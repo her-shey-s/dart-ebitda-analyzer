@@ -352,6 +352,34 @@ _EXACT_ROU_AMORT_LABELS = {
 }
 _EXACT_AMORT_LABELS = {"무형자산상각비", "무형자산상각비용", "무형자산상각"}
 
+
+def _is_general_depreciation_label(label: str) -> bool:
+    """
+    '감가상각비' 버킷에 합산할 일반 감가상각 행인지 판정한다.
+
+    '투자부동산 감가상각비'·'유형자산 감가상각비'처럼 사용권/무형이 아닌 감가상각
+    항목은 모두 감가상각비에 합쳐야 한다(중복 없이). 사용권/무형은 각자 버킷이고,
+    '대손상각비'(감가상각 아님)·'누계액'·합산행은 제외한다.
+
+    Args:
+        label: _normalize_row_label() 적용된 행 라벨
+
+    규칙:
+      - '감가상각'을 포함해야 함 → '대손상각비'·'무형자산상각비'(감가상각 없음) 자동 제외
+      - '사용권' 포함 → 제외(사용권자산상각비 버킷)
+      - '무형자산상각' 포함 → 제외(합산행 '감가상각비및무형자산상각비' 방어)
+      - '누계' 포함 → 제외(자산 변동표의 상각누계액)
+    """
+    if "감가상각" not in label:
+        return False
+    if "누계" in label:
+        return False
+    if "사용권" in label:
+        return False
+    if "무형자산상각" in label:
+        return False
+    return True
+
 # 섹션 제목 블랙리스트 (부분값 테이블)
 # 타이틀이 감지된 경우에만 보조 필터로 사용
 _PARTIAL_TITLE_KEYWORDS = [
@@ -925,6 +953,62 @@ def _resolve_actual_row_label(
     return _normalize_row_label(rows[ri][0])
 
 
+def _sum_general_depreciation_in_table(
+    tables: list[dict],
+    table_id: str,
+    debug_trace: Optional[list[str]] = None,
+) -> Optional[float]:
+    """
+    AI가 감가상각비로 지목한 '표 전체'에서 일반 감가상각 행을 모두 합산한다.
+
+    한 표 안에 '감가상각비'와 '투자부동산 감가상각비'처럼 여러 감가상각 행이
+    분리 기재된 회사가 있다. 사용권/무형은 각자 버킷으로 따로 추출되므로 여기서는
+    제외하여 중복 계산을 원천 차단한다. (표 선택 자체는 AI가 수행)
+
+    Returns:
+        원(KRW) 단위 합계, 일치 행이 없으면 None
+    """
+    m = re.match(r"T(\d+)", table_id or "")
+    if not m:
+        return None
+    ti = int(m.group(1)) - 1
+    if ti < 0 or ti >= len(tables):
+        return None
+    tbl = tables[ti]
+    rows = tbl["rows"]
+    unit = tbl["unit"]
+    current_col = _detect_current_column(rows)
+
+    total: Optional[float] = None
+    parts: list[tuple[str, float]] = []
+    for row in rows:
+        if not row:
+            continue
+        label = _normalize_row_label(row[0])
+        if not _is_general_depreciation_label(label):
+            continue
+        val: Optional[float] = None
+        if current_col is not None and current_col < len(row):
+            v = _parse_number(row[current_col])
+            if v is not None:
+                val = v * unit
+        if val is None:
+            for ci in range(1, len(row)):
+                v = _parse_number(row[ci])
+                if v is not None:
+                    val = v * unit
+                    break
+        if val is not None:
+            total = (total or 0.0) + val
+            parts.append((label, val))
+
+    if debug_trace is not None and parts:
+        debug_trace.append(
+            f"[AGG] 감가상각비 합산({table_id}): {parts} → {total}"
+        )
+    return total
+
+
 def _verify_ai_selection(
     tables: list[dict],
     ai_selection: dict,
@@ -964,9 +1048,21 @@ def _verify_ai_selection(
             and "무형자산상각비" in actual_label
         )
         if actual_label is not None and (actual_label in _EXACT_DEPR_LABELS or is_combined_label):
-            val = _extract_value_at_position(
-                tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
-            )
+            if is_combined_label:
+                # 합산 공시('감가상각비 및 무형자산상각비')는 단일 합산값을 그대로 사용
+                val = _extract_value_at_position(
+                    tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
+                )
+            else:
+                # 일반 감가상각: 선택된 표 안의 모든 감가상각 행(투자부동산 등)을 합산.
+                # 사용권/무형은 제외되므로 중복 계산되지 않는다.
+                val = _sum_general_depreciation_in_table(
+                    tables, depr_sel["table_id"], debug_trace
+                )
+                if val is None:
+                    val = _extract_value_at_position(
+                        tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
+                    )
             result["감가상각비"] = val
             if debug_trace is not None:
                 debug_trace.append(
@@ -1212,6 +1308,8 @@ def _extract_from_cf(
         "무형자산상각비": None,
     }
     combined = False
+    # 일반 감가상각을 합산한 출처 테이블(중복 방지: 다른 테이블 행은 합산하지 않음)
+    depr_src_idx: Optional[int] = None
 
     for idx, (table_tag, rows) in enumerate(cf_tables, start=1):
         # 감가상각 키워드가 포함된 CF 테이블만 대상
@@ -1317,22 +1415,30 @@ def _extract_from_cf(
                 continue
 
             # 4) 감가상각 (가장 마지막 — 위 3개와 겹치지 않은 행만)
+            #    한 테이블에 '감가상각비'·'투자부동산 감가상각비'처럼 여러 행이
+            #    분리 기재되면 모두 합산한다(사용권/무형은 위에서 이미 분리됨).
             if "감가상각" in label:
                 if "누계" in label:
                     continue
-                if result["감가상각비"] is None:
-                    val, col, raw = _get_current_val(row)
-                    if val is not None:
-                        result["감가상각비"] = val
-                        if debug_trace is not None:
-                            debug_trace.append(
-                                f"[CF] #{idx}/R{row_idx+1} 감가상각 매칭: label='{label}', "
-                                f"col={col}, raw='{raw}' → {val}"
-                            )
-                elif debug_trace is not None:
-                    debug_trace.append(
-                        f"[CF] #{idx}/R{row_idx+1} '감가상각' 재발견, 첫 값 유지 → 스킵"
-                    )
+                if combined:
+                    # 합산 공시 케이스에서는 별도 일반 감가상각 행을 더하지 않는다.
+                    continue
+                if depr_src_idx is not None and depr_src_idx != idx:
+                    # 다른 CF 테이블(연결/별도 중복 등)의 감가상각은 합산하지 않음
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} '감가상각' 다른 출처 테이블 → 스킵"
+                        )
+                    continue
+                val, col, raw = _get_current_val(row)
+                if val is not None:
+                    result["감가상각비"] = (result["감가상각비"] or 0.0) + val
+                    depr_src_idx = idx
+                    if debug_trace is not None:
+                        debug_trace.append(
+                            f"[CF] #{idx}/R{row_idx+1} 감가상각 합산: label='{label}', "
+                            f"col={col}, raw='{raw}' → += {val} (누적 {result['감가상각비']})"
+                        )
 
     result["combined"] = combined
     if debug_trace is not None:
