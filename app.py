@@ -65,9 +65,16 @@ if "analysis_logs" not in st.session_state:
 # 요약 테이블에 표시할 재무 항목 (순서 유지)
 _DISPLAY_ITEMS = [
     "총자산", "총부채", "이익잉여금",
-    "감가상각비", "사용권자산상각비", "무형자산상각비",
+    "감가상각비", "사용권자산상각비", "무형자산상각비", "EBITDA",
     "매출액", "매출총이익", "영업이익", "당기순이익",
 ]
+
+# EBITDA 계산은 financial.ebitda를 단일 소스로 공유한다.
+from financial.ebitda import (
+    compute_ebitda as _compute_ebitda,
+    EBITDA_OPERATING_INCOME as _EBITDA_OP,
+    EBITDA_ADDBACKS as _EBITDA_ADDBACKS,
+)
 
 
 
@@ -86,6 +93,13 @@ def _fmt_억(val: Optional[float]) -> str:
 def _fmt_억_raw(val: Optional[float]) -> Optional[float]:
     """Excel 출력용: 억 단위 float 반환 (반올림 없이 원본 정밀도 유지)."""
     return val / 1e8 if val is not None else None
+
+
+def _item_value(items: dict, name: str) -> Optional[float]:
+    """표시용 항목 값 조회. EBITDA는 원본에 없는 파생 항목이라 직접 계산한다."""
+    if name == "EBITDA":
+        return _compute_ebitda(items)
+    return items.get(name)
 
 
 def _sanitize_filename_part(text: str) -> str:
@@ -267,7 +281,7 @@ def _to_summary_df(results: list[dict]) -> pd.DataFrame:
             "보고서":       r["report_nm"],
         }
         for name in _DISPLAY_ITEMS:
-            row[f"{name}(억)"] = _fmt_억(items.get(name))
+            row[f"{name}(억)"] = _fmt_억(_item_value(items, name))
         row["검증"] = _validation_status_label(r, use_icon=True)
         row["처리상세"] = _processing_status_detail(r)
         row["검증상세"] = _format_validation_detail(r)
@@ -292,7 +306,7 @@ def _to_excel_summary_df(results: list[dict]) -> pd.DataFrame:
             "보고서":       r["report_nm"],
         }
         for name in _DISPLAY_ITEMS:
-            row[f"{name}(억원)"] = _fmt_억_raw(items.get(name))
+            row[f"{name}(억원)"] = _fmt_억_raw(_item_value(items, name))
         row["검증"] = _validation_status_label(r, use_icon=False)
         row["처리상세"] = _processing_status_detail(r)
         row["검증상세"] = _format_validation_detail(r)
@@ -322,7 +336,7 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
     # 항목 표시 순서: 매출 먼저, 그 다음 BS
     _EXCEL_ITEMS = ["매출액", "매출총이익", "영업이익", "당기순이익",
                     "총자산", "총부채", "이익잉여금",
-                    "감가상각비", "사용권자산상각비", "무형자산상각비"]
+                    "감가상각비", "사용권자산상각비", "무형자산상각비", "EBITDA"]
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
@@ -387,6 +401,24 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                         cell.number_format = "#,##0_);(#,##0);-_)"
                         cell.alignment = Alignment(horizontal="right")
 
+            # EBITDA 행: 하드코딩 값 대신 셀 참조 수식으로 기입
+            # (영업이익 + 감가상각비 + 사용권자산상각비 + 무형자산상각비)
+            from openpyxl.utils import get_column_letter
+            _row_of = lambda name: 4 + _EXCEL_ITEMS.index(name)
+            ebitda_row = _row_of("EBITDA")
+            op_row = _row_of(_EBITDA_OP)
+            addback_rows = [_row_of(k) for k in _EBITDA_ADDBACKS]
+            for col_idx, r in enumerate(corp_data):
+                # 영업이익이 없으면 EBITDA를 계산할 수 없으므로 빈 칸으로 둔다.
+                if r.get("items", {}).get(_EBITDA_OP) is None:
+                    continue
+                col = get_column_letter(col_idx + 2)
+                terms = "+".join(f"{col}{row}" for row in (op_row, *addback_rows))
+                cell = ws.cell(row=ebitda_row, column=col_idx + 2, value=f"={terms}")
+                cell.number_format = "#,##0_);(#,##0);-_)"
+                cell.alignment = Alignment(horizontal="right")
+            ws.cell(row=ebitda_row, column=1).font = Font(bold=True)
+
             # 항목 컬럼 너비 조정
             ws.column_dimensions["A"].width = 14
             for col_idx in range(len(years)):
@@ -398,6 +430,9 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                 italic=True, color="999999", size=9)
 
         # ── 원본 시트 (원 단위) ───────────────────────────────────────
+        # 매출원가는 매출총이익 정합성 검사(파이프라인 검증)에만 쓰고 출력에서는 숨긴다.
+        # EBITDA는 무형자산상각비 오른쪽에 셀 참조 수식 열로 추가한다.
+        _RAW_ITEMS = [it["name"] for it in FINANCIAL_ITEMS if it["name"] != "매출원가"]
         raw_rows = []
         for r in results:
             items = r.get("items", {})
@@ -409,25 +444,44 @@ def _to_excel_bytes(results: list[dict]) -> bytes:
                 "검증":         _validation_status_label(r, use_icon=False),
                 "재무제표기준": _fs_label(r),
             }
-            for item in FINANCIAL_ITEMS:
-                row[item["name"]] = items.get(item["name"])
+            for name in _RAW_ITEMS:
+                row[name] = items.get(name)
+            row["EBITDA"] = None   # 수식으로 채울 placeholder
             row["비고"] = r.get("remarks", "")
             raw_rows.append(row)
         df_raw = pd.DataFrame(raw_rows)
         df_raw.to_excel(writer, sheet_name="원본(원단위)", index=False)
         ws_raw = writer.sheets["원본(원단위)"]
         _apply_number_format(ws_raw, df_raw)
+
+        from openpyxl.utils import get_column_letter
+        # 항목 열은 F(6)부터 시작 — _RAW_ITEMS 다음에 EBITDA, 그 뒤 비고
+        _FIRST_ITEM_COL = 6
+        _col_of = lambda name: get_column_letter(_FIRST_ITEM_COL + _RAW_ITEMS.index(name))
+        ebitda_col_idx = _FIRST_ITEM_COL + len(_RAW_ITEMS)
+        ebitda_col = get_column_letter(ebitda_col_idx)
+        op_col = _col_of(_EBITDA_OP)
+        addback_cols = [_col_of(k) for k in _EBITDA_ADDBACKS]
+        # EBITDA 수식: 영업이익 없으면 계산 불가 → 빈 칸
+        for i, r in enumerate(results):
+            excel_row = i + 2   # 헤더 1행 + 0-base 보정
+            if r.get("items", {}).get(_EBITDA_OP) is None:
+                continue
+            terms = "+".join(f"{c}{excel_row}" for c in (op_col, *addback_cols))
+            cell = ws_raw.cell(row=excel_row, column=ebitda_col_idx, value=f"={terms}")
+            cell.number_format = "#,##0_);(#,##0);-_)"
+
         ws_raw.column_dimensions["A"].width = 16  # 기업명
         ws_raw.column_dimensions["B"].width = 10  # 연도
         ws_raw.column_dimensions["C"].width = 12  # corp_code
         ws_raw.column_dimensions["D"].width = 22  # 검증
         ws_raw.column_dimensions["E"].width = 14  # 재무제표기준
-        # F~P: 재무 항목 11개 (numeric)
-        from openpyxl.utils import get_column_letter
-        for i in range(len(FINANCIAL_ITEMS)):
-            ws_raw.column_dimensions[get_column_letter(6 + i)].width = 16
+        # 재무 항목 + EBITDA 열
+        n_item_cols = len(_RAW_ITEMS) + 1
+        for i in range(n_item_cols):
+            ws_raw.column_dimensions[get_column_letter(_FIRST_ITEM_COL + i)].width = 16
         # 마지막: 비고
-        비고_col = get_column_letter(6 + len(FINANCIAL_ITEMS))
+        비고_col = get_column_letter(_FIRST_ITEM_COL + n_item_cols)
         ws_raw.column_dimensions[비고_col].width = 60
         # 검증·비고 컬럼은 줄바꿈 허용
         for col_letter in ("D", 비고_col):
@@ -529,6 +583,13 @@ def _render_validation_detail(result: dict) -> None:
                 "금액(억)": _fmt_억(val_raw),
                 "금액(원)": f"{val_raw:,.0f}" if val_raw is not None else "-",
             })
+        ebitda_raw = _compute_ebitda(items)
+        detail_rows.append({
+            "항목":     "EBITDA",
+            "구분":     "파생",
+            "금액(억)": _fmt_억(ebitda_raw),
+            "금액(원)": f"{ebitda_raw:,.0f}" if ebitda_raw is not None else "-",
+        })
         st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, hide_index=True)
 
     trace_lines = result.get("depreciation_trace") or []
