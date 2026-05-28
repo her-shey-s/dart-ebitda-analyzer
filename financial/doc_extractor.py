@@ -123,6 +123,37 @@ def _is_numeric_cell(val: str) -> bool:
     return _to_float(val) is not None
 
 
+# 대시 변종: ASCII hyphen-minus, en/em dash, hangul/figure dashes, minus sign
+_DASH_CHARS = {"-", "–", "—", "‐", "‑", "‒", "−", "ー", "ｰ"}
+_NA_TOKENS = {"n/a", "na", "n.a.", "해당없음", "해당사항없음", "없음"}
+
+
+def _classify_non_numeric_cell(raw) -> str:
+    """
+    숫자로 파싱되지 않는 셀의 의미를 분류한다(명세 #5).
+
+    이전 코드는 비숫자 현재 셀을 무조건 0으로 가정해 '항목 없음(0)'·'미기재'·
+    '주석/기타 표기'를 같은 통계에 섞었다. 이제 셀 표기를 보고 의미를 나눈다:
+
+      - "-" (혹은 대시 변종): 한국 재무제표 관례상 항목 존재·금액 0 → "zero"
+      - "" / 공백:           누락 → "missing"
+      - "N/A" / "해당없음":  해당 없음 → "not_applicable"
+      - 그 외 비숫자:        파싱 실패 → "parse_failed"
+
+    호출측은 이 분류로 (a) 0을 잠글지 (b) None을 두고 다음 표로 넘어갈지 결정한다.
+    """
+    if raw is None:
+        return "missing"
+    s = str(raw).strip()
+    if not s:
+        return "missing"
+    if all(c in _DASH_CHARS for c in s):
+        return "zero"
+    if s.lower() in _NA_TOKENS:
+        return "not_applicable"
+    return "parse_failed"
+
+
 # ── DART XML 다운로드 및 파싱 ──────────────────────────────────────────────
 
 def _build_section_table_map(
@@ -329,16 +360,18 @@ def _classify_table(rows: list[list[str]]) -> str:
 
 # ── 당기 컬럼 탐지 ────────────────────────────────────────────────────────
 
-def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
+def _detect_current_column(rows: list[list[str]]) -> tuple[Optional[int], str]:
     """
-    테이블 헤더에서 당기(현재 기간) 컬럼 인덱스를 탐지한다.
+    테이블 헤더에서 당기(현재 기간) 컬럼 인덱스와 탐지 방법(신뢰도 라벨)을 반환한다.
 
     우선순위:
-      1. "당기" 포함 (전기/전전기 제외)
-      2. "제 N 기" 패턴 — 가장 큰 N이 당기
-      3. "20XX" 연도 패턴 — 가장 최신 연도가 당기
+      1. "당기" 직접 매칭 (전기/전전기 제외)               → "detected_dangi"
+      2. "제 N 기" 패턴 — 가장 큰 N이 당기                → "detected_period_max"
+      3. "20XX" 연도 패턴 — 가장 최신 연도가 당기           → "detected_year_max"
+      탐지 실패 시 (None, "not_detected").
 
-    머리 5행을 탐색 대상으로 한다.
+    머리 5행을 탐색 대상으로 한다. 신뢰도 라벨은 호출측이 결과 메타에 기록해, 어떤
+    근거로 당기 컬럼이 선택됐는지(또는 안 됐는지) 추적할 수 있게 한다(명세 #5).
     """
     header_rows = rows[:5]
     max_cols = max((len(r) for r in rows), default=0)
@@ -365,8 +398,8 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                         snorm = sub_header[cj].replace(" ", "").strip()
                         if snorm in ("합계", "총계"):
                             offset = max_cols - len(sub_header)
-                            return cj + max(offset, 0)
-                return ci
+                            return cj + max(offset, 0), "detected_dangi"
+                return ci, "detected_dangi"
 
     # 2. "제 N 기" 패턴 — 가장 큰 N
     gi_candidates: list[tuple[int, int]] = []
@@ -377,7 +410,7 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                 gi_candidates.append((int(m.group(1)), ci))
     if gi_candidates:
         gi_candidates.sort(key=lambda x: (-x[0], x[1]))
-        return gi_candidates[0][1]
+        return gi_candidates[0][1], "detected_period_max"
 
     # 3. 20XX 연도 — 가장 최신
     year_candidates: list[tuple[int, int]] = []
@@ -387,9 +420,9 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                 year_candidates.append((int(m.group(1)), ci))
     if year_candidates:
         year_candidates.sort(key=lambda x: (-x[0], x[1]))
-        return year_candidates[0][1]
+        return year_candidates[0][1], "detected_year_max"
 
-    return None
+    return None, "not_detected"
 
 
 # ── 항목 추출 ──────────────────────────────────────────────────────────────
@@ -437,12 +470,16 @@ def _make_doc_detail(
     flags: Optional[list[str]] = None,
     value_state: Optional[str] = None,
     table_scope: Optional[str] = None,
+    current_col_confidence: str = "unknown",
 ) -> dict:
     detail_flags = list(flags or [])
     if unit_confidence == "assumed_won":
         detail_flags.append("unit_assumed_won")
         if confidence == "verified":
             confidence = "low_confidence"
+    # 당기 컬럼이 폴백(첫 숫자 컬럼)으로 정해졌으면 verified로 두지 않는다.
+    if current_col_confidence == "fallback_first_numeric" and confidence == "verified":
+        confidence = "low_confidence"
     return make_item_detail(
         item_name,
         value=value,
@@ -459,6 +496,7 @@ def _make_doc_detail(
             "column_id": f"C{col_idx + 1}" if col_idx is not None else None,
             "column_label": column_label,
             "unit_confidence": unit_confidence,
+            "current_col_confidence": current_col_confidence,
         },
         confidence=confidence,
         value_state=value_state,
@@ -491,7 +529,7 @@ def find_item_detail_in_table(
         if "주석" in re.sub(r"\s+", "", cell)
     }
 
-    current_col = _detect_current_column(rows)
+    current_col, current_col_conf = _detect_current_column(rows)
 
     for row_idx, row in enumerate(rows):
         if not row:
@@ -509,10 +547,18 @@ def find_item_detail_in_table(
             confidence = "verified"
             value_state = "extracted"
             if val is None:
-                val = 0.0
-                confidence = "low_confidence"
-                value_state = "zero_assumed_from_non_numeric_current_cell"
-                flags.append("non_numeric_current_cell_zero_assumed")
+                cls = _classify_non_numeric_cell(raw)
+                if cls == "zero":
+                    # 한국 재무제표에서 "-"는 항목 존재·금액 0의 관례적 표기다.
+                    val = 0.0
+                    confidence = "low_confidence"
+                    value_state = "zero_from_dash"
+                    flags.append("current_cell_dash_classified_zero")
+                else:
+                    # missing/not_applicable/parse_failed는 0을 잠그지 않고
+                    # 같은 표 내 다음 매칭 행(또는 외부 루프에서 다음 표)을 시도한다.
+                    # → 0과 None의 의미가 결과 구조에서 구분된다(명세 #5).
+                    continue
             val = val * unit_multiplier
             if force_positive and val < 0:
                 val = abs(val)
@@ -537,6 +583,7 @@ def find_item_detail_in_table(
                 flags=flags,
                 value_state=value_state,
                 table_scope=table_scope,
+                current_col_confidence=current_col_conf,
             )
 
         for ci in range(1, len(row)):
@@ -570,6 +617,7 @@ def find_item_detail_in_table(
                 confidence="low_confidence",
                 flags=flags,
                 table_scope=table_scope,
+                current_col_confidence="fallback_first_numeric",
             )
 
     return None
