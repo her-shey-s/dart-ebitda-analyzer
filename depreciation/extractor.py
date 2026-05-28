@@ -1263,6 +1263,17 @@ def _verify_ai_selection(
 # 내용 기반으로 CF 테이블을 판별하기 위한 마커 (첫 10행 라벨 검사)
 _CF_CONTENT_MARKERS = ("영업활동으로인한현금흐름", "영업활동현금흐름")
 
+# 주석에 있는 "영업으로부터 창출된 현금" (간접법 산출 내역) 표를 식별하는
+# 합계성 라벨 마커들. 회사·연도별 변형이 많아 substring으로 느슨하게 잡는다.
+#   - "차감전순이익": "법인세차감전순이익" / "법인세비용차감전순이익" 모두 매치
+#   - "당기순이익조정": "당기순이익조정을위한가감"
+#   - "영업으로부터창출된현금"
+_CF_ADJUSTMENT_TOTAL_MARKERS = (
+    "차감전순이익",
+    "당기순이익조정",
+    "영업으로부터창출된현금",
+)
+
 
 def _table_looks_like_cf(rows: list[list[str]]) -> bool:
     """테이블 내용이 현금흐름표인지 판별한다 (title 없이 content 기반)."""
@@ -1271,6 +1282,37 @@ def _table_looks_like_cf(rows: list[list[str]]) -> bool:
             continue
         label = row[0].replace(" ", "").strip()
         if any(marker in label for marker in _CF_CONTENT_MARKERS):
+            return True
+    return False
+
+
+def _table_looks_like_cf_adjustment(rows: list[list[str]]) -> bool:
+    """
+    주석에 있는 '영업으로부터 창출된 현금'(간접법 산출 내역) 표를 내용으로 판별한다.
+
+    이 표는 보고서마다 <TITLE>로 잡힐 때도 있고(예: 2025년 현대비앤지스틸의
+    "34. 영업으로부터 창출된 현금 (연결)"), 단순히 <P> 본문에 텍스트로 적힌 뒤
+    표만 이어지는 경우도 있다(예: 같은 회사 2022년 "35. 영업으로부터 ..."). 두
+    경우 모두 행 라벨로 식별해 CF 후보에 넣고, Stage 1의 감가상각 행 매칭을 그대로
+    재사용한다.
+
+    식별 기준 (false positive 최소화):
+      (a) '차감전순이익' / '당기순이익조정' / '영업으로부터창출된현금' 같은
+          CF-조정 합계성 라벨이 한 행 이상 등장하고,
+      (b) 같은 표 안에 '감가상각'을 포함한 행이 있어야 한다.
+    자산 변동표·판관비·비용성격별 등에는 (a) 마커가 등장하지 않아 걸러진다.
+    """
+    has_total_marker = False
+    has_depr_row = False
+    for row in rows[:25]:
+        if not row:
+            continue
+        label = row[0].replace(" ", "").strip()
+        if not has_total_marker and any(m in label for m in _CF_ADJUSTMENT_TOTAL_MARKERS):
+            has_total_marker = True
+        if not has_depr_row and "감가상각" in label:
+            has_depr_row = True
+        if has_total_marker and has_depr_row:
             return True
     return False
 
@@ -1300,6 +1342,9 @@ def _find_cf_tables_by_fs_type(
     all_cf_tables: list[tuple[Tag, list[list[str]]]] = []
 
     current_scope: Optional[bool] = None
+    # 주석 루트("3. 연결재무제표 주석" 등)에서 추출한 연결/별도 스코프.
+    # 주석 안에 흩어진 CF-조정 표(영업으로부터 창출된 현금)에 적용한다.
+    notes_scope: Optional[bool] = None
     is_cf_section = False
     in_notes = False
 
@@ -1314,15 +1359,25 @@ def _find_cf_tables_by_fs_type(
                 in_notes = True
                 is_cf_section = False
                 current_scope = None
+                # 주석 루트 자체에서 연결/별도 스코프를 추출해 두면, 그 안의
+                # CF-조정 표가 어느 스코프인지 결정할 수 있다.
+                if "연결" in title_core:
+                    notes_scope = True
+                elif "별도" in title_core:
+                    notes_scope = False
+                else:
+                    notes_scope = document_scope if document_scope is not None else False
                 if debug_trace is not None:
                     debug_trace.append(
-                        f"[CF] notes root encountered: raw={raw!r}, in_notes=True"
+                        f"[CF] notes root encountered: raw={raw!r}, in_notes=True, "
+                        f"notes_scope={notes_scope}"
                     )
                 continue
 
             # 재무제표 본문 루트 진입 → 주석 종료
             if title_core in _FS_STMT_ROOT_CORES:
                 in_notes = False
+                notes_scope = None
                 is_cf_section = ("현금흐름표" in title_core)
                 if is_cf_section:
                     if "연결" in title_core:
@@ -1365,26 +1420,47 @@ def _find_cf_tables_by_fs_type(
                 is_cf_section = False
                 current_scope = None
 
-        elif tag.name == "table" and (is_cf_section or not in_notes):
+        elif tag.name == "table":
             rows = _xml_table_to_rows(tag)
             if not rows:
                 continue
 
-            # title 기반 CF 섹션 확인, 또는 content 기반 fallback
-            if is_cf_section or _table_looks_like_cf(rows):
-                if not is_cf_section and debug_trace is not None:
+            # 어떤 경로로 이 표를 CF 후보로 채택했는지 분기:
+            #   (a) title 기반 CF 섹션
+            #   (b) title 없는 본문에서 content-based CF 감지
+            #   (c) 주석 안에 있는 CF-조정 표(영업으로부터 창출된 현금) — 명세 #7/실패누적
+            accepted = False
+            table_scope: Optional[bool] = None
+
+            if is_cf_section:
+                accepted = True
+                table_scope = current_scope
+            elif not in_notes and _table_looks_like_cf(rows):
+                accepted = True
+                table_scope = current_scope
+                if debug_trace is not None:
                     labels = ", ".join(row[0].strip() for row in rows[:5] if row)
                     debug_trace.append(
                         f"[CF] content-based CF 감지 (title 없음): labels={labels}"
                     )
+            elif in_notes and _table_looks_like_cf_adjustment(rows):
+                accepted = True
+                table_scope = notes_scope
+                if debug_trace is not None:
+                    labels = ", ".join(row[0].strip() for row in rows[:5] if row)
+                    debug_trace.append(
+                        f"[CF] notes CF-조정 감지: scope={notes_scope}, labels={labels}"
+                    )
+
+            if accepted:
                 all_cf_tables.append((tag, rows))
                 if debug_trace is not None:
                     labels = ", ".join(row[0].strip() for row in rows[:5] if row)
                     debug_trace.append(
-                        f"[CF] table seen scope={current_scope}: labels={labels}"
+                        f"[CF] table seen scope={table_scope}: labels={labels}"
                     )
 
-                if current_scope is None or want_consol == current_scope:
+                if table_scope is None or want_consol == table_scope:
                     matched_tables.append((tag, rows))
 
     if not strict_scope:
@@ -1546,7 +1622,9 @@ def _extract_from_cf(
             # 4) 감가상각 (가장 마지막 — 위 3개와 겹치지 않은 행만)
             #    한 테이블에 '감가상각비'·'투자부동산 감가상각비'처럼 여러 행이
             #    분리 기재되면 모두 합산한다(사용권/무형은 위에서 이미 분리됨).
-            if "감가상각" in label:
+            #    "투자부동산상각비"(2022 현대비앤지스틸 등)는 라벨에 '감가'가 빠져
+            #    있어 일반 substring 매칭으로는 잡히지 않으므로 보조 토큰으로 본다.
+            if "감가상각" in label or "투자부동산상각" in label:
                 if "누계" in label:
                     continue
                 if combined:

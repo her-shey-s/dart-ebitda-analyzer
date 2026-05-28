@@ -1,0 +1,21 @@
+{
+  "id": "bng_steel_2022_path_a",
+  "kind": "real",
+  "description": "현대비앤지스틸 2022 사업보고서 — 본문 CF에 감가상각 행 없음, 주석 '35. 영업으로부터 창출된 현금'에 분리 기재 (제목이 <P>에 묻혀 있음, 투자부동산상각비도 별도 기재)",
+  "path": "A",
+  "corp_code": "00125743",
+  "year": 2022,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "rcept_no": "20230317000757",
+  "report_type": "annual",
+  "raw": {
+    "financial_json": "raw_financial_cfs.json",
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}
