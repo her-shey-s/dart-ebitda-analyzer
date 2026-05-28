@@ -93,8 +93,17 @@ def _build_depreciation_item_details(
     fs_div: str,
     source: str,
     combined: bool = False,
+    risk_flags_by_item: Optional[dict[str, list[str]]] = None,
+    selected_candidate_type_by_item: Optional[dict[str, str]] = None,
 ) -> dict:
-    """Wrap depreciation values in the shared item_details shape."""
+    """
+    Wrap depreciation values in the shared item_details shape.
+
+    risk_flags_by_item / selected_candidate_type_by_item이 주어지면 해당 항목의 detail에
+    선택된 표의 위험 플래그와 분류 유형을 부착하고 confidence를 low_confidence로 강등한다.
+    AI가 후보 중 위험 플래그가 붙은 표를 골랐을 때 최종 결과를 verified로 두지 않기 위함이다
+    (명세 #7).
+    """
     details = details_from_items(
         {name: items.get(name) for name in _DEPR_ITEM_NAMES},
         source={
@@ -108,6 +117,19 @@ def _build_depreciation_item_details(
     )
     if combined and details.get("감가상각비", {}).get("value") is not None:
         add_detail_flag(details["감가상각비"], "combined_depreciation_and_amortization")
+
+    for name in _DEPR_ITEM_NAMES:
+        detail = details.get(name)
+        if not detail or detail.get("value") is None:
+            continue
+        cand_type = (selected_candidate_type_by_item or {}).get(name)
+        if cand_type:
+            detail.setdefault("source", {})["candidate_type"] = cand_type
+        flags = (risk_flags_by_item or {}).get(name) or []
+        if flags:
+            for flag in flags:
+                add_detail_flag(detail, flag)
+            detail["confidence"] = "low_confidence"
     return details
 
 
@@ -479,6 +501,87 @@ def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
     }
 
 
+# ── 후보 테이블 구조 분류 (명세 #7) ─────────────────────────────────────────
+
+# 회사 전체 비용을 가리키는 강한 긍정 시그널 (섹션 제목)
+_STRONG_POSITIVE_TITLE_HINTS = ("비용의성격별", "성격별비용", "성격별분류")
+
+# 자산 변동표를 가리키는 헤더 컬럼명 (취득원가/누계액/장부금액 등)
+_ASSET_MOVEMENT_HEADER_TOKENS = (
+    "취득원가", "장부금액", "감가상각누계액", "감액손실누계액",
+    "정부보조금", "재평가잉여금",
+)
+# 자산 변동표의 흐름 컬럼 (기초·취득·처분·대체·기말 등이 한 표에 모이면 변동표)
+_ASSET_MOVEMENT_FLOW_TOKENS = ("기초", "취득", "처분", "대체", "기말", "감액", "환입")
+
+# 기능별 배분 표를 가리키는 컬럼/라벨 (판관비, 매출원가, 제조원가, 연구개발비 등)
+_FUNCTIONAL_BREAKDOWN_TOKENS = (
+    "판매비와관리비", "판매비", "판관비",
+    "매출원가", "제조원가", "연구개발비",
+)
+
+# 부분 자산군만 다루는 표를 가리키는 제목 토큰 (이미 _PARTIAL_TITLE_KEYWORDS로 1차 걸러지지만
+# 제목이 비어 있는 본문 표가 통과할 때를 대비한 보조 시그널)
+_PARTIAL_ASSET_CLASS_TOKENS = ("유형자산", "투자부동산", "사용권자산", "리스자산", "무형자산")
+
+
+def _classify_depreciation_candidate(
+    rows: list[list[str]],
+    title: Optional[str],
+) -> tuple[str, list[str]]:
+    """
+    감가상각 후보 테이블의 구조 유형(candidate_type)과 위험 플래그(risk_flags)를 분류한다.
+
+    candidate_type 값:
+      - "expense_by_nature":     "비용의 성격별 분류" 등 회사 전체 비용 표 — 강한 긍정
+      - "asset_movement":        취득원가/감가상각누계액/장부금액 자산 변동표 — 부분값(제외)
+      - "functional_breakdown":  판관비/매출원가/제조원가/연구개발비 기능별 배분 — 부분값(제외)
+      - "general_depreciation":  위 분류에 속하지 않지만 정확한 감가상각비 행이 있는 일반 후보
+      - "unknown":               근거 부족 (호출측에서 risk_flag로 처리)
+
+    risk_flags는 분류 근거(예: asset_movement_headers, functional_breakdown_columns)와
+    살아남는 후보의 보조 위험(예: partial_asset_class_title)을 모두 기록한다.
+    호출측은 분류된 유형으로 후보에서 제외하거나, 살아남은 표의 risk_flags를 최종 결과
+    confidence 강등에 사용한다.
+    """
+    risk_flags: list[str] = []
+    title_norm = (title or "").replace(" ", "")
+
+    # 헤더(상단 4행) 모든 셀을 공백 제거하여 키워드 검색 대상으로 모은다.
+    header_cells = [cell for r in rows[:4] for cell in r]
+    header_text = " ".join(c.replace(" ", "") for c in header_cells)
+
+    # 1) 자산 변동표: 누계액/취득원가/장부금액류가 함께 등장하거나 흐름 컬럼이 다수
+    asset_marker_hits = sum(1 for tok in _ASSET_MOVEMENT_HEADER_TOKENS if tok in header_text)
+    flow_marker_hits = sum(1 for tok in _ASSET_MOVEMENT_FLOW_TOKENS if tok in header_text)
+    if asset_marker_hits >= 2:
+        risk_flags.append("asset_movement_headers")
+    if flow_marker_hits >= 3:
+        risk_flags.append("asset_movement_flow_columns")
+    if asset_marker_hits >= 2 or flow_marker_hits >= 3:
+        return "asset_movement", risk_flags
+
+    # 2) 기능별 배분 표: 헤더 컬럼에 판관비/매출원가/제조원가 등이 등장
+    func_hits = sum(1 for tok in _FUNCTIONAL_BREAKDOWN_TOKENS if tok in header_text)
+    if func_hits >= 1:
+        risk_flags.append("functional_breakdown_columns")
+        return "functional_breakdown", risk_flags
+
+    # 3) 비용의 성격별 분류: 섹션 제목에 강한 긍정 시그널
+    if any(hint in title_norm for hint in _STRONG_POSITIVE_TITLE_HINTS):
+        return "expense_by_nature", risk_flags
+
+    # 4) 부분 자산군 제목 (살아남은 후보에 보조 risk_flag로 부착)
+    if title_norm and any(tok in title_norm for tok in _PARTIAL_ASSET_CLASS_TOKENS):
+        risk_flags.append("partial_asset_class_title")
+
+    return "general_depreciation", risk_flags
+
+
+# 후보에서 제외할 candidate_type
+_EXCLUDED_CANDIDATE_TYPES = {"asset_movement", "functional_breakdown"}
+
+
 # ── 주석 테이블 수집 ──────────────────────────────────────────────────────────
 
 def _collect_depreciation_tables(
@@ -606,6 +709,18 @@ def _collect_depreciation_tables(
                     )
                 continue
 
+            # 4차 필터: 테이블 구조 기반 분류 (명세 #7).
+            # 자산 변동표/기능별 배분 표는 부분값이므로 후보에서 제외하고 사유를 trace에 남긴다.
+            # 살아남는 후보에는 candidate_type과 risk_flags를 부착해 AI 선택·결과 신뢰도에 사용한다.
+            candidate_type, risk_flags = _classify_depreciation_candidate(rows, title)
+            if candidate_type in _EXCLUDED_CANDIDATE_TYPES:
+                if debug_trace is not None:
+                    debug_trace.append(
+                        f"[NOTES] -> 구조 분류 {candidate_type} (flags={risk_flags}), 후보 제외 "
+                        f"(title={title or '-'})"
+                    )
+                continue
+
             # 캡션/부모/헤더 태그에서 단위 감지 실패 시, 표 안의 "(단위: 천원)"
             # 같은 행에서 다시 찾는다(단위 표기가 표 밖이 아니라 표 안에 있는 케이스).
             unit = _detect_unit_multiplier(tag)
@@ -616,19 +731,27 @@ def _collect_depreciation_tables(
             text_lines = []
             if title:
                 text_lines.append(f"[섹션: {title}]")
+            text_lines.append(f"[CANDIDATE_TYPE] {candidate_type}")
             unit_label = {1: "원", 1000: "천원", 1_000_000: "백만원"}.get(unit, f"{unit}원")
             text_lines.append(f"(단위: {unit_label})")
             for row in rows:
                 text_lines.append(" | ".join(row))
 
             entry = {
-                "title":   title,
-                "unit":    unit,
-                "rows":    rows,
-                "text":    "\n".join(text_lines),
-                "tag":     tag,  # 원본 태그 (디버깅용)
-                "signals": signals,
+                "title":          title,
+                "unit":           unit,
+                "rows":           rows,
+                "text":           "\n".join(text_lines),
+                "tag":            tag,  # 원본 태그 (디버깅용)
+                "signals":        signals,
+                "candidate_type": candidate_type,
+                "risk_flags":     risk_flags,
             }
+            if debug_trace is not None:
+                debug_trace.append(
+                    f"[NOTES] -> 후보 채택 candidate_type={candidate_type} flags={risk_flags} "
+                    f"(title={title or '-'})"
+                )
 
             all_notes_tables.append(entry)
 
@@ -703,9 +826,11 @@ def _format_tables_for_ai(tables: list[dict]) -> str:
         unit = tbl.get("unit", 1)
         unit_label = {1: "원", 1000: "천원", 1_000_000: "백만원", 100_000_000: "억원"}.get(unit, f"{unit}원")
 
+        candidate_type = tbl.get("candidate_type") or "unknown"
         lines = [
             f"[TABLE {table_id}]",
             f"[SECTION] {title}",
+            f"[TYPE] {candidate_type}",
             f"[UNIT] {unit_label}",
         ]
 
@@ -1565,6 +1690,8 @@ def extract_depreciation(
         for idx, tbl in enumerate(tables, start=1):
             title = tbl.get("title") or "-"
             signals = tbl.get("signals") or {}
+            candidate_type = tbl.get("candidate_type") or "unknown"
+            risk_flags = tbl.get("risk_flags") or []
             marks = []
             if signals.get("has_separate_pair"):
                 marks.append("SEPARATE_PAIR")
@@ -1573,8 +1700,12 @@ def extract_depreciation(
             if signals.get("has_combined_row"):
                 marks.append("COMBINED")
             mark_str = f"[{'/'.join(marks)}] " if marks else ""
+            risk_str = f" risk={risk_flags}" if risk_flags else ""
             labels = ", ".join(row[0].strip() for row in tbl.get("rows", [])[:5] if row)
-            trace.append(f"[NOTES] T{idx} {mark_str}title={title} / labels={labels}")
+            trace.append(
+                f"[NOTES] T{idx} {mark_str}type={candidate_type}{risk_str} "
+                f"title={title} / labels={labels}"
+            )
     except Exception as e:
         tables = []
         base["error"] = f"테이블 수집 실패: {e}"
@@ -1677,10 +1808,47 @@ def extract_depreciation(
     # Step D: CF + Notes 병합 (CF 우선)
     notes_combined = notes_result.get("combined", False)
     final: dict[str, Optional[float]] = {}
+    notes_provenance: dict[str, bool] = {}
     for key in ("감가상각비", "사용권자산상각비", "무형자산상각비"):
         cf_val = cf_result.get(key)
         notes_val = notes_result.get(key)
         final[key] = cf_val if cf_val is not None else notes_val
+        # 최종값이 notes 단계에서 나왔는지(CF가 덮어쓰지 않은 경우) 표시 — risk_flags 적용 판단용.
+        notes_provenance[key] = cf_val is None and notes_val is not None
+
+    # AI가 선택한 표의 candidate_type/risk_flags를 notes 출처 항목에만 전파한다(명세 #7).
+    risk_flags_by_item: dict[str, list[str]] = {}
+    selected_candidate_type_by_item: dict[str, str] = {}
+    if ai_selection:
+        _SEL_KEYS = {
+            "감가상각비": "depreciation",
+            "사용권자산상각비": "rou_amortization",
+            "무형자산상각비": "amortization",
+        }
+        for item_name, sel_key in _SEL_KEYS.items():
+            if not notes_provenance.get(item_name):
+                continue
+            sel = ai_selection.get(sel_key)
+            if not isinstance(sel, dict):
+                continue
+            t_id = sel.get("table_id")
+            if not t_id:
+                continue
+            for idx, tbl in enumerate(tables, start=1):
+                if f"T{idx}" != t_id:
+                    continue
+                cand_type = tbl.get("candidate_type") or "unknown"
+                selected_candidate_type_by_item[item_name] = cand_type
+                tbl_flags = list(tbl.get("risk_flags") or [])
+                if cand_type == "unknown":
+                    tbl_flags.append("candidate_type_unknown")
+                if tbl_flags:
+                    risk_flags_by_item[item_name] = tbl_flags
+                    trace.append(
+                        f"[NOTES] 선택된 표 위험 플래그 전파: {item_name} ← T{idx} "
+                        f"(type={cand_type}, flags={tbl_flags})"
+                    )
+                break
 
     is_combined = cf_combined or notes_combined
 
@@ -1713,6 +1881,8 @@ def extract_depreciation(
             fs_div=fs_div,
             source=source,
             combined=is_combined,
+            risk_flags_by_item=risk_flags_by_item or None,
+            selected_candidate_type_by_item=selected_candidate_type_by_item or None,
         ),
         "source":   source,
         "combined": is_combined,
