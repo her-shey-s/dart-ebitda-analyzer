@@ -1,0 +1,21 @@
+{
+  "id": "stxengine_2022_path_a",
+  "kind": "real",
+  "description": "STX엔진 2022 사업보고서: 주석 34.현금흐름표 단위(천원) 및 투자부동산상각비",
+  "path": "A",
+  "corp_code": "00480455",
+  "year": 2022,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "rcept_no": "20230322000972",
+  "report_type": "annual",
+  "raw": {
+    "financial_json": "raw_financial_cfs.json",
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}

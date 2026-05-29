@@ -387,12 +387,15 @@ def _is_general_depreciation_label(label: str) -> bool:
         label: _normalize_row_label() 적용된 행 라벨
 
     규칙:
-      - '감가상각'을 포함해야 함 → '대손상각비'·'무형자산상각비'(감가상각 없음) 자동 제외
+      - '감가상각' 또는 '투자부동산상각'을 포함해야 함
+        → '대손상각비'·'무형자산상각비'(감가상각 없음) 자동 제외
+        → '투자부동산상각비'(2022 STX엔진 등 '감가'가 빠진 단축 표기)는 보조 토큰으로 포함.
+          CF 경로(_extract_from_cf)도 동일 토큰으로 감가상각비에 합산한다.
       - '사용권' 포함 → 제외(사용권자산상각비 버킷)
       - '무형자산상각' 포함 → 제외(합산행 '감가상각비및무형자산상각비' 방어)
       - '누계' 포함 → 제외(자산 변동표의 상각누계액)
     """
-    if "감가상각" not in label:
+    if "감가상각" not in label and "투자부동산상각" not in label:
         return False
     if "누계" in label:
         return False

@@ -70,8 +70,13 @@ def detect_unit_multiplier(tag: Tag, fallback: int = 1) -> int:
 
     탐색 순서:
       1. 직전 형제 태그 최대 5개 ('(단위: 백만원)' 캡션 패턴)
-      2. 부모 노드의 직전 형제 (캡션이 한 단계 위에 있는 경우)
-      3. 테이블 내부 첫 5행의 셀 텍스트 (인라인 표기)
+      2. 테이블 내부 첫 5행의 셀 텍스트 (인라인 표기)
+      3. 부모 노드의 직전 형제 (캡션이 한 단계 위에 있는 경우)
+
+    테이블 자체의 인라인 단위 표기(2)는 그 표에 대해 가장 권위 있는 출처이므로,
+    멀리 떨어진 부모 형제(3)보다 먼저 확인한다. 그렇지 않으면 주석에 재수록된
+    현금흐름표(인라인 "(단위: 천원)")가 상위 재무제표 본문 섹션의 "(단위: 백만원)"
+    캡션을 잘못 집어 1,000배 오차가 발생한다(예: STX엔진 2022 "34. 현금흐름표").
 
     감지 실패 시 ``fallback`` (기본 1=원) 반환.
     """
@@ -85,6 +90,14 @@ def detect_unit_multiplier(tag: Tag, fallback: int = 1) -> int:
         if unit is not None:
             return unit
 
+    for i, tr in enumerate(tag.find_all("tr")):
+        if i >= 5:
+            break
+        for cell in tr.find_all(["td", "th", "tu", "te"]):
+            unit = detect_unit_in_text(cell.get_text(strip=True))
+            if unit is not None:
+                return unit
+
     parent = tag.parent
     sib = parent
     for _ in range(3):
@@ -95,14 +108,6 @@ def detect_unit_multiplier(tag: Tag, fallback: int = 1) -> int:
         unit = detect_unit_in_text(text)
         if unit is not None:
             return unit
-
-    for i, tr in enumerate(tag.find_all("tr")):
-        if i >= 5:
-            break
-        for cell in tr.find_all(["td", "th", "tu", "te"]):
-            unit = detect_unit_in_text(cell.get_text(strip=True))
-            if unit is not None:
-                return unit
 
     return fallback
 
