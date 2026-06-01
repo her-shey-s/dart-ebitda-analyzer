@@ -12,6 +12,11 @@ concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
 
+# checkout/setup-python(현재 최신 메이저)이 아직 Node 20 런타임을 쓰는데,
+# 2026-06-16부터 Node 24로 강제 전환된다는 deprecation 경고를 미리 opt-in 해 없앤다.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   pytest:
     runs-on: ubuntu-latest
