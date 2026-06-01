@@ -460,12 +460,14 @@ def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
     Returns:
         {
             "has_exact_depr": bool,     # 정확 감가상각비 행 존재
+            "has_general_depr": bool,   # 일반 감가상각 행 존재(유형자산/투자부동산 등)
             "has_exact_amort": bool,    # 정확 무형자산상각비 행 존재
             "has_combined_row": bool,   # 합산 행 존재
             "has_separate_pair": bool,  # 분리 기재 쌍 존재 (depr + amort)
         }
     """
     has_exact_depr = False
+    has_general_depr = False
     has_exact_amort = False
     has_combined_row = False
 
@@ -488,6 +490,7 @@ def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
         if label in _EXACT_DEPR_LABELS:
             if _row_has_number(row):
                 has_exact_depr = True
+                has_general_depr = True
             continue
 
         # 정확 무형자산상각비 매칭
@@ -496,11 +499,18 @@ def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
                 has_exact_amort = True
             continue
 
+        # 일반 감가상각 행(증권·자산운용 등 금융사 CF 주석은 '감가상각비' 단일 행 없이
+        # '유형자산감가상각비'·'투자부동산감가상각비'로 분리 기재한다). 이 행들도
+        # 감가상각비 후보 시그널로 인정해야 표가 후보에서 누락되지 않는다.
+        if _is_general_depreciation_label(label) and _row_has_number(row):
+            has_general_depr = True
+
     return {
         "has_exact_depr":    has_exact_depr,
+        "has_general_depr":  has_general_depr,
         "has_exact_amort":   has_exact_amort,
         "has_combined_row":  has_combined_row,
-        "has_separate_pair": has_exact_depr and has_exact_amort,
+        "has_separate_pair": has_general_depr and has_exact_amort,
     }
 
 
@@ -693,11 +703,15 @@ def _collect_depreciation_tables(
             # 정확한 '감가상각비' 행 또는 합산 행이 숫자와 함께 없으면 스킵
             # (유형자산 변동/기능별 배분/판관비 부분값 등 걸러냄)
             signals = _detect_depreciation_signals(rows)
-            if not (signals["has_exact_depr"] or signals["has_combined_row"]):
+            if not (
+                signals["has_exact_depr"]
+                or signals["has_general_depr"]
+                or signals["has_combined_row"]
+            ):
                 if debug_trace is not None:
                     preview = ", ".join(row[0].strip() for row in rows[:5] if row)
                     debug_trace.append(
-                        f"[NOTES] -> 정확 감가상각비/합산 행 없음, 스킵 (labels={preview})"
+                        f"[NOTES] -> 감가상각비/합산 행 없음, 스킵 (labels={preview})"
                     )
                 continue
 
@@ -1179,7 +1193,17 @@ def _verify_ai_selection(
             and "감가상각비" in actual_label
             and "무형자산상각비" in actual_label
         )
-        if actual_label is not None and (actual_label in _EXACT_DEPR_LABELS or is_combined_label):
+        # 정확 '감가상각비'뿐 아니라 '유형자산감가상각비'·'투자부동산감가상각비' 같은
+        # 일반 감가상각 라벨도 허용한다(금융사 CF 주석 분리 기재 대응). 사용권/무형은
+        # _is_general_depreciation_label에서 제외되므로 오인식되지 않는다.
+        is_general_depr_label = (
+            actual_label is not None
+            and not is_combined_label
+            and _is_general_depreciation_label(actual_label)
+        )
+        if actual_label is not None and (
+            actual_label in _EXACT_DEPR_LABELS or is_combined_label or is_general_depr_label
+        ):
             if is_combined_label:
                 # 합산 공시('감가상각비 및 무형자산상각비')는 단일 합산값을 그대로 사용
                 val = _extract_value_at_position(
@@ -1205,7 +1229,7 @@ def _verify_ai_selection(
             if debug_trace is not None:
                 debug_trace.append(
                     f"[VERIFY] 감가상각비 라벨 불일치: AI선택={depr_sel.get('row_label')!r}, "
-                    f"actual='{actual_label}', 허용={_EXACT_DEPR_LABELS} → null 처리"
+                    f"actual='{actual_label}', 허용=감가상각비/일반감가상각/합산 → null 처리"
                 )
 
     # 사용권자산상각비 추출 (합산이 아닌 경우만, 라벨 검증 포함)

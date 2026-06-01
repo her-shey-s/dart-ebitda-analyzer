@@ -1,0 +1,21 @@
+{
+  "id": "miraeasset_am_2025_path_a",
+  "kind": "real",
+  "description": "미래에셋자산운용 2025 (경로A). 주석35 현금흐름표 손익조정의 유형자산/투자부동산 분리기재 D&A. 주석-AI 경로는 오프라인 golden 미반영(Gemini 필요) — D&A 검증은 test_cf_notes_split_depreciation.py.",
+  "path": "A",
+  "corp_code": "00259776",
+  "year": 2025,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "rcept_no": "20260323001202",
+  "report_type": "annual",
+  "raw": {
+    "financial_json": "raw_financial_cfs.json",
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}
