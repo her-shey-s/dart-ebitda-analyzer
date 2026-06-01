@@ -179,7 +179,14 @@ def _parse_number(text: str) -> Optional[float]:
         negative = True
         text = text[1:-1]
 
-    text = text.replace(",", "").replace(" ", "")
+    text = text.replace(" ", "").strip()
+    # 주석(노트 번호) 컬럼은 "2,4,13,27,28,33"처럼 콤마로 나열돼 숫자처럼 보이지만
+    # 금액이 아니다. 콤마가 있으면 천단위 그룹 형식(첫 그룹 1~3자리, 이후 정확히
+    # 3자리)일 때만 금액으로 인정한다.
+    if "," in text:
+        if not re.fullmatch(r"-?\d{1,3}(?:,\d{3})+(?:\.\d+)?", text):
+            return None
+        text = text.replace(",", "")
     try:
         val = float(text)
         return -val if negative else val
@@ -292,7 +299,13 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
     for header in header_rows:
         for ci, cell in enumerate(header):
             norm = cell.replace(" ", "").strip()
-            if "당기" in norm and "전기" not in norm and "전전기" not in norm:
+            # "당기"가 기간 헤더(당기/당기말/당기초)일 때만 매칭한다. "당기순이익"·
+            # "당기손익" 같은 계정 라벨의 "당기"(뒤에 한글이 이어짐)는 제외한다.
+            if (
+                re.search(r"당기(?:말|초)?(?![가-힣])", norm)
+                and "전기" not in norm
+                and "전전기" not in norm
+            ):
                 # 복합 헤더 대응 (비용의 성격별 분류 등):
                 # "당기" 아래 매출원가/판관비/합계 하위 컬럼이 있으면 "합계" 우선
                 end_col = len(header)
@@ -317,10 +330,11 @@ def _detect_current_column(rows: list[list[str]]) -> Optional[int]:
                 return ci
 
     # 2. "제 N 기" 패턴 — 가장 큰 N
+    #    "제 37 (당) 기"처럼 (당)/(전) 표기가 끼어드는 헤더도 잡는다.
     gi_candidates: list[tuple[int, int]] = []
     for header in header_rows:
         for ci, cell in enumerate(header):
-            m = re.search(r"제\s*(\d+)\s*기", cell)
+            m = re.search(r"제\s*(\d+)\s*\(?\s*[당전]?\s*\)?\s*기", cell)
             if m:
                 gi_candidates.append((int(m.group(1)), ci))
     if gi_candidates:

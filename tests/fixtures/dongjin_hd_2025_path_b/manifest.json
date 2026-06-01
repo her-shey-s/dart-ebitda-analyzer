@@ -1,0 +1,17 @@
+{
+  "id": "dongjin_hd_2025_path_b",
+  "kind": "real",
+  "description": "동진홀딩스 2025 (경로B). 연결현금흐름표 '제 N (당) 기' 헤더 + 주석(노트번호) 컬럼. 당기컬럼 오탐지·주석숫자 오인식으로 감가상각비가 24억으로 추출되던 회귀(정답 778억). CF 본문 추출이라 golden에 D&A 포함.",
+  "path": "B",
+  "rcept_no": "20260331003185",
+  "report_type": "audit_consol",
+  "fs_div": "CFS",
+  "strict_scope": false,
+  "raw": {
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}
