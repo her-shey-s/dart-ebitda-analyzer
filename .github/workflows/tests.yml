@@ -1,0 +1,38 @@
+name: tests
+
+# 푸시·PR 시 오프라인 회귀 테스트(pytest)를 자동 실행한다.
+# tests/ 만 수집하며(pytest.ini), 실제 DART/Gemini 네트워크 호출은 하지 않으므로
+# API 키 없이 결정적으로 통과해야 한다.
+on:
+  push:
+  pull_request:
+
+# 같은 브랜치/PR에서 새 푸시가 오면 진행 중이던 실행은 취소한다.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run offline regression tests
+        # 네트워크가 필요한 진단 테스트가 실수로 끼어들지 않도록 network 마커는 제외한다.
+        # (pytest.ini가 testpaths=tests 로 루트 진단 스크립트는 이미 제외)
+        run: pytest tests/ -m "not network"
