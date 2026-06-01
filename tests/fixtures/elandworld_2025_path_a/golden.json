@@ -1,0 +1,41 @@
+{
+  "fs_div": "CFS",
+  "financials": {
+    "총자산": null,
+    "총부채": null,
+    "자본총계": null,
+    "이익잉여금": null,
+    "매출액": null,
+    "매출원가": null,
+    "매출총이익": null,
+    "영업이익": null,
+    "당기순이익": null,
+    "감가상각비": null,
+    "사용권자산상각비": null,
+    "무형자산상각비": null
+  },
+  "depreciation": {
+    "items": {
+      "감가상각비": null,
+      "사용권자산상각비": null,
+      "무형자산상각비": null
+    },
+    "combined": false,
+    "source": "error"
+  },
+  "final_items": {
+    "총자산": null,
+    "총부채": null,
+    "자본총계": null,
+    "이익잉여금": null,
+    "매출액": null,
+    "매출원가": null,
+    "매출총이익": null,
+    "영업이익": null,
+    "당기순이익": null,
+    "감가상각비": null,
+    "사용권자산상각비": null,
+    "무형자산상각비": null
+  },
+  "ebitda": null
+}

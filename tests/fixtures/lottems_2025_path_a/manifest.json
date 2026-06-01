@@ -1,0 +1,21 @@
+{
+  "id": "lottems_2025_path_a",
+  "kind": "real",
+  "description": "롯데물산 2025 (경로A). 32.비용의 성격별 분류 합산행 '감가상각비 및 무형자산상각비' 99,541백만. report_finder가 [첨부정정] 대신 원본 선택. 주석-AI 경로(golden 미반영).",
+  "path": "A",
+  "corp_code": "00120483",
+  "year": 2025,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "rcept_no": "20260331004115",
+  "report_type": "annual",
+  "raw": {
+    "financial_json": "raw_financial_cfs.json",
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}

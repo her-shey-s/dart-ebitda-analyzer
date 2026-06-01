@@ -601,6 +601,12 @@ def _classify_depreciation_candidate(
     # 헤더(상단 4행) 모든 셀을 공백 제거하여 키워드 검색 대상으로 모은다.
     header_cells = [cell for r in rows[:4] for cell in r]
     header_text = " ".join(c.replace(" ", "") for c in header_cells)
+    # 기능별 배분 토큰(매출원가/판관비 등)은 '컬럼 헤더'에 등장한다. '비용의 성격별
+    # 분류' 표의 행 라벨 '상품매출원가'(0번 컬럼)를 기능별 컬럼으로 오인하지 않도록,
+    # 기능별 판정은 0번(라벨) 컬럼을 뺀 셀에서만 검색한다.
+    col_header_text = " ".join(
+        c.replace(" ", "") for r in rows[:4] for c in r[1:]
+    )
 
     # 1) 자산 변동표: 누계액/취득원가/장부금액류가 함께 등장하거나 흐름 컬럼이 다수
     asset_marker_hits = sum(1 for tok in _ASSET_MOVEMENT_HEADER_TOKENS if tok in header_text)
@@ -612,15 +618,16 @@ def _classify_depreciation_candidate(
     if asset_marker_hits >= 2 or flow_marker_hits >= 3:
         return "asset_movement", risk_flags
 
-    # 2) 기능별 배분 표: 헤더 컬럼에 판관비/매출원가/제조원가 등이 등장
-    func_hits = sum(1 for tok in _FUNCTIONAL_BREAKDOWN_TOKENS if tok in header_text)
+    # 2) 비용의 성격별 분류: 섹션 제목 강한 긍정 → 회사 전체 비용 표.
+    #    기능별 배분 판정보다 우선한다('상품매출원가' 같은 행이 있어도 성격별 표다).
+    if any(hint in title_norm for hint in _STRONG_POSITIVE_TITLE_HINTS):
+        return "expense_by_nature", risk_flags
+
+    # 3) 기능별 배분 표: 컬럼 헤더(0번 라벨 컬럼 제외)에 판관비/매출원가/제조원가 등
+    func_hits = sum(1 for tok in _FUNCTIONAL_BREAKDOWN_TOKENS if tok in col_header_text)
     if func_hits >= 1:
         risk_flags.append("functional_breakdown_columns")
         return "functional_breakdown", risk_flags
-
-    # 3) 비용의 성격별 분류: 섹션 제목에 강한 긍정 시그널
-    if any(hint in title_norm for hint in _STRONG_POSITIVE_TITLE_HINTS):
-        return "expense_by_nature", risk_flags
 
     # 4) 부분 자산군 제목 (살아남은 후보에 보조 risk_flag로 부착)
     if title_norm and any(tok in title_norm for tok in _PARTIAL_ASSET_CLASS_TOKENS):

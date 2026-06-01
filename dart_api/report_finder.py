@@ -110,15 +110,18 @@ def find_report(
         elapsed = time.perf_counter() - t0
         _log("REPORT", f"  {label} API 응답: {len(items)}건 ({elapsed:.2f}초)")
 
-        # 접수일 내림차순으로 순회하며 요청 연도와 일치하는 보고서 선택
+        # 접수일 내림차순으로 순회하며 요청 연도와 일치하는 보고서 선택.
+        # [첨부정정]은 첨부서류만 정정해 본문 XML(document.xml)이 없으므로(재무
+        # 수치는 원본과 동일) 비-[첨부정정](원본/기재정정)을 우선한다. 같은 spec에
+        # [첨부정정]밖에 없을 때만 폴백으로 사용한다.
+        attach_correction_fallback: dict | None = None
         for item in items:
             report_year = _extract_year_from_report_nm(item["report_nm"])
             if report_year is not None and report_year != year:
                 _log("REPORT", f"  스킵: {item['report_nm']} (연도 불일치: {report_year})")
                 continue
 
-            _log("REPORT", f"  선택: {item['report_nm']} (rcept_no={item['rcept_no']}, path={spec['path']})")
-            return {
+            selected = {
                 "path":        spec["path"],
                 "rcept_no":    item["rcept_no"],
                 "report_type": spec["report_type"],
@@ -126,6 +129,23 @@ def find_report(
                 "rcept_dt":    item["rcept_dt"],
                 "reprt_code":  spec["reprt_code"],
             }
+
+            if "[첨부정정]" in item["report_nm"]:
+                if attach_correction_fallback is None:
+                    attach_correction_fallback = selected
+                _log("REPORT", f"  보류(첨부정정, 본문 XML 없음): {item['report_nm']} (rcept_no={item['rcept_no']})")
+                continue
+
+            _log("REPORT", f"  선택: {item['report_nm']} (rcept_no={item['rcept_no']}, path={spec['path']})")
+            return selected
+
+        if attach_correction_fallback is not None:
+            _log(
+                "REPORT",
+                f"  비-첨부정정본 없음 → 첨부정정본 사용: {attach_correction_fallback['report_nm']} "
+                f"(rcept_no={attach_correction_fallback['rcept_no']})",
+            )
+            return attach_correction_fallback
 
     _log("REPORT", "  보고서를 찾지 못함")
     return None

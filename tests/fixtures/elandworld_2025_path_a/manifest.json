@@ -1,0 +1,21 @@
+{
+  "id": "elandworld_2025_path_a",
+  "kind": "real",
+  "description": "이랜드월드 2025 (경로A, corp 00207108). 31.비용의 성격별 분류 '감가상각비와 기타상각비' 382,884백만. '상품매출원가' 행 때문에 functional_breakdown 오분류로 제외되던 회귀. 주석-AI 경로(golden 미반영) — 검증은 test_expense_by_nature_combined.py.",
+  "path": "A",
+  "corp_code": "00207108",
+  "year": 2025,
+  "reprt_code": "11011",
+  "requested_div": "CFS",
+  "fs_div": "CFS",
+  "rcept_no": "20260331004473",
+  "report_type": "annual",
+  "strict_scope": true,
+  "raw": {
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": false,
+    "depreciation": true
+  }
+}
