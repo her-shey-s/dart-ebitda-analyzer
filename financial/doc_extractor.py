@@ -771,6 +771,26 @@ def _extract_all_items(
     return details_to_items(_extract_all_item_details(soup, fs_div=fs_div))
 
 
+def _scale_amount_text(cell: str, unit: int) -> str:
+    """
+    AI 입력용 금액 셀을 원(KRW) 단위로 미리 환산한다.
+
+    AI에게 "(단위: 백만원)" 라벨 + 원시 숫자(예: 10,051,358)를 주고 원 단위로
+    변환하라고 시키면, 작은 모델은 표시값을 그대로 돌려주어(10,051,358) 단위 보정이
+    사라진다. 이를 막기 위해 텍스트 단계에서 미리 원 단위로 환산해, AI는 숫자를
+    그대로 복사만 하면 되도록 한다. 비숫자 셀(대시·주석기호 등)은 원본을 유지한다.
+    """
+    if unit == 1:
+        return cell
+    val = _to_float(cell)
+    if val is None:
+        return cell
+    scaled = val * unit
+    if scaled == int(scaled):
+        return f"{int(scaled):,}"
+    return f"{scaled:,.2f}"
+
+
 def _extract_table_text_for_ai(
     soup: BeautifulSoup,
     fs_div: Optional[str] = None,
@@ -782,6 +802,10 @@ def _extract_table_text_for_ai(
     각 행은 '항목명: 값' 형태로 변환한다. fs_div가 주어지면 Python 추출과 같은
     스코프의 표만 AI에 보여, 연결/별도 혼재 문서에서 AI가 다른 스코프 표를 보고
     엇갈린 판정을 내리지 않도록 한다.
+
+    금액은 테이블 단위(백만원 등)를 적용해 원(KRW)으로 미리 환산한 뒤 넣는다.
+    AI에게 단위 변환을 맡기면 표시값을 그대로 돌려주어 단위 보정이 사라지므로,
+    Python 추출과 동일한 원 단위 기준으로 맞춰 불일치·오판정을 막는다.
 
     Args:
         soup:   _parse_dart_xml() 반환값
@@ -808,11 +832,18 @@ def _extract_table_text_for_ai(
             unit = _detect_unit_multiplier(tag)
             if unit == 1:
                 unit = _detect_unit_from_rows(rows, fallback=1)
-            lines.append(f"[{fs_type}] (단위: {_unit_label(unit)})")
+            # 숫자를 미리 원(KRW)으로 환산했으므로 라벨도 '원'으로 표기한다.
+            lines.append(f"[{fs_type}] (단위: 원)")
             for row in rows:
                 if row and len(row) >= 2:
                     label = normalize_label(row[0])
-                    vals  = " | ".join(c for c in row[1:] if c.strip())
+                    # 표 안에 재수록된 "(단위: 백만원)" 같은 캡션 셀은 환산된 숫자와
+                    # 모순되어 AI를 혼동시키므로 제외한다.
+                    vals  = " | ".join(
+                        _scale_amount_text(c, unit)
+                        for c in row[1:]
+                        if c.strip() and "단위" not in c
+                    )
                     if label and vals:
                         lines.append(f"{label}: {vals}")
             if len("\n".join(lines)) > 8000:
