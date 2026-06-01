@@ -375,6 +375,29 @@ _EXACT_ROU_AMORT_LABELS = {
 _EXACT_AMORT_LABELS = {"무형자산상각비", "무형자산상각비용", "무형자산상각"}
 
 
+def _is_intangible_amortization_label(label: str) -> bool:
+    """
+    무형자산상각비(무형자산 상각/감가상각) 행인지 판정한다.
+
+    회사마다 표기가 갈린다: '무형자산상각비'가 표준이나 일부는 '무형자산감가상각비'로
+    적는다(예: 2025 에실로코리아 '26. 비용의 성격별 분류'). 후자는 '무형자산'과 '상각'
+    사이에 '감가'가 끼어 '무형자산상각' substring으로는 잡히지 않으므로, '무형자산'과
+    '상각'이 함께 있으면 무형자산상각으로 본다. 이렇게 잡아야:
+      (a) 감가상각비 합산에서 제외되어 무형자산상각비가 감가상각비에 오합산되지 않고,
+      (b) 무형자산상각비 버킷으로 올바로 분리된다.
+
+    '무형자산손상차손'·'무형자산처분손실' 등은 '상각'이 없어 자동 제외된다.
+
+    Args:
+        label: _normalize_row_label() 적용된 행 라벨
+    """
+    if "누계" in label:
+        return False
+    if "무형자산" not in label:
+        return False
+    return "상각" in label
+
+
 def _is_general_depreciation_label(label: str) -> bool:
     """
     '감가상각비' 버킷에 합산할 일반 감가상각 행인지 판정한다.
@@ -392,7 +415,8 @@ def _is_general_depreciation_label(label: str) -> bool:
         → '투자부동산상각비'(2022 STX엔진 등 '감가'가 빠진 단축 표기)는 보조 토큰으로 포함.
           CF 경로(_extract_from_cf)도 동일 토큰으로 감가상각비에 합산한다.
       - '사용권' 포함 → 제외(사용권자산상각비 버킷)
-      - '무형자산상각' 포함 → 제외(합산행 '감가상각비및무형자산상각비' 방어)
+      - 무형자산상각(=무형자산상각비/무형자산감가상각비) → 제외(무형자산상각비 버킷 및
+        합산행 '감가상각비및무형자산상각비' 방어)
       - '누계' 포함 → 제외(자산 변동표의 상각누계액)
     """
     if "감가상각" not in label and "투자부동산상각" not in label:
@@ -401,7 +425,7 @@ def _is_general_depreciation_label(label: str) -> bool:
         return False
     if "사용권" in label:
         return False
-    if "무형자산상각" in label:
+    if _is_intangible_amortization_label(label):
         return False
     return True
 
@@ -493,8 +517,8 @@ def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
                 has_general_depr = True
             continue
 
-        # 정확 무형자산상각비 매칭
-        if label in _EXACT_AMORT_LABELS:
+        # 무형자산상각비 매칭('무형자산상각비'·'무형자산감가상각비' 등)
+        if _is_intangible_amortization_label(label):
             if _row_has_number(row):
                 has_exact_amort = True
             continue
@@ -1263,7 +1287,7 @@ def _verify_ai_selection(
             actual_label = _resolve_actual_row_label(
                 tables, amort_sel["table_id"], amort_sel["row_id"]
             )
-            if actual_label is not None and actual_label in _EXACT_AMORT_LABELS:
+            if actual_label is not None and _is_intangible_amortization_label(actual_label):
                 val = _extract_value_at_position(
                     tables, amort_sel["table_id"], amort_sel["row_id"], debug_trace
                 )
@@ -1277,7 +1301,7 @@ def _verify_ai_selection(
                 if debug_trace is not None:
                     debug_trace.append(
                         f"[VERIFY] 무형자산상각비 라벨 불일치: AI선택={amort_sel.get('row_label')!r}, "
-                        f"actual='{actual_label}', 허용={_EXACT_AMORT_LABELS} → null 처리"
+                        f"actual='{actual_label}', 허용=무형자산상각/무형자산감가상각 → null 처리"
                     )
 
     result["combined"] = combined
@@ -1628,7 +1652,9 @@ def _extract_from_cf(
                 continue
 
             # 3) 무형자산상각 (감가상각보다 먼저)
-            if "무형자산상각" in label:
+            #    '무형자산감가상각비'(에실로코리아 등)도 무형자산상각으로 잡아야
+            #    아래 4) 감가상각 합산에 오합산되지 않는다.
+            if _is_intangible_amortization_label(label):
                 if "누계" in label:
                     continue
                 if result["무형자산상각비"] is None:

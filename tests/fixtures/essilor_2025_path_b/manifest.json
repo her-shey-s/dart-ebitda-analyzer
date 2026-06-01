@@ -1,0 +1,17 @@
+{
+  "id": "essilor_2025_path_b",
+  "kind": "real",
+  "description": "에실로코리아 2025 (경로B). '26.비용의 성격별 분류'에서 무형자산 상각을 '무형자산감가상각비'로 표기 → 감가상각비에 오합산되던 회귀. 주석-AI 경로는 오프라인 golden 미반영(Gemini 필요) — D&A 검증은 test_intangible_amortization_label.py.",
+  "path": "B",
+  "rcept_no": "20260408003403",
+  "report_type": "audit_consol",
+  "fs_div": "CFS",
+  "strict_scope": false,
+  "raw": {
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}
