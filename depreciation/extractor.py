@@ -1144,6 +1144,40 @@ def _resolve_actual_row_label(
     return _normalize_row_label(rows[ri][0])
 
 
+def _clean_display_label(label: str) -> str:
+    """행 라벨을 표시용으로 정리한다(연속 공백 1칸, 앞 번호 접두 제거).
+
+    비고 문구에 원문 합산 라벨을 그대로 보여주기 위한 것으로, 정규화(공백 제거)와
+    달리 '감가상각비 및 무형자산상각비'처럼 사람이 읽기 좋은 형태를 유지한다.
+    """
+    norm = re.sub(r"\s+", " ", (label or "")).strip()
+    # 선두 번호/기호 접두어 제거 ("1.", "(1)", "가." 등)
+    norm = re.sub(r"^[\(\[]?[\d①-⑳]{1,3}[\)\]]?[.\s]*", "", norm).strip()
+    return norm
+
+
+def _raw_display_row_label(
+    tables: list[dict],
+    table_id: str,
+    row_id: str,
+) -> Optional[str]:
+    """AI가 지목한 위치의 원문 행 라벨(표시용, 공백 유지)을 반환한다."""
+    m = re.match(r"T(\d+)", table_id or "")
+    if not m:
+        return None
+    ti = int(m.group(1)) - 1
+    if ti < 0 or ti >= len(tables):
+        return None
+    rows = tables[ti].get("rows", [])
+    m = re.match(r"R(\d+)", row_id or "")
+    if not m:
+        return None
+    ri = int(m.group(1)) - 1
+    if ri < 0 or ri >= len(rows) or not rows[ri]:
+        return None
+    return _clean_display_label(rows[ri][0])
+
+
 def _sum_general_depreciation_in_table(
     tables: list[dict],
     table_id: str,
@@ -1225,6 +1259,7 @@ def _verify_ai_selection(
         "무형자산상각비": None,
     }
     combined = ai_selection.get("combined", False)
+    combined_label: Optional[str] = None
 
     # 감가상각비 추출 (라벨 검증 포함)
     depr_sel = ai_selection.get("depreciation")
@@ -1265,6 +1300,12 @@ def _verify_ai_selection(
                         tables, depr_sel["table_id"], depr_sel["row_id"], debug_trace
                     )
             result["감가상각비"] = val
+            # 합산 공시인 경우, 비고에 표시할 원문 합산 라벨을 보관한다
+            # (예: '감가상각비 및 무형자산상각비', '감가상각비와 기타상각비').
+            if combined and val is not None:
+                combined_label = _raw_display_row_label(
+                    tables, depr_sel["table_id"], depr_sel["row_id"]
+                )
             if debug_trace is not None:
                 debug_trace.append(
                     f"[VERIFY] 감가상각비: table={depr_sel['table_id']}, row={depr_sel['row_id']}, "
@@ -1326,6 +1367,7 @@ def _verify_ai_selection(
                     )
 
     result["combined"] = combined
+    result["combined_label"] = combined_label
     return result
 
 
@@ -1585,6 +1627,7 @@ def _extract_from_cf(
         "무형자산상각비": None,
     }
     combined = False
+    combined_label: Optional[str] = None
     # 일반 감가상각을 합산한 출처 테이블(중복 방지: 다른 테이블 행은 합산하지 않음)
     depr_src_idx: Optional[int] = None
 
@@ -1646,6 +1689,7 @@ def _extract_from_cf(
                 if val is not None:
                     result["감가상각비"] = val
                     combined = True
+                    combined_label = _clean_display_label(row[0])
                     if debug_trace is not None:
                         debug_trace.append(
                             f"[CF] #{idx}/R{row_idx+1} combined 매칭: label='{label}', col={col}, "
@@ -1722,6 +1766,7 @@ def _extract_from_cf(
                         )
 
     result["combined"] = combined
+    result["combined_label"] = combined_label
     if debug_trace is not None:
         debug_trace.append(
             f"[CF] Python 추출 결과: 감가상각비={result.get('감가상각비')}, "
@@ -1773,6 +1818,7 @@ def extract_depreciation(
         "tables_found":  0,
         "ai_selection":  None,
         "combined":      False,
+        "combined_label": None,
         "trace":         [],
     }
     trace: list[str] = [
@@ -1807,6 +1853,7 @@ def extract_depreciation(
         cf_result = {"감가상각비": None, "무형자산상각비": None, "combined": False}
 
     cf_combined = cf_result.pop("combined", False)
+    cf_combined_label = cf_result.pop("combined_label", None)
     trace.append(f"[CF] combined={cf_combined}")
 
     # CF에서 감가상각비 + 무형자산상각비(또는 합산)까지 잡혔으면 즉시 반환.
@@ -1825,6 +1872,7 @@ def extract_depreciation(
             ),
             "source":   "cf",
             "combined": cf_combined,
+            "combined_label": cf_combined_label,
             "trace":    trace,
         }
 
@@ -1882,6 +1930,7 @@ def extract_depreciation(
                 ),
                 "source":   "cf",
                 "combined": cf_combined,
+                "combined_label": cf_combined_label,
                 "trace":    trace,
             }
 
@@ -1897,6 +1946,7 @@ def extract_depreciation(
                 except Exception:
                     cf_result2 = {"감가상각비": None, "무형자산상각비": None, "combined": False}
                 cf_combined2 = cf_result2.pop("combined", False)
+                cf_combined_label2 = cf_result2.pop("combined_label", None)
                 if cf_result2.get("감가상각비") is not None and (cf_result2.get("무형자산상각비") is not None or cf_combined2):
                     trace.append("[FINAL] 병합 파일 CF에서 추출 완료")
                     return {
@@ -1911,6 +1961,7 @@ def extract_depreciation(
                         ),
                         "source":   "cf",
                         "combined": cf_combined2,
+                        "combined_label": cf_combined_label2,
                         "trace":    trace,
                     }
                 try:
@@ -2003,6 +2054,8 @@ def extract_depreciation(
                 break
 
     is_combined = cf_combined or notes_combined
+    # CF가 합산을 잡았으면 CF 라벨, 아니면 notes 라벨을 비고용으로 사용한다.
+    combined_label = cf_combined_label if cf_combined else notes_result.get("combined_label")
 
     # source 결정
     _track_keys = ("감가상각비", "사용권자산상각비", "무형자산상각비")
@@ -2038,5 +2091,6 @@ def extract_depreciation(
         ),
         "source":   source,
         "combined": is_combined,
+        "combined_label": combined_label,
         "trace":    trace,
     }

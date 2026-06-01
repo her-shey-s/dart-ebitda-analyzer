@@ -57,13 +57,15 @@ class TestExpenseByNatureNotMisclassified:
 
 class TestCombinedExpenseByNatureValues:
     @pytest.mark.parametrize(
-        "fixture_id,combined_label,expected_depr",
+        "fixture_id,combined_label,expected_depr,expected_display",
         [
-            ("lottems_2025_path_a", "감가상각비및무형자산상각비", 99_541_000_000),
-            ("elandworld_2025_path_a", "감가상각비와기타상각비", 382_884_000_000),
+            ("lottems_2025_path_a", "감가상각비및무형자산상각비", 99_541_000_000, "감가상각비 및 무형자산상각비"),
+            ("elandworld_2025_path_a", "감가상각비와기타상각비", 382_884_000_000, "감가상각비와 기타상각비"),
         ],
     )
-    def test_combined_row_goes_to_depreciation(self, fixture_id, combined_label, expected_depr):
+    def test_combined_row_goes_to_depreciation(
+        self, fixture_id, combined_label, expected_depr, expected_display
+    ):
         soup = _parse_dart_xml((_FIXTURES / fixture_id / "raw_input.xml").read_bytes())
         tables = _collect_depreciation_tables(soup, fs_div="CFS", strict_scope=True)
         tbl = _find_expense_table(tables, combined_label)
@@ -84,6 +86,8 @@ class TestCombinedExpenseByNatureValues:
         }
         result = _verify_ai_selection(tables, ai_selection)
         assert result["감가상각비"] == expected_depr
+        # 비고용 합산 라벨은 원문 표기(공백 유지)를 그대로 보존해야 한다.
+        assert result["combined_label"] == expected_display
 
 
 class TestReportFinderPrefersNonAttachmentCorrection:

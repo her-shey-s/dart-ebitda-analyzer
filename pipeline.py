@@ -247,7 +247,8 @@ def analyze_one(
                     value_state="not_separately_disclosed",
                     flags=["combined_depreciation_and_amortization"],
                 )
-            base["remarks"] = "감가상각비란에 '감가상각비 및 무형자산상각비' 합산액 기입 (원본에서 분리 불가)"
+            combined_label = depr_result.get("combined_label") or "감가상각비 및 무형자산상각비"
+            base["remarks"] = f"감가상각비란에 '{combined_label}' 합산액 기입 (원본에서 분리 불가)"
         log("DEPR", (
             f"감가상각 추출 완료: source={depr_result.get('source')}, "
             f"감가상각비={format_amount(depr_items.get('감가상각비'))}, "
