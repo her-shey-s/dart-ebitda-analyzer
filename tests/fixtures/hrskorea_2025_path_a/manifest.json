@@ -1,0 +1,17 @@
+{
+  "id": "hrskorea_2025_path_a",
+  "kind": "real",
+  "description": "HRS코리아 2025 진단",
+  "path": "B",
+  "rcept_no": "20250609000158",
+  "report_type": "audit_consol",
+  "fs_div": "CFS",
+  "strict_scope": false,
+  "raw": {
+    "xml": "raw_input.xml"
+  },
+  "run": {
+    "financials": true,
+    "depreciation": true
+  }
+}

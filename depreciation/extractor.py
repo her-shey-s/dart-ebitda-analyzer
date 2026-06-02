@@ -1397,6 +1397,12 @@ def _table_looks_like_cf(rows: list[list[str]]) -> bool:
         label = row[0].replace(" ", "").strip()
         if any(marker in label for marker in _CF_CONTENT_MARKERS):
             return True
+        # 영업활동 헤더의 연결자 변형('으로 인한'/'으로부터의'/'으로부터'/없음)을 모두
+        # 흡수한다. 마커 리스트는 특정 표기만 잡아 신규 변형(예: 2025 HRS코리아
+        # '영업활동으로부터의 현금흐름')이 누락되어 CF 추출이 통째로 실패하는 회귀가
+        # 반복됐다. '영업활동'+'현금흐름' 동시 출현으로 일반화한다.
+        if "영업활동" in label and "현금흐름" in label:
+            return True
     return False
 
 
