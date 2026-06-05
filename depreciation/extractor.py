@@ -382,10 +382,6 @@ def _has_exclude_keywords(rows: list[list[str]]) -> bool:
 
 # 정확 매칭 대상 라벨 (행 첫 셀이 이 값과 정확히 일치해야 함)
 _EXACT_DEPR_LABELS = {"감가상각비", "감가상각비용"}
-_EXACT_ROU_AMORT_LABELS = {
-    "사용권자산상각비", "사용권자산상각비용", "사용권자산상각",
-    "사용권자산감가상각비", "사용권자산감가상각비용", "사용권자산감가상각",
-}
 _EXACT_AMORT_LABELS = {"무형자산상각비", "무형자산상각비용", "무형자산상각"}
 
 
@@ -408,6 +404,27 @@ def _is_intangible_amortization_label(label: str) -> bool:
     if "누계" in label:
         return False
     if "무형자산" not in label:
+        return False
+    return "상각" in label
+
+
+def _is_rou_amortization_label(label: str) -> bool:
+    """
+    사용권자산상각비(사용권자산 상각/감가상각) 행인지 판정한다.
+
+    회사마다 '사용권자산상각비'·'사용권자산감가상각비'로 갈리고, CF 조정항목 표에서는
+    뒤에 '조정'·'에 대한 조정'이 붙어('사용권자산감가상각비 조정' 등) exact-match
+    집합으로는 잡히지 않는다(예: 2025 하나투어 '37. 현금흐름표'). '사용권자산'과
+    '상각'이 함께 있으면 사용권자산상각으로 본다. 무형자산상각 판정과 동일한 방식이다.
+
+    '사용권자산손상차손' 등은 '상각'이 없어 자동 제외된다.
+
+    Args:
+        label: _normalize_row_label() 적용된 행 라벨
+    """
+    if "누계" in label:
+        return False
+    if "사용권자산" not in label:
         return False
     return "상각" in label
 
@@ -484,6 +501,37 @@ def _normalize_row_label(label: str) -> str:
             break
         norm = new_norm
     return norm
+
+
+def _account_label(row: list[str]) -> str:
+    """
+    행의 계정 라벨을 rowspan 그룹 헤더에 영향받지 않게 추출한다.
+
+    rowspan으로 묶인 그룹의 '첫 하위 행'은 그룹 헤더 셀이 row[0]에 그대로 남아,
+    실제 계정명이 row[1] 이후로 밀린다. 예(2024 STX엔진 연결 CF 조정):
+      ['당기순이익조정을 위한 가감', '감가상각비에 대한 조정', '9,683,232']
+    이때 row[0]만 보면 '감가상각비' 행을 통째로 놓친다.
+
+    한편 주석 번호 나열 컬럼('2,4,13,27,28,33' 등, 동진홀딩스 2025 연결 CF)은
+    _parse_number가 거부해 텍스트 셀처럼 보이지만 계정명이 아니다. 그러므로 첫 숫자
+    셀 직전의 텍스트 셀 중 '한글이 포함된' 셀만 계정 라벨 후보로 보고, 그 중 가장
+    구체적인(마지막) 셀을 고른다. 일반 행(라벨 1칸 + 숫자)에서는 row[0]과 같다.
+
+    Returns:
+        _normalize_row_label() 적용된 계정 라벨
+    """
+    if not row:
+        return ""
+    label_cells: list[str] = []
+    for cell in row:
+        if _parse_number(cell) is not None:
+            break
+        label_cells.append(cell)
+    hangul_cells = [c for c in label_cells if re.search(r"[가-힣]", c)]
+    if hangul_cells:
+        return _normalize_row_label(hangul_cells[-1])
+    chosen = label_cells[-1] if label_cells else row[0]
+    return _normalize_row_label(chosen)
 
 
 def _detect_depreciation_signals(rows: list[list[str]]) -> dict:
@@ -1325,7 +1373,7 @@ def _verify_ai_selection(
             actual_label = _resolve_actual_row_label(
                 tables, rou_sel["table_id"], rou_sel["row_id"]
             )
-            if actual_label is not None and actual_label in _EXACT_ROU_AMORT_LABELS:
+            if actual_label is not None and _is_rou_amortization_label(actual_label):
                 val = _extract_value_at_position(
                     tables, rou_sel["table_id"], rou_sel["row_id"], debug_trace
                 )
@@ -1339,7 +1387,7 @@ def _verify_ai_selection(
                 if debug_trace is not None:
                     debug_trace.append(
                         f"[VERIFY] 사용권자산상각비 라벨 불일치: AI선택={rou_sel.get('row_label')!r}, "
-                        f"actual='{actual_label}', 허용={_EXACT_ROU_AMORT_LABELS} → null 처리"
+                        f"actual='{actual_label}', 허용=사용권자산상각/사용권자산감가상각 → null 처리"
                     )
 
     # 무형자산상각비 추출 (합산이 아닌 경우만, 라벨 검증 포함)
@@ -1681,7 +1729,9 @@ def _extract_from_cf(
                 continue
             # 라벨을 정규화하되, CF 본문에서는 substring으로 관대하게 매칭한다
             # ("가. 감가상각비", "감가상각비용", "감가상각비등" 등 접두/접미 변형 모두 허용).
-            label = _normalize_row_label(row[0])
+            # rowspan 그룹 헤더가 row[0]에 끼면 실제 계정명이 뒤 셀로 밀리므로
+            # _account_label로 그룹 헤더가 아닌 계정 라벨을 집는다(2024 STX엔진 CF).
+            label = _account_label(row)
 
             # 1) 합산 행 ("감가상각...무형자산상각..." 한 줄로 기재) — 가장 먼저 검사
             if "감가상각" in label and "무형자산상각" in label and "누계" not in label:
